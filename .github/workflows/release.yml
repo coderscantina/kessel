@@ -1,0 +1,102 @@
+name: Release
+
+# CalVer releases: scripts/release.sh tags main as vYY.M.D (e.g. v26.7.10),
+# this workflow builds, signs, notarizes and publishes the DMG plus the
+# latest.json manifest consumed by the in-app update checker.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish macOS release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/kessel \
+            target/x86_64-apple-darwin/release/kessel \
+            -output target/universal/kessel
+
+      - name: Bundle, sign, notarize, package
+        env:
+          KESSEL_BIN: target/universal/kessel
+          KESSEL_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          scripts/bundle.sh release
+          scripts/package.sh
+
+      - name: Write update manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG="target/dist/Kessel-${VERSION}.dmg"
+          SHA256=$(cat "${DMG}.sha256")
+          cat > target/dist/latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${GITHUB_REF_NAME}",
+            "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Kessel-${VERSION}.dmg",
+            "sha256": "${SHA256}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Extract changelog section
+        run: |
+          # The block for this tag: from its "## [vYY.M.D]" heading to the next "## "
+          awk -v tag="$GITHUB_REF_NAME" '
+            $0 ~ "^## \\[" tag "\\]" { on=1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || echo "See CHANGELOG.md" > release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "kessel $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            "target/dist/Kessel-${VERSION}.dmg" \
+            "target/dist/Kessel-${VERSION}.dmg.sha256" \
+            target/dist/latest.json

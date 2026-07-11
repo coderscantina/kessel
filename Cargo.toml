@@ -1,0 +1,150 @@
+[package]
+name = "kessel"
+version = "26.7.12"
+edition = "2021"
+description = "A fast, native desktop file manager for remote filesystems, built on Apache OpenDAL."
+authors = ["Coders Cantina <hello@coderscantina.com>"]
+homepage = "https://www.coderscantina.com"
+license = "MIT"
+
+[dependencies]
+# GUI — both published on crates.io; gpui-component 0.5 depends on gpui ^0.2.2
+gpui = "0.2"
+gpui-component = "0.5"
+
+# Async runtime (OpenDAL + sqlx are async). gpui has its own executor; kessel
+# owns a dedicated tokio runtime (held in AppState) for all I/O work.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "fs",
+  "io-util",
+  "sync",
+  "time",
+] }
+
+# Storage layer — every backend is an OpenDAL Operator
+opendal = { version = "0.58", features = [
+  "services-s3",
+  "services-fs",
+  "services-sftp",
+  "services-ftp",
+  "services-webdav",
+  "services-gcs",
+  "services-azblob",
+  "services-gdrive",
+  "services-dropbox",
+  "services-onedrive",
+  "layers-throttle",
+  "layers-tracing",
+] }
+
+# S3 ListBuckets — OpenDAL Operators are bucket-scoped, so the "browse all
+# buckets" root needs one hand-signed request. reqsign 0.20 is a facade over
+# reqsign-core + service crates; kessel signs directly with reqsign-aws-v4 and
+# the reqwest http-send helper, aligned with what opendal itself pulls in.
+reqsign = { version = "0.20", default-features = false, features = [
+  "aws",
+  "default-context",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  # `.form()` for the OAuth token exchange is gated behind this in reqwest 0.13.
+  "form",
+] }
+# `http` request parts are what reqsign 0.20 signs; same major as reqwest/reqsign use.
+http = "1"
+
+# SFTP permissions/chmod — OpenDAL's sftp service hides unix modes, so kessel
+# runs its own short-lived session for them. Already in the tree via opendal;
+# same version, so no extra compile weight.
+openssh-sftp-client = { version = "0.15", features = ["openssh"] }
+
+# Local state
+sqlx = { version = "0.9", features = [
+  "runtime-tokio",
+  "sqlite",
+  "migrate",
+  "chrono",
+] }
+
+# Config (JSON5 with live-reload-friendly layering)
+config = { version = "0.15", features = ["json5"] }
+dirs = "6"
+
+# Hot reload of theme / icon-theme extensions (both already in the dependency
+# tree via gpui-component; pinned to the same majors)
+notify = "7"
+smol = "2"
+
+# Streaming directory expansion (opendal::Lister is a Stream); already in the
+# tree via opendal.
+futures = "0.3"
+
+# Timestamp preservation on local destinations — OpenDAL's write path cannot
+# set mtime, so the fs backend gets a native escape hatch.
+filetime = "0.2"
+
+# Secrets — OS keychain only, never SQLite. keyring 4's default `v1` feature
+# wires up each platform's native store (macOS Keychain, Windows Credential
+# Manager, Linux Secret Service) with the right backend sub-features.
+keyring = "4"
+
+# OAuth for cloud drives (Drive, Dropbox, OneDrive): PKCE + loopback
+# redirect; the token exchange rides the reqwest already in the tree.
+sha2 = "0.10"
+# AWS IAM Identity Center token cache is keyed by SHA-1 of the SSO start URL
+# (the aws-cli / reqsign convention). Already in the tree via reqsign-aws-v4.
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.10"
+url = "2"
+
+# Zed theme / icon-theme extension downloads: the Zed API serves each
+# extension as a gzipped tar, which the theme browser unpacks into
+# <data_dir>/extensions/. flate2 is already in the tree; named here as a
+# direct dep for the GzDecoder used alongside tar.
+tar = "0.4"
+flate2 = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Keybindings — user-editable keymap file (same JSON5 dialect as config);
+# schemars is required by gpui's Action derive for actions carrying data.
+json5 = "1"
+schemars = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Embedded MCP (Model Context Protocol) server — the official Rust SDK. Only
+# the server half is compiled, over the streamable-HTTP transport (a GUI app
+# owns its stdio, so stdio transport is pointless): clients connect to
+# http://127.0.0.1:<port>/mcp. `macros` gives the #[tool_router]/#[tool]
+# attributes; `tower` lets the service mount into the axum router. Disabled by
+# default at runtime (see config.mcp.enabled).
+rmcp = { version = "2.2", features = [
+  "server",
+  "macros",
+  "tower",
+  "transport-streamable-http-server",
+  "transport-streamable-http-server-session",
+] }
+# HTTP server the MCP streamable transport mounts into; same axum major rmcp
+# builds against.
+axum = "0.8"
+
+[profile.dev]
+# gpui is heavy; keep dependencies optimized in dev builds
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

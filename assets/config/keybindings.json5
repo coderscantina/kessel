@@ -1,0 +1,98 @@
+{
+  // kessel default keybindings.
+  // Override per binding in <app_data_dir>/kessel/keybindings.json5 — same
+  // shape, comments welcome. Top-level keys are key contexts ("Workspace"
+  // is the whole window, "FilePane" a focused file list); values map a
+  // keystroke to an action name, `["action", { …args }]` for actions that
+  // take arguments, or `null` to unbind a default.
+
+  Workspace: {
+    // Tabs, browser-style.
+    "cmd-t": "workspace::NewTab",
+    "cmd-w": "workspace::CloseTab",
+    "ctrl-tab": "workspace::NextTab",
+    "ctrl-shift-tab": "workspace::PrevTab",
+    "cmd-shift-]": "workspace::NextTab",
+    "cmd-shift-[": "workspace::PrevTab",
+    "cmd-1": ["workspace::ActivateTab", { index: 1 }],
+    "cmd-2": ["workspace::ActivateTab", { index: 2 }],
+    "cmd-3": ["workspace::ActivateTab", { index: 3 }],
+    "cmd-4": ["workspace::ActivateTab", { index: 4 }],
+    "cmd-5": ["workspace::ActivateTab", { index: 5 }],
+    "cmd-6": ["workspace::ActivateTab", { index: 6 }],
+    "cmd-7": ["workspace::ActivateTab", { index: 7 }],
+    "cmd-8": ["workspace::ActivateTab", { index: 8 }],
+    "cmd-9": ["workspace::ActivateTab", { index: 9 }],
+
+    // Spaces.
+    "ctrl-1": ["workspace::SwitchSpace", { index: 1 }],
+    "ctrl-2": ["workspace::SwitchSpace", { index: 2 }],
+    "ctrl-3": ["workspace::SwitchSpace", { index: 3 }],
+    "ctrl-4": ["workspace::SwitchSpace", { index: 4 }],
+    "ctrl-5": ["workspace::SwitchSpace", { index: 5 }],
+    "ctrl-6": ["workspace::SwitchSpace", { index: 6 }],
+    "ctrl-7": ["workspace::SwitchSpace", { index: 7 }],
+    "ctrl-8": ["workspace::SwitchSpace", { index: 8 }],
+    "ctrl-9": ["workspace::SwitchSpace", { index: 9 }],
+
+    // Panels and layout.
+    "cmd-b": "workspace::ToggleSidebar",
+    "cmd-.": "workspace::ToggleSidebar",
+    "cmd-j": "workspace::ToggleTransfers",
+    "cmd-alt-j": "workspace::ToggleLogs",
+    "cmd-alt-1": "workspace::LayoutSingle",
+    "cmd-alt-2": "workspace::LayoutSplitH",
+    "cmd-alt-3": "workspace::LayoutSplitV",
+    "cmd-shift-b": "workspace::OpenBookmarks",
+
+    // Command bar, preferences, sync.
+    "cmd-k": "workspace::ToggleCommandBar",
+    "cmd-shift-p": "workspace::ToggleCommandBar",
+    "cmd-,": "workspace::OpenPreferences",
+    "cmd-alt-s": "workspace::SyncPanes",
+
+    // Quit warns while transfers run; keep holding cmd-q to quit anyway.
+    "cmd-q": "workspace::Quit",
+  },
+
+  FilePane: {
+    // Selection.
+    "down": "file_pane::SelectNext",
+    "up": "file_pane::SelectPrev",
+    "shift-down": "file_pane::ExtendNext",
+    "shift-up": "file_pane::ExtendPrev",
+    "home": "file_pane::SelectFirst",
+    "end": "file_pane::SelectLast",
+    "cmd-a": "file_pane::SelectAll",
+    "ctrl-a": "file_pane::SelectAll",
+    "escape": "file_pane::ClearSelection",
+
+    // Navigation.
+    "enter": "file_pane::Activate",
+    "right": "file_pane::Activate",
+    "cmd-down": "file_pane::Activate",
+    "backspace": "file_pane::GoUp",
+    "left": "file_pane::GoUp",
+    "cmd-up": "file_pane::GoUp",
+    "cmd-[": "file_pane::GoBack",
+    "cmd-]": "file_pane::GoForward",
+    "cmd-left": "file_pane::GoBack",
+    "cmd-right": "file_pane::GoForward",
+    "tab": "workspace::FocusOtherPane",
+
+    // Files.
+    "space": "file_pane::QuickLook",
+    "cmd-f": "file_pane::Search",
+    "cmd-r": "file_pane::Refresh",
+    "f5": "file_pane::Refresh",
+    "cmd-shift-n": "file_pane::NewFolder",
+    "f2": "file_pane::RenameSelected",
+    "cmd-backspace": "file_pane::DeleteSelected",
+    // macOS reports shift-. as ">", so bind both spellings.
+    "cmd-shift-.": "file_pane::ToggleHidden",
+    "cmd->": "file_pane::ToggleHidden",
+    "cmd-shift-e": "file_pane::ToggleTree",
+    // Address-bar idiom: edit the raw path (Escape returns to the breadcrumb).
+    "cmd-l": "file_pane::EditPath",
+  },
+}
