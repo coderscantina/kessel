@@ -111,6 +111,11 @@ flate2 = "1"
 thiserror = "2"
 anyhow = "1"
 
+# Native drag-out (dragging entries to Finder / other apps): gpui only
+# supports *incoming* external drags, so the outbound side is patched on top
+# via the raw window handle — same major gpui builds against.
+raw-window-handle = "0.6"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -141,6 +146,14 @@ rmcp = { version = "2.2", features = [
 # HTTP server the MCP streamable transport mounts into; same axum major rmcp
 # builds against.
 axum = "0.8"
+
+# AppKit bindings for the native drag-out session (NSDraggingSession +
+# NSFilePromiseProvider); versions match what gpui already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["block2"] }
+block2 = "0.6"
 
 [profile.dev]
 # gpui is heavy; keep dependencies optimized in dev builds

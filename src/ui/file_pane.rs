@@ -287,6 +287,15 @@ pub struct DraggedEntries {
     pub entries: Vec<FsEntry>,
 }
 
+/// The row drag currently in flight, if any. Set when a row drag starts and
+/// cleared on mouse-up; the workspace watches the pointer and promotes the
+/// internal drag to a native OS drag session (Finder drop target) the
+/// moment it leaves the window. See [`crate::dragout`].
+#[derive(Default)]
+pub struct PendingDragOut(pub Option<DraggedEntries>);
+
+impl gpui::Global for PendingDragOut {}
+
 /// The little chip that follows the pointer during a drag. Kept to a small
 /// solid pill — a large translucent box under the pointer reads as a
 /// misplaced shadow.
@@ -2552,7 +2561,8 @@ impl FilePane {
                 }),
             )
             .when(is_drag_source, |el| {
-                el.on_drag(payload, move |_payload, grab_offset, _window, cx| {
+                el.on_drag(payload, move |payload, grab_offset, _window, cx| {
+                    cx.set_global(PendingDragOut(Some(payload.clone())));
                     let label = ghost_label.clone();
                     cx.new(|_| DragGhost { label, grab_offset })
                 })
@@ -3466,7 +3476,7 @@ fn preview_files(paths: Vec<PathBuf>) {
 
 /// Local directory → browse path on the reserved local site (no leading
 /// `/`, trailing `/` unless root).
-fn local_dir_path(dir: &Path) -> String {
+pub(crate) fn local_dir_path(dir: &Path) -> String {
     let mut path = dir.to_string_lossy().trim_start_matches('/').to_string();
     if !path.is_empty() && !path.ends_with('/') {
         path.push('/');

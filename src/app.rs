@@ -10,12 +10,13 @@
 //!   very bottom. The session (spaces × tabs) persists to SQLite.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, AnyElement, App, Context, Corner, Entity, EntityId, FocusHandle,
-    Focusable as _, Global, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    actions, canvas, div, px, AnyElement, App, Context, Corner, DispatchPhase, Entity, EntityId,
+    FocusHandle, Focusable as _, Global, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -34,11 +35,11 @@ use sqlx::SqlitePool;
 use crate::config::KesselConfig;
 use crate::db::{self, BookmarkFolder, OpenTabRow, Space};
 use crate::provider::{LayerConfig, SiteProfile};
-use crate::queue::{ConflictPolicy, NewJob, LOCAL_SITE_ID};
+use crate::queue::{ConflictPolicy, JobState, NewJob, LOCAL_SITE_ID};
 use crate::i18n::{t, tf};
 use crate::ui::bookmarks::{BookmarkEvent, BookmarkManager};
 use crate::ui::command_bar::{CommandBar, CommandBarEvent, RunRequest};
-use crate::ui::file_pane::{FilePane, FsEntry, PaneEvent};
+use crate::ui::file_pane::{DraggedEntries as DraggedRowEntries, FilePane, FsEntry, PaneEvent, PendingDragOut};
 use crate::ui::logs::LogsPanel;
 use crate::ui::transfers::{TransfersEvent, TransfersPanel};
 use crate::ui::{bookmark_color, bookmark_icon};
@@ -3342,6 +3343,78 @@ impl KesselApp {
     }
 }
 
+/// Promote an in-flight internal row drag to a native OS drag session —
+/// gpui has no outbound drag support, so once the pointer leaves the window
+/// the gpui drag is stopped and the still-held gesture is handed to the
+/// platform (see `crate::dragout`). Local entries travel as real file URLs;
+/// remote ones as file promises that run through the transfer queue when
+/// Finder (or any other app) accepts the drop.
+fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) {
+    let state = cx.global::<AppState>();
+    let queue = state.queue.clone();
+    let runtime = state.runtime.handle().clone();
+    let local = drag.site_id == LOCAL_SITE_ID;
+
+    let items: Vec<crate::dragout::DragItem> = drag
+        .entries
+        .iter()
+        .map(|entry| crate::dragout::DragItem {
+            name: entry.name.to_string(),
+            is_dir: entry.is_dir,
+            // Local-site browse paths are absolute paths without the leading
+            // slash (dirs keep a trailing one) — see `accept_external`.
+            local_path: local
+                .then(|| PathBuf::from(format!("/{}", entry.path.trim_end_matches('/')))),
+        })
+        .collect();
+
+    let site_id = drag.site_id;
+    let sources: Vec<String> = drag.entries.iter().map(|entry| entry.path.clone()).collect();
+    let fulfill: crate::dragout::FulfillFn = Box::new(move |ix, dest| {
+        use anyhow::Context as _;
+        let src = sources.get(ix).context("unknown drag item")?.clone();
+        let dir = dest.parent().context("promise destination has no parent")?;
+        let name = dest.file_name().context("promise destination has no name")?;
+        let job = NewJob {
+            src_site_id: site_id,
+            dst_site_id: LOCAL_SITE_ID,
+            src,
+            dst_dir: crate::ui::file_pane::local_dir_path(dir),
+            dst_name: Some(name.to_string_lossy().to_string()),
+            // The destination already chose the final (unique) name; never
+            // park a promise on a conflict prompt.
+            conflict_policy: ConflictPolicy::Overwrite,
+            move_source: false,
+        };
+        let queue = queue.clone();
+        runtime.block_on(async move {
+            let job_id = queue
+                .enqueue_tracked(job)
+                .await
+                .map_err(|_| anyhow::anyhow!("transfer was rejected"))?;
+            match queue.wait_terminal(job_id).await {
+                JobState::Done => Ok(()),
+                state => {
+                    let detail = queue
+                        .latest()
+                        .jobs
+                        .iter()
+                        .find(|job| job.id == job_id)
+                        .and_then(|job| job.error.clone());
+                    Err(match detail {
+                        Some(error) => anyhow::anyhow!(error),
+                        None => anyhow::anyhow!("transfer {}", state.as_str()),
+                    })
+                }
+            }
+        })
+    });
+
+    if crate::dragout::start_drag(window, items, fulfill) {
+        cx.stop_active_drag(window);
+    }
+}
+
 impl Render for KesselApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = cx.global::<AppState>().config.ui.clone();
@@ -3476,6 +3549,56 @@ impl Render for KesselApp {
                     .size_full()
                     .child(title_bar)
                     .child(div().flex_1().min_h_0().w_full().child(body)),
+            )
+            // Invisible per-frame hook: window-level mouse listeners (they
+            // fire even outside the window while the button is held, which
+            // element listeners never do) that promote an internal row drag
+            // to a native OS drag session the moment it crosses the window
+            // edge — the only path for dropping entries onto Finder.
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |_, _, window, _| {
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent, phase, window, cx| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.pressed_button != Some(MouseButton::Left)
+                                    || !cx.has_active_drag()
+                                {
+                                    return;
+                                }
+                                let size = window.viewport_size();
+                                let position = event.position;
+                                let inside = position.x >= px(0.)
+                                    && position.y >= px(0.)
+                                    && position.x <= size.width
+                                    && position.y <= size.height;
+                                if inside {
+                                    return;
+                                }
+                                let Some(drag) = cx
+                                    .try_global::<PendingDragOut>()
+                                    .and_then(|pending| pending.0.clone())
+                                else {
+                                    return;
+                                };
+                                cx.global_mut::<PendingDragOut>().0 = None;
+                                promote_drag_out(drag, window, cx);
+                            },
+                        );
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble
+                                && cx
+                                    .try_global::<PendingDragOut>()
+                                    .is_some_and(|pending| pending.0.is_some())
+                            {
+                                cx.global_mut::<PendingDragOut>().0 = None;
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0(),
             )
             // Command bar overlay: centered near the top, backdrop click
             // dismisses.

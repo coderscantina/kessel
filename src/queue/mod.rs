@@ -203,6 +203,9 @@ pub struct QueueSnapshot {
 #[derive(Debug)]
 pub(crate) enum Command {
     Enqueue(NewJob),
+    /// Enqueue and report the created job id back — used by drag-out file
+    /// promises, which must know when *their* job settles.
+    EnqueueTracked(NewJob, oneshot::Sender<i64>),
     Pause(i64),
     Resume(i64),
     Cancel(i64),
@@ -249,6 +252,36 @@ pub struct QueueHandle {
 impl QueueHandle {
     pub fn enqueue(&self, job: NewJob) {
         let _ = self.cmds.send(Command::Enqueue(job));
+    }
+    /// Enqueue and get the job id back once the engine has persisted it.
+    /// The receiver errors if the job was rejected (e.g. src == dst).
+    pub fn enqueue_tracked(&self, job: NewJob) -> oneshot::Receiver<i64> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.cmds.send(Command::EnqueueTracked(job, tx));
+        rx
+    }
+    /// Wait until the job reaches a terminal state. A job that vanishes from
+    /// the snapshot after having been seen (user cleared finished jobs)
+    /// counts as done; one that never appears keeps waiting until the engine
+    /// itself goes away.
+    pub async fn wait_terminal(&self, job_id: i64) -> JobState {
+        let mut rx = self.subscribe();
+        let mut seen = false;
+        loop {
+            let state = {
+                let snapshot = rx.borrow();
+                snapshot.jobs.iter().find(|job| job.id == job_id).map(|job| job.state)
+            };
+            match state {
+                Some(state) if state.is_terminal() => return state,
+                Some(_) => seen = true,
+                None if seen => return JobState::Done,
+                None => {}
+            }
+            if rx.changed().await.is_err() {
+                return JobState::Cancelled;
+            }
+        }
     }
     pub fn pause(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Pause(job_id));

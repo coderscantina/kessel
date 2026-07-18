@@ -4,6 +4,7 @@ mod aws;
 mod bookmarks;
 mod config;
 mod db;
+mod dragout;
 mod edit;
 mod i18n;
 mod keymap;

@@ -262,6 +262,16 @@ impl Engine {
                 );
                 store::enqueue_job(&self.pool, &job).await?;
             }
+            Command::EnqueueTracked(job, reply) => {
+                let dst_name = job.dst_name.as_deref().unwrap_or(file_name(&job.src));
+                anyhow::ensure!(
+                    job.src_site_id != job.dst_site_id
+                        || !format!("{}{dst_name}", job.dst_dir).eq(&job.src),
+                    "source and destination are the same"
+                );
+                let id = store::enqueue_job(&self.pool, &job).await?;
+                let _ = reply.send(id);
+            }
             Command::Pause(id) => {
                 if let Some(rt) = self.jobs.get(&id) {
                     rt.control.paused.store(true, Ordering::Relaxed);
