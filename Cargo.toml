@@ -183,6 +183,12 @@ windows = { version = "0.61", features = [
 # needs windows-core named directly (gpui pins the same version).
 windows-core = "0.61"
 
+# Windows resource section: the app icon Explorer and the taskbar show, plus
+# the version/company strings the file properties dialog reads. Compiled into
+# the executable by build.rs.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [profile.dev]
 # gpui is heavy; keep dependencies optimized in dev builds
 opt-level = 1

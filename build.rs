@@ -1,6 +1,10 @@
 //! Generates the embedded-icon table for `src/assets.rs` from everything
 //! under `assets/icons/` (recursively, SVGs only). `assets/icons/app/` holds
 //! the bundle artwork (.icns etc.) and is deliberately skipped.
+//!
+//! On Windows it also compiles the resource section — app icon and version
+//! info — into the executable. macOS carries the equivalent in the `.app`
+//! bundle's Info.plist instead (see scripts/bundle.sh).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -38,4 +42,34 @@ fn main() {
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("embedded_icons.rs");
     std::fs::write(out, table).expect("write embedded_icons.rs");
     println!("cargo::rerun-if-changed=assets/icons");
+
+    windows_resources();
 }
+
+/// Compile the Windows resource section. The dev profile gets the Coaxium
+/// icon, so a debug build is distinguishable in the taskbar — the same split
+/// scripts/bundle.sh makes for the ICNS.
+#[cfg(windows)]
+fn windows_resources() {
+    let icon = if std::env::var("PROFILE").as_deref() == Ok("debug") {
+        "assets/icons/app/kessel-dev.ico"
+    } else {
+        "assets/icons/app/kessel.ico"
+    };
+    println!("cargo::rerun-if-changed={icon}");
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(icon)
+        .set("ProductName", "Kessel")
+        .set("FileDescription", env!("CARGO_PKG_DESCRIPTION"))
+        .set("CompanyName", "Coders Cantina")
+        .set("LegalCopyright", "© Coders Cantina — coderscantina.com");
+    if let Err(error) = res.compile() {
+        // A missing resource compiler shouldn't stop a local build; the
+        // executable just ends up without an icon.
+        println!("cargo::warning=windows resources not compiled: {error}");
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_resources() {}
