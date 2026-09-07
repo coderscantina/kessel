@@ -1571,10 +1571,43 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.enqueue_local_paths(paths.paths(), dst_dir, window, cx);
+    }
+
+    fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dst_dir = self.path.clone();
+        let site = self.site_id();
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some("Upload files or folders".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picker.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                if this.site_id() == site {
+                    this.enqueue_local_paths(&paths, dst_dir, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn enqueue_local_paths(
+        &mut self,
+        paths: &[PathBuf],
+        dst_dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dst_site = self.provider.site_id;
         let queue = cx.global::<AppState>().queue.clone();
         let mut queued = 0;
-        for path in paths.paths() {
+        for path in paths {
             let mut src = path.to_string_lossy().trim_start_matches('/').to_string();
             if path.is_dir() {
                 src.push('/');
@@ -3119,6 +3152,15 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
                     )
                     .child(div().flex_1().min_w_0().child(self.render_path_bar(cx)))
+                    .child(
+                        Button::new("upload")
+                            .icon(Icon::new(IconName::ArrowUp))
+                            .label("Upload…")
+                            .ghost()
+                            .small()
+                            .tooltip("Upload files or full folders into this directory")
+                            .on_click(cx.listener(|this, _, window, cx| this.upload(window, cx))),
+                    )
                     .child(
                         Button::new("new-folder")
                             .icon(Icon::default().path("icons/folder-plus.svg"))

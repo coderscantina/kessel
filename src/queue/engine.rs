@@ -564,8 +564,7 @@ async fn prepare_job(
         // A previously interrupted fan-out may have left partial tasks —
         // start clean, then stream batches in and seal the expansion.
         store::begin_expansion(pool, job.id).await?;
-        let count = expand_job(pool, &providers, job, skip_hidden).await?;
-        anyhow::ensure!(count > 0, "nothing to transfer under `{}`", job.src);
+        expand_job(pool, &providers, job, skip_hidden).await?;
         store::finish_expansion(pool, job.id).await?;
     } else {
         store::activate_job(pool, job.id).await?;
@@ -615,6 +614,14 @@ async fn expand_job(
     } else {
         format!("{}/", job.src)
     };
+    anyhow::ensure!(
+        !providers.same_site || !job.dst.starts_with(&src_dir),
+        "cannot transfer a folder into itself or a descendant"
+    );
+    anyhow::ensure!(
+        !providers.same_site || format!("{}{name}/", job.dst) != src_dir,
+        "source and destination are the same folder"
+    );
     let (src_op, src_rel) = providers.src.op_for(&src_dir)?;
     let base = format!("{}{name}/", job.dst);
 
@@ -623,6 +630,14 @@ async fn expand_job(
         .recursive(true)
         .await
         .with_context(|| format!("listing `{src_dir}`"))?;
+
+    let (dst_op, dst_rel) = providers.dst.op_for(&base)?;
+    if dst_op.info().capability().create_dir {
+        dst_op
+            .create_dir(&dst_rel)
+            .await
+            .context("creating destination folder")?;
+    }
 
     let mut batch: Vec<NewTask> = Vec::with_capacity(EXPANSION_BATCH);
     let mut count = 0u64;
@@ -641,8 +656,11 @@ async fn expand_job(
         let meta = entry.metadata();
         if meta.is_dir() {
             let (dst_op, dst_rel) = providers.dst.op_for(&format!("{base}{rel}"))?;
-            if let Err(error) = dst_op.create_dir(&dst_rel).await {
-                tracing::debug!(%error, path = %rel, "create_dir skipped");
+            if dst_op.info().capability().create_dir {
+                dst_op
+                    .create_dir(&dst_rel)
+                    .await
+                    .with_context(|| format!("creating destination folder `{dst_rel}`"))?;
             }
         } else if meta.is_file() {
             batch.push(NewTask {
@@ -1095,6 +1113,58 @@ mod tests {
         assert_eq!(snap.jobs[0].state, JobState::Done);
         assert_eq!(std::fs::read(dst.join("日本 (1).tar.gz")).unwrap(), b"NEW");
         assert_eq!(std::fs::read(dst.join("日本.tar.gz")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn preserves_empty_folder_tree() {
+        let env = test_env("empty-tree");
+        let src = env.dir.join("tree");
+        let dst = env.dir.join("out");
+        std::fs::create_dir_all(src.join("nested/empty")).unwrap();
+        env.handle.enqueue(job(
+            format!("{}/", browse(&src)),
+            format!("{}/", browse(&dst)),
+            ConflictPolicy::Ask,
+        ));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state.is_terminal())
+        });
+        assert_eq!(
+            snap.jobs[0].state,
+            JobState::Done,
+            "{:?}",
+            snap.jobs[0].error
+        );
+        assert!(dst.join("tree/nested/empty").is_dir());
+        let empty = env.dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        env.handle.enqueue(job(
+            format!("{}/", browse(&empty)),
+            format!("{}/", browse(&dst)),
+            ConflictPolicy::Ask,
+        ));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.len() == 2 && s.jobs.iter().all(|j| j.state.is_terminal())
+        });
+        assert!(snap.jobs.iter().all(|j| j.state == JobState::Done));
+        assert!(dst.join("empty").is_dir());
+    }
+
+    #[test]
+    fn rejects_uploading_a_folder_into_itself() {
+        let env = test_env("recursive-target");
+        let src = env.dir.join("tree");
+        std::fs::create_dir_all(&src).unwrap();
+        env.handle.enqueue(job(
+            format!("{}/", browse(&src)),
+            format!("{}/", browse(&src)),
+            ConflictPolicy::Ask,
+        ));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state.is_terminal())
+        });
+        assert_eq!(snap.jobs[0].state, JobState::Failed);
+        assert!(!src.join("tree").exists());
     }
 
     #[test]

@@ -23,6 +23,8 @@ flag on.
 
 - One or two panes per tab (horizontal / vertical split) with drag & drop
   between panes, to directory rows, and from Finder/Explorer
+- **Upload…** accepts files and full folder trees, including empty folders
+  on backends that support directories
 - Virtualized file list built for huge directory listings, with per-backend
   columns (size, modified, unix permissions, S3 storage class, bucket region)
 - Finder-grade selection: click, cmd-click, shift-click ranges, rubber-band,
