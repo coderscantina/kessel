@@ -3529,8 +3529,20 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
         })
     });
 
-    if crate::dragout::start_drag(window, items, fulfill) {
+    if crate::dragout::STARTS_IN_EVENT_DISPATCH {
+        // macOS seeds the session from the event being dispatched right now,
+        // so it has to happen here — and only once it has, is the internal
+        // drag safe to drop.
+        if crate::dragout::start_drag(window, items, fulfill) {
+            cx.stop_active_drag(window);
+        }
+    } else if crate::dragout::can_drag(&items) {
+        // Windows runs a modal drag loop; letting this dispatch unwind first
+        // keeps that loop out of gpui's event handling.
         cx.stop_active_drag(window);
+        window.defer(cx, move |window, _| {
+            crate::dragout::start_drag(window, items, fulfill);
+        });
     }
 }
 

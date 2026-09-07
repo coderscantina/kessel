@@ -160,6 +160,29 @@ objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["block2"] }
 block2 = "0.6"
 
+# Win32 bindings for the native drag-out session (an OLE data object over the
+# shell's file-promise protocol). Same major gpui already builds against, so
+# feature unification adds no compile weight — only the Com_Marshal module is
+# new here.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_Marshal",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_SystemServices",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+] }
+# `#[implement]` expands to `::windows_core::…` paths, so the COM data object
+# needs windows-core named directly (gpui pins the same version).
+windows-core = "0.61"
+
 [profile.dev]
 # gpui is heavy; keep dependencies optimized in dev builds
 opt-level = 1
