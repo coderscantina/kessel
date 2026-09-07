@@ -271,6 +271,8 @@ pub enum PaneEvent {
     },
     /// The pane's site or directory changed — refresh titles, persist tabs.
     Navigated,
+    DirectoryLoaded { linked: bool },
+    LinkedNavigationFailed,
     /// The user interacted with this pane; it becomes the tab's active pane.
     Focused,
 }
@@ -378,6 +380,8 @@ pub struct FilePane {
     scroll_handle: UniformListScrollHandle,
     /// Bumped per reload so stale results are dropped.
     load_seq: usize,
+    linked_seq: usize,
+    linked_navigation: bool,
     /// Visible optional columns, seeded from `ui.columns` by scheme.
     columns: Vec<Column>,
     /// Current sort; entries are kept in this order.
@@ -515,6 +519,8 @@ impl FilePane {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             load_seq: 0,
+            linked_seq: 0,
+            linked_navigation: false,
             columns,
             sort: Sort::default(),
             col_widths: std::collections::HashMap::new(),
@@ -2119,6 +2125,58 @@ impl FilePane {
 
     // --- navigation / loading ---
 
+    pub fn cancel_linked_navigation(&mut self) {
+        self.linked_seq += 1;
+    }
+
+    pub fn navigate_linked(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.linked_seq += 1;
+        let seq = self.linked_seq;
+        let provider = self.provider.clone();
+        let target = path.clone();
+        let task = cx.global::<AppState>().runtime.spawn(async move {
+            if target.is_empty() {
+                provider.list(&target).await?;
+            } else if provider.caps.virtual_dirs {
+                let siblings = provider.list(&parent_of(&target)).await?;
+                anyhow::ensure!(
+                    siblings
+                        .iter()
+                        .any(|entry| entry.is_dir && entry.path == target),
+                    "matching folder does not exist"
+                );
+            } else {
+                let (op, rel) = provider.op_for(&target)?;
+                let meta = op.stat(&rel).await?;
+                anyhow::ensure!(meta.is_dir(), "matching path is not a folder");
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.linked_seq != seq {
+                    return;
+                }
+                match result {
+                    Ok(Ok(())) => {
+                        this.navigate_to(path, window, cx);
+                        this.linked_navigation = true;
+                    }
+                    _ => {
+                        window.push_notification(
+                            format!("Linked browsing stopped: cannot open matching folder /{path}"),
+                            cx,
+                        );
+                        cx.emit(PaneEvent::LinkedNavigationFailed);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn navigate_to(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         if path != self.path {
             self.back_stack.push(std::mem::replace(&mut self.path, path));
@@ -2296,6 +2354,8 @@ impl FilePane {
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.update_watch();
+        self.linked_navigation = false;
+        self.linked_seq += 1;
         self.load_seq += 1;
         let seq = self.load_seq;
         let provider = self.provider.clone();
@@ -2362,6 +2422,7 @@ impl FilePane {
                         this.all_entries = entries;
                         this.apply_sort();
                         this.error = None;
+                        cx.emit(PaneEvent::DirectoryLoaded { linked: this.linked_navigation });
                         this.fetch_details(cx);
                         // Selection-preserving refresh: re-select by name.
                         if let Some(names) = pending {
@@ -2381,6 +2442,7 @@ impl FilePane {
                         this.all_entries = Vec::new();
                         this.entries = Vec::new();
                         this.error = Some(format!("{error:#}").into());
+                        cx.emit(PaneEvent::LinkedNavigationFailed);
                     }
                 }
                 cx.notify();

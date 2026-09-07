@@ -162,6 +162,15 @@ struct Workspace {
     active: usize,
     split_h: Entity<ResizableState>,
     split_v: Entity<ResizableState>,
+    linked_roots: Option<[(i64, String); 2]>,
+}
+
+fn linked_directory(root: &str, other_root: &str, path: &str) -> Option<String> {
+    if path.split('/').any(|part| matches!(part, "." | "..")) {
+        return None;
+    }
+    let relative = path.strip_prefix(root)?;
+    Some(format!("{other_root}{relative}"))
 }
 
 enum TabContent {
@@ -517,6 +526,7 @@ impl KesselApp {
             active: 0,
             split_h,
             split_v,
+            linked_roots: None,
         };
         // Seed each pane's tree orientation from the initial layout.
         for pane in &workspace.panes {
@@ -643,6 +653,10 @@ impl KesselApp {
             workspace.layout = layout;
             if layout == PaneLayout::Single {
                 workspace.active = 0;
+                workspace.linked_roots = None;
+                for pane in &workspace.panes {
+                    pane.update(cx, |pane, _| pane.cancel_linked_navigation());
+                }
             }
             let panes = workspace.panes.clone();
             self.persist_session(cx);
@@ -1362,6 +1376,69 @@ impl KesselApp {
         .detach();
     }
 
+    fn toggle_linked_browsing(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_ix(self.active) else {
+            return;
+        };
+        let TabContent::Panes(workspace) = &mut self.tabs[ix].content else {
+            return;
+        };
+        if workspace.layout == PaneLayout::Single {
+            return;
+        }
+        workspace.linked_roots = if workspace.linked_roots.is_some() {
+            None
+        } else {
+            Some(workspace.panes.each_ref().map(|pane| {
+                let pane = pane.read(cx);
+                (pane.site_id(), pane.current_dir())
+            }))
+        };
+        for pane in &workspace.panes {
+            pane.update(cx, |pane, _| pane.cancel_linked_navigation());
+        }
+        cx.notify();
+    }
+
+    fn follow_linked_pane(
+        &mut self,
+        pane: &Entity<FilePane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((tab_ix, pane_ix)) = self.find_pane(pane.entity_id()) else {
+            return;
+        };
+        let TabContent::Panes(workspace) = &mut self.tabs[tab_ix].content else {
+            return;
+        };
+        let Some(roots) = &workspace.linked_roots else {
+            return;
+        };
+        let path = pane.read(cx).current_dir();
+        let sites_match = workspace
+            .panes
+            .iter()
+            .zip(roots)
+            .all(|(pane, (site, _))| pane.read(cx).site_id() == *site);
+        let target = sites_match
+            .then(|| linked_directory(&roots[pane_ix].1, &roots[1 - pane_ix].1, &path))
+            .flatten();
+        let Some(target) = target else {
+            workspace.linked_roots = None;
+            for pane in &workspace.panes {
+                pane.update(cx, |pane, _| pane.cancel_linked_navigation());
+            }
+            window.push_notification("Linked browsing stopped: you left the paired folders.", cx);
+            cx.notify();
+            return;
+        };
+        let other = &workspace.panes[1 - pane_ix];
+        if other.read(cx).current_dir() != target {
+            other.update(cx, |pane, cx| pane.navigate_linked(target, window, cx));
+        }
+    }
+
     // --- event plumbing ---
 
     fn on_pane_event(
@@ -1387,7 +1464,26 @@ impl KesselApp {
             PaneEvent::OpenInNewTab { profile, path } => {
                 self.open_tab_with(profile.clone(), path.clone(), None, window, cx);
             }
+            PaneEvent::DirectoryLoaded { linked } => {
+                if !linked { self.follow_linked_pane(pane, window, cx); }
+            }
+            PaneEvent::LinkedNavigationFailed => {
+                if let Some((tab_ix, _)) = self.find_pane(pane.entity_id()) {
+                    if let TabContent::Panes(workspace) = &mut self.tabs[tab_ix].content {
+                        workspace.linked_roots = None;
+                        for pane in &workspace.panes {
+                            pane.update(cx, |pane, _| pane.cancel_linked_navigation());
+                        }
+                        cx.notify();
+                    }
+                }
+            }
             PaneEvent::Navigated => {
+                if let Some((tab_ix, pane_ix)) = self.find_pane(pane.entity_id()) {
+                    if let TabContent::Panes(workspace) = &self.tabs[tab_ix].content {
+                        workspace.panes[1 - pane_ix].update(cx, |pane, _| pane.cancel_linked_navigation());
+                    }
+                }
                 self.persist_session(cx);
                 cx.notify();
             }
@@ -2280,6 +2376,20 @@ impl KesselApp {
                     "Split vertically",
                     cx,
                 ));
+        }
+        if let Some(Tab { content: TabContent::Panes(workspace), .. }) = self.active_tab() {
+            if workspace.layout != PaneLayout::Single {
+                let linked = workspace.linked_roots.is_some();
+                right = right.child(
+                    Button::new("linked-browsing")
+                        .label(if linked { "Unlink panes" } else { "Link panes" })
+                        .selected(linked)
+                        .ghost()
+                        .small()
+                        .tooltip("Follow matching subfolders from the two current directories")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_linked_browsing(cx))),
+                );
+            }
         }
         if sidebar_right {
             right = right.child(toggle);
@@ -3745,4 +3855,43 @@ pub fn watch_config(cx: &mut App) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod linked_browsing_tests {
+    use super::linked_directory;
+
+    #[test]
+    fn follows_relative_paths_in_both_directions() {
+        assert_eq!(
+            linked_directory(
+                "local/project/",
+                "remote/www/",
+                "local/project/assets/icons/"
+            ),
+            Some("remote/www/assets/icons/".into())
+        );
+        assert_eq!(
+            linked_directory("remote/www/", "local/project/", "remote/www/assets/"),
+            Some("local/project/assets/".into())
+        );
+        assert_eq!(
+            linked_directory("local/project/", "remote/www/", "local/project/"),
+            Some("remote/www/".into())
+        );
+        assert_eq!(
+            linked_directory("", "backup/", "photos/"),
+            Some("backup/photos/".into())
+        );
+    }
+
+    #[test]
+    fn stops_at_the_paired_root_boundary() {
+        assert_eq!(linked_directory("project/", "www/", ""), None);
+        assert_eq!(linked_directory("project/", "www/", "project-other/"), None);
+        assert_eq!(
+            linked_directory("project/", "www/", "project/../private/"),
+            None
+        );
+    }
 }

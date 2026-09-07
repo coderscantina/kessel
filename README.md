@@ -23,6 +23,9 @@ flag on.
 
 - One or two panes per tab (horizontal / vertical split) with drag & drop
   between panes, to directory rows, and from Finder/Explorer
+- Linked browsing: choose **Link panes** in split view to follow matching
+  subfolders from the two current directories. Leaving those roots or reaching
+  an unavailable folder stops the link
 - **Upload…** accepts files and full folder trees, including empty folders
   on backends that support directories
 - Virtualized file list built for huge directory listings, with per-backend
