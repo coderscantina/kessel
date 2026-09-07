@@ -190,4 +190,5 @@
   "update.dialog.install": "Installieren & neu starten",
   "update.dialog.later": "Später",
   "update.manual_hint": "Das geladene Disk-Image wurde im Finder angezeigt — ziehe kessel zum Abschluss in „Programme“.",
+  "update.manual_hint_windows": "kessel kann sich am Installationsort nicht selbst ersetzen — der Download wurde im Explorer angezeigt. Ersetze damit die vorhandene kessel.exe, um abzuschließen.",
 }

@@ -62,6 +62,10 @@ fn main() -> Result<()> {
         .init();
     config::LOG_FILTER.set(filter_handle).ok();
 
+    // Clear anything a previous in-app update had to leave behind (Windows
+    // can't delete a running executable, so the old one is swept here).
+    update::sweep_leftovers();
+
     // Bootstrap async state (DB, migrations, crash recovery) on the app-owned
     // tokio runtime; it stays alive in AppState for all later I/O work.
     let runtime = tokio::runtime::Runtime::new()?;

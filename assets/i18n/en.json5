@@ -200,4 +200,5 @@
   "update.dialog.install": "Install & relaunch",
   "update.dialog.later": "Later",
   "update.manual_hint": "The downloaded disk image was revealed in Finder — drag kessel into Applications to finish.",
+  "update.manual_hint_windows": "kessel can't replace itself where it is installed — the download was revealed in Explorer. Put it in place of the current kessel.exe to finish.",
 }

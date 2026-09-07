@@ -48,8 +48,16 @@ impl Default for UpdateConfig {
     }
 }
 
+/// The release manifest for *this* platform. Each release publishes one per
+/// platform beside its artifact; `latest.json` stays the macOS one so builds
+/// that predate the Windows port keep updating.
 fn default_update_url() -> String {
-    "https://github.com/coderscantina/kessel/releases/latest/download/latest.json".to_string()
+    let manifest = if cfg!(target_os = "windows") {
+        "latest-windows.json"
+    } else {
+        "latest.json"
+    };
+    format!("https://github.com/coderscantina/kessel/releases/latest/download/{manifest}")
 }
 
 /// Embedded Model Context Protocol server. Exposes kessel's sites, listings

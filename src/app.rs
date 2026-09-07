@@ -1179,7 +1179,11 @@ impl KesselApp {
                         cx.quit();
                     }
                     Ok(crate::update::InstallOutcome::ManualInstall) => {
-                        this.update_error = Some(t("update.manual_hint"));
+                        this.update_error = Some(t(if cfg!(target_os = "windows") {
+                            "update.manual_hint_windows"
+                        } else {
+                            "update.manual_hint"
+                        }));
                     }
                     Err(error) => {
                         this.update_error = Some(SharedString::from(format!("{error}")));

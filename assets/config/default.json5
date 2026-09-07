@@ -108,14 +108,16 @@
   },
 
   // In-app auto-update. kessel checks a stable release manifest on GitHub at
-  // startup and once every 24h. When a newer build is available and the app is
-  // running from a writable .app bundle, it can download the DMG, verify its
-  // SHA-256, and swap the bundle in place; otherwise it reveals the downloaded
-  // DMG in Finder for a manual drag-install. The manual "Check for updates…"
-  // command works regardless of `check`.
+  // startup and once every 24h, downloads the new build when there is one, and
+  // verifies its SHA-256 before installing: the .app bundle is swapped in place
+  // on macOS, the .exe on Windows. When the install location isn't writable the
+  // download is revealed in Finder / Explorer for a manual install instead. The
+  // manual "Check for updates…" command works regardless of `check`.
   update: {
     check: true,          // background check at startup and daily
-    // Stable manifest URL — resolves to the newest release's latest.json.
-    url: "https://github.com/coderscantina/kessel/releases/latest/download/latest.json",
+    // Manifest URL. Left unset it resolves to the newest release's manifest for
+    // the platform this build runs on — latest.json (macOS) or
+    // latest-windows.json. Set it only to pin a different release channel.
+    // url: "https://github.com/coderscantina/kessel/releases/latest/download/latest.json",
   },
 }
