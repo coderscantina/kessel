@@ -12,8 +12,21 @@ cargo run            # debug build straight from the checkout
 scripts/bundle.sh dev  # or a signed dev .app bundle
 ```
 
-Requirements: latest stable Rust; macOS 12+ for the app bundle. Tests run
-with `cargo test`, lints with `cargo clippy --all-targets`.
+Requirements: latest stable Rust; macOS 12+ for the `.app` bundle, Windows 10+
+for the Windows build (`scripts\package-windows.ps1`). Tests run with
+`cargo test`, lints with `cargo clippy --all-targets`.
+
+kessel builds for macOS and Windows from one tree and CI builds both on every
+push, so keep platform-specific code behind `cfg` and reach for the shared
+helpers rather than assuming POSIX:
+
+- `src/localfs.rs` — local paths and the Local site's root (`/` vs. `C:\`).
+- `src/update.rs` — per-platform install paths for the in-app updater.
+- `src/sftp.rs` / `src/sftp_unsupported.rs` — a backend that only exists on
+  unix, swapped by module path so call sites stay `cfg`-free.
+- `assets/config/keybindings.json5` — `secondary-` is Cmd on macOS and Ctrl
+  elsewhere; a `"windows,linux: Context"` section overrides bindings per
+  platform.
 
 ## Project layout
 
@@ -24,6 +37,8 @@ with `cargo test`, lints with `cargo clippy --all-targets`.
 | `src/provider.rs` | OpenDAL Operator construction + layer stack |
 | `src/queue/` | Persistent transfer queue (engine, store, transfer) |
 | `src/config.rs`, `src/keymap.rs` | JSON5 config and keybindings |
+| `src/localfs.rs` | Local filesystem path model (POSIX and Windows) |
+| `src/update.rs` | In-app updater, with a per-platform install path |
 | `src/db.rs`, `migrations/` | SQLite state (never secrets) |
 | `src/secrets.rs` | OS keychain access |
 | `assets/config/` | Compiled-in defaults (config, keybindings) |
@@ -78,8 +93,9 @@ subjects, so write them for release notes.
 kessel versions by [CalVer](https://calver.org): `vYY.M.D` (e.g. `v26.7.10`),
 one release per day at most. `scripts/release.sh` bumps `Cargo.toml`, creates
 the `🔖 Release` commit, folds the generated `CHANGELOG.md` entry into it, and
-pushes the tag — which triggers the GitHub release workflow (build, sign,
-notarize, package, publish).
+pushes the tag — which triggers the GitHub release workflow: each platform
+builds, signs and packages in parallel, then one job publishes them together
+with their update manifests.
 
 ## Code style
 

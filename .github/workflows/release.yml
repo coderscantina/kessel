@@ -1,8 +1,9 @@
 name: Release
 
 # CalVer releases: scripts/release.sh tags main as vYY.M.D (e.g. v26.7.10),
-# this workflow builds, signs, notarizes and publishes the DMG plus the
-# latest.json manifest consumed by the in-app update checker.
+# this workflow builds and signs each platform's artifact, then publishes them
+# in one GitHub release together with the per-platform manifests the in-app
+# update checker reads (latest.json on macOS, latest-windows.json on Windows).
 on:
   push:
     tags:
@@ -12,8 +13,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & publish macOS release
+  macos:
+    name: Build macOS release
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +80,75 @@ jobs:
           }
           EOF
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            target/dist/Kessel-*.dmg
+            target/dist/Kessel-*.dmg.sha256
+            target/dist/latest.json
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Unset both when no certificate is configured, so the packaging script
+      # takes its unsigned path with a warning instead of failing.
+      - name: Build, sign and package
+        shell: pwsh
+        env:
+          KESSEL_WIN_CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+          KESSEL_WIN_CERT: ${{ secrets.WINDOWS_CERT_PATH }}
+          KESSEL_WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: scripts/package-windows.ps1
+
+      - name: Write update manifest
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $exe = "kessel-$version-x86_64.exe"
+          $sha = Get-Content "target/dist/$exe.sha256"
+          $manifest = [ordered]@{
+            version  = $version
+            tag      = $env:GITHUB_REF_NAME
+            url      = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$exe"
+            sha256   = $sha
+            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $manifest | ConvertTo-Json | Set-Content target/dist/latest-windows.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            target/dist/kessel-*-x86_64.exe
+            target/dist/kessel-*-x86_64.exe.sha256
+            target/dist/kessel-*-x86_64.zip
+            target/dist/kessel-*-x86_64.zip.sha256
+            target/dist/latest-windows.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub release
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Extract changelog section
         run: |
           # The block for this tag: from its "## [vYY.M.D]" heading to the next "## "
@@ -93,10 +163,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" \
             --title "kessel $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
-            "target/dist/Kessel-${VERSION}.dmg" \
-            "target/dist/Kessel-${VERSION}.dmg.sha256" \
-            target/dist/latest.json
+            dist/*
