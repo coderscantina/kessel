@@ -5,24 +5,30 @@
   // is the whole window, "FilePane" a focused file list); values map a
   // keystroke to an action name, `["action", { …args }]` for actions that
   // take arguments, or `null` to unbind a default.
+  //
+  // "secondary" is the platform's command modifier: Cmd on macOS, Ctrl on
+  // Windows and Linux. A context may be prefixed with a comma-separated
+  // platform list ("windows,linux: Workspace") to apply only there; those
+  // sections are folded over the shared ones, so they can override a binding
+  // or drop it with `null`.
 
   Workspace: {
     // Tabs, browser-style.
-    "cmd-t": "workspace::NewTab",
-    "cmd-w": "workspace::CloseTab",
+    "secondary-t": "workspace::NewTab",
+    "secondary-w": "workspace::CloseTab",
     "ctrl-tab": "workspace::NextTab",
     "ctrl-shift-tab": "workspace::PrevTab",
-    "cmd-shift-]": "workspace::NextTab",
-    "cmd-shift-[": "workspace::PrevTab",
-    "cmd-1": ["workspace::ActivateTab", { index: 1 }],
-    "cmd-2": ["workspace::ActivateTab", { index: 2 }],
-    "cmd-3": ["workspace::ActivateTab", { index: 3 }],
-    "cmd-4": ["workspace::ActivateTab", { index: 4 }],
-    "cmd-5": ["workspace::ActivateTab", { index: 5 }],
-    "cmd-6": ["workspace::ActivateTab", { index: 6 }],
-    "cmd-7": ["workspace::ActivateTab", { index: 7 }],
-    "cmd-8": ["workspace::ActivateTab", { index: 8 }],
-    "cmd-9": ["workspace::ActivateTab", { index: 9 }],
+    "secondary-shift-]": "workspace::NextTab",
+    "secondary-shift-[": "workspace::PrevTab",
+    "secondary-1": ["workspace::ActivateTab", { index: 1 }],
+    "secondary-2": ["workspace::ActivateTab", { index: 2 }],
+    "secondary-3": ["workspace::ActivateTab", { index: 3 }],
+    "secondary-4": ["workspace::ActivateTab", { index: 4 }],
+    "secondary-5": ["workspace::ActivateTab", { index: 5 }],
+    "secondary-6": ["workspace::ActivateTab", { index: 6 }],
+    "secondary-7": ["workspace::ActivateTab", { index: 7 }],
+    "secondary-8": ["workspace::ActivateTab", { index: 8 }],
+    "secondary-9": ["workspace::ActivateTab", { index: 9 }],
 
     // Spaces.
     "ctrl-1": ["workspace::SwitchSpace", { index: 1 }],
@@ -36,23 +42,23 @@
     "ctrl-9": ["workspace::SwitchSpace", { index: 9 }],
 
     // Panels and layout.
-    "cmd-b": "workspace::ToggleSidebar",
-    "cmd-.": "workspace::ToggleSidebar",
-    "cmd-j": "workspace::ToggleTransfers",
-    "cmd-alt-j": "workspace::ToggleLogs",
-    "cmd-alt-1": "workspace::LayoutSingle",
-    "cmd-alt-2": "workspace::LayoutSplitH",
-    "cmd-alt-3": "workspace::LayoutSplitV",
-    "cmd-shift-b": "workspace::OpenBookmarks",
+    "secondary-b": "workspace::ToggleSidebar",
+    "secondary-.": "workspace::ToggleSidebar",
+    "secondary-j": "workspace::ToggleTransfers",
+    "secondary-alt-j": "workspace::ToggleLogs",
+    "secondary-alt-1": "workspace::LayoutSingle",
+    "secondary-alt-2": "workspace::LayoutSplitH",
+    "secondary-alt-3": "workspace::LayoutSplitV",
+    "secondary-shift-b": "workspace::OpenBookmarks",
 
     // Command bar, preferences, sync.
-    "cmd-k": "workspace::ToggleCommandBar",
-    "cmd-shift-p": "workspace::ToggleCommandBar",
-    "cmd-,": "workspace::OpenPreferences",
-    "cmd-alt-s": "workspace::SyncPanes",
+    "secondary-k": "workspace::ToggleCommandBar",
+    "secondary-shift-p": "workspace::ToggleCommandBar",
+    "secondary-,": "workspace::OpenPreferences",
+    "secondary-alt-s": "workspace::SyncPanes",
 
-    // Quit warns while transfers run; keep holding cmd-q to quit anyway.
-    "cmd-q": "workspace::Quit",
+    // Quit warns while transfers run; keep holding the shortcut to quit anyway.
+    "secondary-q": "workspace::Quit",
   },
 
   FilePane: {
@@ -63,36 +69,69 @@
     "shift-up": "file_pane::ExtendPrev",
     "home": "file_pane::SelectFirst",
     "end": "file_pane::SelectLast",
-    "cmd-a": "file_pane::SelectAll",
+    "secondary-a": "file_pane::SelectAll",
     "ctrl-a": "file_pane::SelectAll",
     "escape": "file_pane::ClearSelection",
 
     // Navigation.
     "enter": "file_pane::Activate",
     "right": "file_pane::Activate",
-    "cmd-down": "file_pane::Activate",
+    "secondary-down": "file_pane::Activate",
     "backspace": "file_pane::GoUp",
     "left": "file_pane::GoUp",
-    "cmd-up": "file_pane::GoUp",
-    "cmd-[": "file_pane::GoBack",
-    "cmd-]": "file_pane::GoForward",
-    "cmd-left": "file_pane::GoBack",
-    "cmd-right": "file_pane::GoForward",
+    "secondary-up": "file_pane::GoUp",
+    "secondary-[": "file_pane::GoBack",
+    "secondary-]": "file_pane::GoForward",
+    "secondary-left": "file_pane::GoBack",
+    "secondary-right": "file_pane::GoForward",
     "tab": "workspace::FocusOtherPane",
 
     // Files.
     "space": "file_pane::QuickLook",
-    "cmd-f": "file_pane::Search",
-    "cmd-r": "file_pane::Refresh",
+    "secondary-f": "file_pane::Search",
+    "secondary-r": "file_pane::Refresh",
     "f5": "file_pane::Refresh",
-    "cmd-shift-n": "file_pane::NewFolder",
+    "secondary-shift-n": "file_pane::NewFolder",
     "f2": "file_pane::RenameSelected",
-    "cmd-backspace": "file_pane::DeleteSelected",
+    "secondary-backspace": "file_pane::DeleteSelected",
     // macOS reports shift-. as ">", so bind both spellings.
-    "cmd-shift-.": "file_pane::ToggleHidden",
-    "cmd->": "file_pane::ToggleHidden",
-    "cmd-shift-e": "file_pane::ToggleTree",
+    "secondary-shift-.": "file_pane::ToggleHidden",
+    "secondary->": "file_pane::ToggleHidden",
+    "secondary-shift-e": "file_pane::ToggleTree",
     // Address-bar idiom: edit the raw path (Escape returns to the breadcrumb).
-    "cmd-l": "file_pane::EditPath",
+    "secondary-l": "file_pane::EditPath",
+  },
+
+  // Ctrl is the command modifier off macOS, so ctrl-1…9 belongs to the tabs
+  // (browser convention, from "secondary-1…9" above). Spaces move to alt.
+  "windows,linux: Workspace": {
+    "ctrl-1": null,
+    "ctrl-2": null,
+    "ctrl-3": null,
+    "ctrl-4": null,
+    "ctrl-5": null,
+    "ctrl-6": null,
+    "ctrl-7": null,
+    "ctrl-8": null,
+    "ctrl-9": null,
+    "alt-1": ["workspace::SwitchSpace", { index: 1 }],
+    "alt-2": ["workspace::SwitchSpace", { index: 2 }],
+    "alt-3": ["workspace::SwitchSpace", { index: 3 }],
+    "alt-4": ["workspace::SwitchSpace", { index: 4 }],
+    "alt-5": ["workspace::SwitchSpace", { index: 5 }],
+    "alt-6": ["workspace::SwitchSpace", { index: 6 }],
+    "alt-7": ["workspace::SwitchSpace", { index: 7 }],
+    "alt-8": ["workspace::SwitchSpace", { index: 8 }],
+    "alt-9": ["workspace::SwitchSpace", { index: 9 }],
+  },
+
+  "windows,linux: FilePane": {
+    // Explorer idioms: Delete deletes, alt-arrows walk the history.
+    "delete": "file_pane::DeleteSelected",
+    "alt-left": "file_pane::GoBack",
+    "alt-right": "file_pane::GoForward",
+    "alt-up": "file_pane::GoUp",
+    // ctrl-h shows hidden files on Windows; keep ctrl-shift-. working too.
+    "ctrl-h": "file_pane::ToggleHidden",
   },
 }

@@ -313,6 +313,11 @@ pub struct KesselApp {
     update_installing: bool,
     /// Inline feedback shown in the update dialog (manual-install hint or error).
     update_error: Option<SharedString>,
+    /// In-app menu bar, drawn in the title bar where the OS has no menu bar of
+    /// its own (Windows, Linux). `None` on macOS, which owns the main menu.
+    /// It snapshots the menus when built, so it is rebuilt when the menu epoch
+    /// moves (a locale change reinstalls them).
+    menu_bar: Option<(u64, Entity<gpui_component::menu::AppMenuBar>)>,
 }
 
 /// Bandwidth slider unit: MB/s ↔ bytes/sec.
@@ -393,6 +398,7 @@ impl KesselApp {
             pending_pane_focus: false,
             ui_save_scheduled: false,
             config_epoch_seen: 0,
+            menu_bar: None,
             space_name_input: cx.new(|cx| InputState::new(window, cx).placeholder("space name")),
             space_icon: None,
             space_color: None,
@@ -1330,10 +1336,11 @@ impl KesselApp {
             dialog
                 .title("Transfers are running")
                 .w(px(440.))
-                .child(
+                .child(format!(
                     "Quitting pauses running transfers and resumes them the next \
-                     time kessel starts. Keep holding ⌘Q to quit without asking.",
-                )
+                     time kessel starts. Keep holding {} to quit without asking.",
+                    if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" }
+                ))
                 .confirm()
                 .button_props(
                     gpui_component::dialog::DialogButtonProps::default()
@@ -2340,6 +2347,10 @@ impl KesselApp {
             MouseButton::Left,
             |_: &MouseDownEvent, _, cx| cx.stop_propagation(),
         );
+        // Windows / Linux: the app menus, in the title bar (see `crate::menu`).
+        if let Some((_, menu_bar)) = &self.menu_bar {
+            left = left.child(menu_bar.clone());
+        }
         let mut right = h_flex().gap_1().items_center().on_mouse_down(
             MouseButton::Left,
             |_: &MouseDownEvent, _, cx| cx.stop_propagation(),
@@ -3542,6 +3553,17 @@ impl Render for KesselApp {
         // Workspace-context bindings (quit, tabs, panels) keep firing.
         if window.focused(cx).is_none() && self.rename.is_none() {
             window.focus(&self.focus_handle);
+        }
+
+        // Where the OS draws no menu bar, kessel draws one in its title bar.
+        // Rebuilt when `menu::install` bumps the epoch (locale change), since
+        // AppMenuBar snapshots the menus at construction.
+        if !cfg!(target_os = "macos") {
+            let epoch = crate::menu::epoch();
+            if self.menu_bar.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
+                let bar = gpui_component::menu::AppMenuBar::new(window, cx);
+                self.menu_bar = Some((epoch, bar));
+            }
         }
 
         let title_bar = self.render_title_bar(sidebar_right, cx);
