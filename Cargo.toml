@@ -23,11 +23,13 @@ tokio = { version = "1", features = [
   "time",
 ] }
 
-# Storage layer — every backend is an OpenDAL Operator
+# Storage layer — every backend is an OpenDAL Operator.
+# `services-sftp` is deliberately absent here: it pulls in `openssh`, which
+# hard-errors on non-unix targets. It is re-added for unix below, and the
+# sftp backend simply doesn't exist in the Windows build (see src/sftp.rs).
 opendal = { version = "0.58", features = [
   "services-s3",
   "services-fs",
-  "services-sftp",
   "services-ftp",
   "services-webdav",
   "services-gcs",
@@ -54,11 +56,6 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 # `http` request parts are what reqsign 0.20 signs; same major as reqwest/reqsign use.
 http = "1"
-
-# SFTP permissions/chmod — OpenDAL's sftp service hides unix modes, so kessel
-# runs its own short-lived session for them. Already in the tree via opendal;
-# same version, so no extra compile weight.
-openssh-sftp-client = { version = "0.15", features = ["openssh"] }
 
 # Local state
 sqlx = { version = "0.9", features = [
@@ -146,6 +143,14 @@ rmcp = { version = "2.2", features = [
 # HTTP server the MCP streamable transport mounts into; same axum major rmcp
 # builds against.
 axum = "0.8"
+
+# SFTP — the transport is `openssh`, which only builds on unix (it drives the
+# system `ssh` binary through a ControlMaster socket). Both OpenDAL's sftp
+# service and kessel's own session for permissions/chmod ride on it, so the
+# whole backend is unix-only.
+[target.'cfg(unix)'.dependencies]
+opendal = { version = "0.58", features = ["services-sftp"] }
+openssh-sftp-client = { version = "0.15", features = ["openssh"] }
 
 # AppKit bindings for the native drag-out session (NSDraggingSession +
 # NSFilePromiseProvider); versions match what gpui already pulls in.

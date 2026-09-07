@@ -362,7 +362,7 @@ impl Provider {
             "fs" => {
                 let (op, rel) = self.op_for(path)?;
                 let root = op.info().root().to_string();
-                let full = std::path::Path::new(&root).join(rel.trim_start_matches('/'));
+                let full = crate::localfs::full_path(&root, rel.trim_start_matches('/'));
                 let time = filetime::FileTime::from_unix_time(
                     mtime.timestamp(),
                     mtime.timestamp_subsec_nanos(),
@@ -477,7 +477,7 @@ impl Provider {
                 let full = self.fs_path(path);
                 let meta = std::fs::symlink_metadata(&full)
                     .with_context(|| format!("stat `{}`", full.display()))?;
-                Ok(Some(unix_mode(&meta)))
+                Ok(unix_mode(&meta))
             }
             _ => anyhow::bail!("permissions are not supported on this backend"),
         }
@@ -487,6 +487,7 @@ impl Provider {
     pub async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
         match self.scheme.as_str() {
             "sftp" => crate::sftp::chmod(&self.options, path, mode).await,
+            #[cfg(unix)]
             "fs" => {
                 let full = self.fs_path(path);
                 std::fs::set_permissions(
@@ -501,8 +502,12 @@ impl Provider {
 
     /// Absolute local path for an fs-site browse path.
     fn fs_path(&self, path: &str) -> std::path::PathBuf {
-        let root = self.options.get("root").map(String::as_str).unwrap_or("/");
-        std::path::Path::new(root).join(path.trim_end_matches('/'))
+        let root = self
+            .options
+            .get("root")
+            .cloned()
+            .unwrap_or_else(crate::localfs::root);
+        crate::localfs::full_path(&root, path)
     }
 
     /// Connectivity probe for the bookmark form's "Test" button.
@@ -619,8 +624,8 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
             stats.spawn(async move { (ix, op.stat(&rel).await.ok()) });
         }
         let permissions = fs_root.as_deref().and_then(|root| {
-            let full = std::path::Path::new(root).join(entry.path().trim_end_matches('/'));
-            std::fs::symlink_metadata(full).ok().map(|meta| unix_mode(&meta))
+            let full = crate::localfs::full_path(root, entry.path());
+            std::fs::symlink_metadata(full).ok().and_then(|meta| unix_mode(&meta))
         });
         entries.push(RemoteEntry {
             name: entry.name().trim_end_matches('/').to_string(),
@@ -650,8 +655,15 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
     Ok(entries)
 }
 
-/// `mode & 0o7777` from local fs metadata.
-fn unix_mode(meta: &std::fs::Metadata) -> u32 {
+/// `mode & 0o7777` from local fs metadata; `None` where the local filesystem
+/// has no unix mode to report (Windows), which blanks the permissions column.
+#[cfg(unix)]
+fn unix_mode(meta: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt as _;
-    meta.mode() & 0o7777
+    Some(meta.mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
 }

@@ -12,6 +12,9 @@ use openssh_sftp_client::metadata::{Permissions, RawPermissions};
 use openssh_sftp_client::{Sftp, SftpOptions};
 use smol::stream::StreamExt as _;
 
+/// Whether this build carries the sftp backend (see `sftp_unsupported.rs`).
+pub const SUPPORTED: bool = true;
+
 /// Open one sftp session from a site's resolved operator options.
 async fn connect(options: &HashMap<String, String>) -> Result<Sftp> {
     let endpoint = options

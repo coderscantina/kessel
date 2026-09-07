@@ -26,7 +26,7 @@ use crate::app::AppState;
 use crate::aws;
 use crate::bookmarks::{
     driver_by_scheme, is_oauth_scheme, secret_keys, DriverSpec, FieldSpec, AWS_PROFILE_OPT,
-    DRIVERS,
+    available_drivers,
 };
 use crate::i18n::t;
 use crate::db;
@@ -148,9 +148,10 @@ impl BookmarkManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let drivers = available_drivers();
         let spec = site
             .and_then(|site| driver_by_scheme(&site.scheme))
-            .unwrap_or(&DRIVERS[0]);
+            .unwrap_or(drivers[0]);
         let options = site.map(|site| site.options.clone()).unwrap_or_default();
         let stored_profile = options.get(AWS_PROFILE_OPT).cloned();
         let had_secret = site.is_some_and(|site| site.secret_handle.is_some());
@@ -164,12 +165,12 @@ impl BookmarkManager {
             });
         }
 
-        let driver_ix = DRIVERS
+        let driver_ix = drivers
             .iter()
             .position(|driver| driver.scheme == spec.scheme)
             .unwrap_or(0);
         let driver_items: Vec<SharedString> =
-            DRIVERS.iter().map(|driver| driver.label.into()).collect();
+            drivers.iter().map(|driver| driver.label.into()).collect();
         let driver = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(driver_items),
@@ -331,7 +332,10 @@ impl BookmarkManager {
         let SelectEvent::Confirm(Some(label)) = event else {
             return;
         };
-        let Some(spec) = DRIVERS.iter().find(|driver| driver.label == label.as_ref()) else {
+        let Some(spec) = available_drivers()
+            .into_iter()
+            .find(|driver| driver.label == label.as_ref())
+        else {
             return;
         };
         let Some(editor) = &self.editor else { return };

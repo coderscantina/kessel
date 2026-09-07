@@ -139,7 +139,7 @@ impl Column {
     fn available_for(self, scheme: &str) -> bool {
         match self {
             Column::Size | Column::Modified => true,
-            Column::Permissions => matches!(scheme, "fs" | "sftp"),
+            Column::Permissions => supports_permissions(scheme),
             Column::StorageClass | Column::Region => scheme == "s3",
         }
     }
@@ -1376,10 +1376,10 @@ impl FilePane {
                 .options
                 .get("root")
                 .cloned()
-                .unwrap_or_else(|| "/".to_string());
+                .unwrap_or_else(crate::localfs::root);
             let paths: Vec<PathBuf> = entries
                 .iter()
-                .map(|entry| Path::new(&root).join(entry.path.trim_end_matches('/')))
+                .map(|entry| crate::localfs::full_path(&root, &entry.path))
                 .collect();
             preview_files(paths);
             return;
@@ -1614,10 +1614,7 @@ impl FilePane {
         let queue = cx.global::<AppState>().queue.clone();
         let mut queued = 0;
         for path in paths {
-            let mut src = path.to_string_lossy().trim_start_matches('/').to_string();
-            if path.is_dir() {
-                src.push('/');
-            }
+            let src = crate::localfs::browse_path(path, path.is_dir());
             if dst_site == crate::queue::LOCAL_SITE_ID && parent_of(&src) == dst_dir {
                 continue;
             }
@@ -1857,7 +1854,7 @@ impl FilePane {
     /// "Download As…": pick a destination path; the file name becomes the
     /// job's destination-name override.
     fn download_as(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let start = dirs::download_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let start = dirs::download_dir().unwrap_or_else(|| PathBuf::from(crate::localfs::root()));
         let rx = cx.prompt_for_new_path(&start, Some(&entry.name));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else {
@@ -2314,9 +2311,9 @@ impl FilePane {
             .profile
             .options
             .get("root")
-            .map(String::as_str)
-            .unwrap_or("/");
-        let dir = Path::new(root).join(&self.path);
+            .cloned()
+            .unwrap_or_else(crate::localfs::root);
+        let dir = crate::localfs::full_path(&root, &self.path);
         if *watched == dir {
             return;
         }
@@ -3023,7 +3020,7 @@ fn build_context_menu(
         }
     }
 
-    if matches!(scheme.as_str(), "fs" | "sftp") {
+    if supports_permissions(&scheme) {
         if let Some(entry) = single.clone() {
             let pane = weak.clone();
             menu = menu.separator().item(PopupMenuItem::new("Permissions…").on_click(
@@ -3578,14 +3575,17 @@ fn preview_files(paths: Vec<PathBuf>) {
     }
 }
 
-/// Local directory → browse path on the reserved local site (no leading
-/// `/`, trailing `/` unless root).
+/// Whether a backend has unix permission bits to show and edit. The local
+/// filesystem only does on unix; sftp always does, but only exists at all in
+/// a unix build (see `sftp_unsupported.rs`).
+fn supports_permissions(scheme: &str) -> bool {
+    scheme == "sftp" || (cfg!(unix) && scheme == "fs")
+}
+
+/// Local directory → browse path on the reserved local site (root-relative,
+/// trailing `/` unless it *is* the root).
 pub(crate) fn local_dir_path(dir: &Path) -> String {
-    let mut path = dir.to_string_lossy().trim_start_matches('/').to_string();
-    if !path.is_empty() && !path.ends_with('/') {
-        path.push('/');
-    }
-    path
+    crate::localfs::dir_browse_path(dir)
 }
 
 /// `report.pdf` → `report copy.pdf`, then `report copy 2.pdf`, … — first

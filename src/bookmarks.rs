@@ -205,9 +205,19 @@ pub const DRIVERS: &[DriverSpec] = &[
     DriverSpec {
         scheme: "fs",
         label: "Local filesystem",
-        fields: &[field("root", "Root path", "/", false, true)],
+        fields: &[field("root", "Root path", "/ — or C:\\, D:\\… on Windows", false, true)],
     },
 ];
+
+/// The drivers this build can actually connect with, in menu order. The sftp
+/// transport only exists on unix (see `sftp_unsupported.rs`), so it isn't
+/// offered on Windows — a bookmark for it could never connect.
+pub fn available_drivers() -> Vec<&'static DriverSpec> {
+    DRIVERS
+        .iter()
+        .filter(|driver| driver.scheme != "sftp" || crate::sftp::SUPPORTED)
+        .collect()
+}
 
 /// Schemes whose credentials come from the browser OAuth flow.
 pub fn is_oauth_scheme(scheme: &str) -> bool {

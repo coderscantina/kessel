@@ -10,7 +10,6 @@
 //!   very bottom. The session (spaces × tabs) persists to SQLite.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
@@ -111,22 +110,21 @@ pub struct AppState {
 
 impl Global for AppState {}
 
-/// Connection profile for the machine's own filesystem, rooted at `/`.
+/// Connection profile for the machine's own filesystem, rooted at `/` (the
+/// system drive on Windows — see `localfs`).
 pub fn local_profile() -> SiteProfile {
     SiteProfile {
         id: LOCAL_SITE_ID,
         name: "Local".into(),
         scheme: "fs".into(),
-        options: HashMap::from([("root".to_string(), "/".to_string())]),
+        options: HashMap::from([("root".to_string(), crate::localfs::root())]),
         layers: LayerConfig::default(),
         ..Default::default()
     }
 }
 
 fn home_path() -> String {
-    dirs::home_dir()
-        .map(|p| p.to_string_lossy().trim_start_matches('/').to_string() + "/")
-        .unwrap_or_default()
+    crate::localfs::home_browse_path()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3471,10 +3469,10 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
         .map(|entry| crate::dragout::DragItem {
             name: entry.name.to_string(),
             is_dir: entry.is_dir,
-            // Local-site browse paths are absolute paths without the leading
-            // slash (dirs keep a trailing one) — see `accept_external`.
+            // Local-site browse paths are root-relative (dirs keep a trailing
+            // slash) — see `localfs`.
             local_path: local
-                .then(|| PathBuf::from(format!("/{}", entry.path.trim_end_matches('/')))),
+                .then(|| crate::localfs::full_path(&crate::localfs::root(), &entry.path)),
         })
         .collect();
 

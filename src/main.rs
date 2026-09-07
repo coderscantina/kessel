@@ -1,3 +1,8 @@
+// Release builds on Windows are GUI apps: no console window flashes up behind
+// the app. Debug builds keep the console so `cargo run` still shows the
+// tracing output that the fmt layer writes to stdout.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod aws;
@@ -8,6 +13,7 @@ mod dragout;
 mod edit;
 mod i18n;
 mod keymap;
+mod localfs;
 mod logs;
 mod mcp;
 mod menu;
@@ -16,6 +22,9 @@ mod provider;
 mod queue;
 mod s3;
 mod secrets;
+// The sftp transport is unix-only (see Cargo.toml); elsewhere a stub module
+// with the same signatures stands in, so call sites stay `cfg`-free.
+#[cfg_attr(not(unix), path = "sftp_unsupported.rs")]
 mod sftp;
 mod sso;
 mod sync;
