@@ -38,8 +38,8 @@ flag on.
   mid-transfer on relaunch
 - Upload, download and site-to-site copy are the same code path: a layered
   source Operator streamed into a layered destination Operator
-- Conflict handling per file: ask, overwrite, skip, resume (append the missing
-  tail), or rename
+- Resolve conflicts per file or for the entire transfer: overwrite, overwrite
+  if newer, skip, resume a known partial copy, or keep both with a unique name
 - Priorities, pause/resume (per job and global), retries, post-transfer
   verification, timestamp preservation, transfer history
 - Global and per-site bandwidth throttling and concurrency caps

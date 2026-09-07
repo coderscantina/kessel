@@ -44,6 +44,8 @@ pub enum ConflictPolicy {
     #[default]
     Ask,
     Overwrite,
+    /// Replace only a newer source; missing timestamps leave a conflict.
+    OverwriteNewer,
     Skip,
     /// Append the missing tail where the backend supports it; skip files the
     /// destination already holds completely; overwrite where neither fits.
@@ -57,6 +59,7 @@ impl ConflictPolicy {
         match self {
             Self::Ask => "ask",
             Self::Overwrite => "overwrite",
+            Self::OverwriteNewer => "overwrite_newer",
             Self::Skip => "skip",
             Self::Resume => "resume",
             Self::Rename => "rename",
@@ -66,6 +69,7 @@ impl ConflictPolicy {
     fn from_str(s: &str) -> Self {
         match s {
             "overwrite" => Self::Overwrite,
+            "overwrite_newer" => Self::OverwriteNewer,
             "skip" => Self::Skip,
             "resume" => Self::Resume,
             "rename" => Self::Rename,
@@ -153,8 +157,10 @@ pub struct TaskSnapshot {
 /// One parked conflict, for the resolve dialog's size/date comparison.
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
+    pub id: i64,
     pub dst: String,
     pub src_size: Option<u64>,
+    pub src_modified: Option<String>,
     pub dst_size: Option<u64>,
     pub dst_modified: Option<String>,
 }
@@ -212,6 +218,7 @@ pub(crate) enum Command {
     Retry(i64),
     /// Apply a decision to a job's parked conflicts (and future ones).
     Resolve(i64, ConflictPolicy),
+    ResolveTask(i64, ConflictPolicy),
     ClearFinished,
     /// Remove one terminal job from the queue view (history keeps the row).
     Remove(i64),
@@ -299,6 +306,9 @@ impl QueueHandle {
     /// conflicts the job hits later.
     pub fn resolve(&self, job_id: i64, policy: ConflictPolicy) {
         let _ = self.cmds.send(Command::Resolve(job_id, policy));
+    }
+    pub fn resolve_task(&self, task_id: i64, policy: ConflictPolicy) {
+        let _ = self.cmds.send(Command::ResolveTask(task_id, policy));
     }
     pub fn clear_finished(&self) {
         let _ = self.cmds.send(Command::ClearFinished);

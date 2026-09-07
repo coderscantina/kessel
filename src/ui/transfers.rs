@@ -90,24 +90,24 @@ pub struct TransfersPanel {
 
 impl EventEmitter<TransfersEvent> for TransfersPanel {}
 
-/// "These files already exist" prompt: fetches the parked conflicts (for a
-/// size + date comparison), then asks for one decision applied to the whole
-/// job, now and for conflicts it hits later.
-fn open_resolve_dialog(
-    job_id: i64,
-    window: &mut Window,
-    cx: &mut Context<TransfersPanel>,
-) {
+/// Show the next conflict with an explicit per-file or whole-transfer decision.
+fn open_resolve_dialog(job_id: i64, window: &mut Window, cx: &mut Context<TransfersPanel>) {
     let state = cx.global::<AppState>();
     let pool = state.db.clone();
     let queue = state.queue.clone();
     let fetch = state
         .runtime
-        .spawn(async move { crate::queue::store::job_conflicts(&pool, job_id, 8).await });
+        .spawn(async move { crate::queue::store::job_conflicts(&pool, job_id, 100).await });
     cx.spawn_in(window, async move |_, cx| {
         let conflicts = match fetch.await {
             Ok(Ok(conflicts)) => conflicts,
-            _ => Vec::new(),
+            error => {
+                cx.update(|window, cx| {
+                    window.push_notification(format!("Could not load conflicts: {error:?}"), cx);
+                })
+                .ok();
+                return;
+            }
         };
         cx.update(|window, cx| {
             open_resolve_dialog_with(job_id, conflicts, queue, window, cx);
@@ -124,11 +124,21 @@ fn open_resolve_dialog_with(
     window: &mut Window,
     cx: &mut App,
 ) {
+    if conflicts.is_empty() {
+        window.push_notification("No conflicts waiting in this transfer.", cx);
+        return;
+    }
+    let task_id = conflicts[0].id;
     const CHOICES: &[(&str, &str, ConflictPolicy)] = &[
         (
             "Overwrite",
             "Replace the existing files with the source files.",
             ConflictPolicy::Overwrite,
+        ),
+        (
+            "Overwrite if newer",
+            "Replace only when the source is newer. Missing dates require a decision.",
+            ConflictPolicy::OverwriteNewer,
         ),
         (
             "Skip",
@@ -137,7 +147,7 @@ fn open_resolve_dialog_with(
         ),
         (
             "Resume",
-            "Transfer only the missing tail where possible; complete files are skipped.",
+            "Use only for a known partial copy. Appends when supported; otherwise replaces. Equal or larger files are skipped.",
             ConflictPolicy::Resume,
         ),
         (
@@ -148,42 +158,26 @@ fn open_resolve_dialog_with(
     ];
     window.open_dialog(cx, move |dialog, _, cx| {
         let queue = queue.clone();
-        // Existing vs incoming, per parked file: "name · existing 1.2 MB,
-        // 2026-07-01 10:31 · new 2.0 MB".
-        let comparison = v_flex().gap_0p5().children(conflicts.iter().map(|conflict| {
-            let name = conflict.dst.rsplit('/').next().unwrap_or(&conflict.dst);
-            let existing = match (conflict.dst_size, conflict.dst_modified.as_deref()) {
-                (Some(size), Some(raw)) => {
-                    let when = chrono::DateTime::parse_from_rfc3339(raw)
-                        .map(|t| human_time(Some(t.with_timezone(&chrono::Utc))))
-                        .unwrap_or_else(|_| raw.to_string());
-                    format!("existing {} · {when}", human_size(size))
-                }
-                (Some(size), None) => format!("existing {}", human_size(size)),
-                _ => "existing".to_string(),
-            };
-            let incoming = match conflict.src_size {
-                Some(size) => format!("new {}", human_size(size)),
-                None => "new".to_string(),
-            };
-            h_flex()
-                .gap_2()
-                .text_xs()
-                .child(div().flex_1().min_w_0().truncate().child(name.to_string()))
-                .child(
-                    div()
-                        .text_color(cx.theme().muted_foreground)
-                        .whitespace_nowrap()
-                        .child(format!("{existing} → {incoming}")),
-                )
-        }));
+        let conflict = &conflicts[0];
+        let details = |label: &str, size: Option<u64>, modified: Option<&str>| {
+            let size = size.map(human_size).unwrap_or_else(|| "Unknown size".into());
+            let modified = modified
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|time| human_time(Some(time.with_timezone(&chrono::Utc))))
+                .unwrap_or_else(|| "Unknown date".into());
+            format!("{label}: {size} · {modified}")
+        };
+        let comparison = v_flex().gap_1().text_xs()
+            .child(div().child(conflict.dst.clone()))
+            .child(details("Incoming", conflict.src_size, conflict.src_modified.as_deref()))
+            .child(details("Existing", conflict.dst_size, conflict.dst_modified.as_deref()));
         dialog
-            .title("Files already exist")
-            .w(px(480.))
+            .title("File already exists")
+            .w(px(580.))
             .child(
                 v_flex()
                     .gap_2()
-                    .child("Some destination files already exist. What should happen to them?")
+                    .child("Choose for this file, or apply a rule to every conflict in this transfer, including future conflicts.")
                     .when(!conflicts.is_empty(), |this| {
                         this.child(
                             v_flex()
@@ -197,18 +191,30 @@ fn open_resolve_dialog_with(
                     .children(CHOICES.iter().map(|(label, explain, policy)| {
                         let queue = queue.clone();
                         let policy = *policy;
+                        let remaining = conflicts[1..].to_vec();
                         v_flex()
                             .gap_0p5()
-                            .child(
-                                Button::new(*label)
-                                    .label(*label)
-                                    .outline()
-                                    .small()
-                                    .on_click(move |_, window, cx| {
-                                        queue.resolve(job_id, policy);
-                                        window.close_dialog(cx);
-                                    }),
-                            )
+                            .child({
+                                let all_queue = queue.clone();
+                                h_flex().gap_2()
+                                    .child(Button::new(*label)
+                                        .label(format!("{label}: this file"))
+                                        .outline().small()
+                                        .on_click(move |_, window, cx| {
+                                            queue.resolve_task(task_id, policy);
+                                            window.close_dialog(cx);
+                                            if !remaining.is_empty() {
+                                                open_resolve_dialog_with(job_id, remaining.clone(), queue.clone(), window, cx);
+                                            }
+                                        }))
+                                    .child(Button::new(gpui::SharedString::from(format!("all-{label}")))
+                                        .label("Entire transfer")
+                                        .ghost().small()
+                                        .on_click(move |_, window, cx| {
+                                            all_queue.resolve(job_id, policy);
+                                            window.close_dialog(cx);
+                                        }))
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -550,9 +556,7 @@ impl TransfersPanel {
                         .child(error),
                 )
             })
-            .when(is_expanded, |this| {
-                this.child(self.render_tasks(job, cx))
-            })
+            .when(is_expanded, |this| this.child(self.render_tasks(job, cx)))
     }
 
     /// The unfolded per-file task list of one job.

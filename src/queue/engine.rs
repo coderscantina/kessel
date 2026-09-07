@@ -306,6 +306,9 @@ impl Engine {
             Command::Resolve(id, policy) => {
                 store::resolve_job_conflicts(&self.pool, id, policy).await?;
             }
+            Command::ResolveTask(id, policy) => {
+                store::resolve_task_conflict(&self.pool, id, policy).await?;
+            }
             Command::ClearFinished => {
                 for id in store::clear_finished(&self.pool).await? {
                     self.jobs.remove(&id);
@@ -416,12 +419,14 @@ impl Engine {
                         store::set_task_state(&self.pool, task_id, "skipped").await?;
                     }
                     Outcome::Conflict {
+                        policy,
                         dst_size,
                         dst_modified,
                     } => {
                         store::park_task_conflict(
                             &self.pool,
                             task_id,
+                            policy,
                             dst_size,
                             dst_modified.as_deref(),
                         )
@@ -986,6 +991,110 @@ mod tests {
         });
         assert_eq!(snap.jobs[0].state, JobState::Done);
         assert_eq!(std::fs::read(dst_dir.join("file.txt")).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn resolving_one_file_leaves_other_conflicts_parked() {
+        let env = test_env("individual-conflict");
+        let src = env.dir.join("tree");
+        let dst = env.dir.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(dst.join("tree")).unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(src.join(name), b"NEW").unwrap();
+            std::fs::write(dst.join("tree").join(name), b"OLD").unwrap();
+        }
+        env.handle.enqueue(job(
+            format!("{}/", browse(&src)),
+            format!("{}/", browse(&dst)),
+            ConflictPolicy::Ask,
+        ));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.files_conflict == 2)
+        });
+        let id = snap.jobs[0].id;
+        let conflicts = env
+            .rt
+            .block_on(store::job_conflicts(&env.pool, id, 2))
+            .unwrap();
+        env.handle
+            .resolve_task(conflicts[0].id, ConflictPolicy::Overwrite);
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs
+                .first()
+                .is_some_and(|j| j.files_done == 1 && j.files_conflict == 1)
+        });
+        assert_eq!(snap.jobs[0].state, JobState::Active);
+        let remaining = env
+            .rt
+            .block_on(store::job_conflicts(&env.pool, id, 2))
+            .unwrap();
+        assert_eq!(remaining[0].id, conflicts[1].id);
+        env.handle.resolve(id, ConflictPolicy::Skip);
+        wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state == JobState::Done)
+        });
+        assert_eq!(
+            std::fs::read(dst.join("tree").join(file_name(&conflicts[0].dst))).unwrap(),
+            b"NEW"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("tree").join(file_name(&conflicts[1].dst))).unwrap(),
+            b"OLD"
+        );
+    }
+
+    #[test]
+    fn overwrite_newer_compares_modification_times() {
+        for (name, source_time, expected) in [
+            ("newer", 200, b"NEW"),
+            ("older", 50, b"OLD"),
+            ("equal", 100, b"OLD"),
+        ] {
+            let (env, src, dst) = conflict_env(name, b"NEW");
+            filetime::set_file_mtime(
+                src.join("file.txt"),
+                filetime::FileTime::from_unix_time(source_time, 0),
+            )
+            .unwrap();
+            filetime::set_file_mtime(
+                dst.join("file.txt"),
+                filetime::FileTime::from_unix_time(100, 0),
+            )
+            .unwrap();
+            env.handle.enqueue(job(
+                browse(&src.join("file.txt")),
+                format!("{}/", browse(&dst)),
+                ConflictPolicy::OverwriteNewer,
+            ));
+            let snap = wait_until(&env.handle, |s| {
+                s.jobs.first().is_some_and(|j| j.state.is_terminal())
+            });
+            assert_eq!(snap.jobs[0].state, JobState::Done);
+            assert_eq!(std::fs::read(dst.join("file.txt")).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn keeps_both_unicode_filenames() {
+        let env = test_env("unicode-rename");
+        let src = env.dir.join("src");
+        let dst = env.dir.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("日本.tar.gz"), b"NEW").unwrap();
+        std::fs::write(dst.join("日本.tar.gz"), b"OLD").unwrap();
+        env.handle.enqueue(job(
+            browse(&src.join("日本.tar.gz")),
+            format!("{}/", browse(&dst)),
+            ConflictPolicy::Rename,
+        ));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state.is_terminal())
+        });
+        assert_eq!(snap.jobs[0].state, JobState::Done);
+        assert_eq!(std::fs::read(dst.join("日本 (1).tar.gz")).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(dst.join("日本.tar.gz")).unwrap(), b"OLD");
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub(crate) enum Outcome {
     /// Destination already existed under policy `Ask`: parked for the user,
     /// with what the destination held at detection time.
     Conflict {
+        policy: ConflictPolicy,
         dst_size: u64,
         dst_modified: Option<String>,
     },
@@ -118,45 +119,72 @@ async fn run_inner(
         .with_context(|| format!("stat source `{}`", task.src))?;
     let size = meta.content_length();
     let etag = meta.etag().map(str::to_string);
+    let modified = meta
+        .last_modified()
+        .and_then(crate::provider::to_datetime)
+        .map(|t| t.to_rfc3339());
     let can_append = dst.caps.write_can_append;
 
     // Conflict check: only for a fresh transfer (byte_offset > 0 means the
     // partial destination is our own earlier work, handled by resume below).
     let mut resume_from_dst = None;
     if task.byte_offset == 0 {
-        if let Ok(dst_meta) = dst_op.stat(&dst_path).await {
-            if !dst_meta.is_dir() {
-                let dst_len = dst_meta.content_length();
-                match task.conflict_policy {
-                    ConflictPolicy::Overwrite => {}
-                    ConflictPolicy::Ask => {
-                        return Ok(Outcome::Conflict {
-                            dst_size: dst_len,
-                            dst_modified: dst_meta
-                                .last_modified()
-                                .and_then(crate::provider::to_datetime)
-                                .map(|t| t.to_rfc3339()),
-                        });
-                    }
-                    ConflictPolicy::Skip => return Ok(Outcome::Skipped),
-                    ConflictPolicy::Resume => {
-                        if dst_len >= size {
-                            return Ok(Outcome::Skipped);
+        store::update_task_meta(pool, task.id, size, etag.as_deref(), 0, modified.as_deref())
+            .await?;
+        let destination = match dst_op.stat(&dst_path).await {
+            Ok(meta) => Some(meta),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("checking destination before transfer"),
+        };
+        if let Some(dst_meta) = destination {
+            anyhow::ensure!(!dst_meta.is_dir(), "destination `{}` is a folder", task.dst);
+            let dst_len = dst_meta.content_length();
+            match task.conflict_policy {
+                ConflictPolicy::Overwrite => {}
+                ConflictPolicy::OverwriteNewer => {
+                    match (meta.last_modified(), dst_meta.last_modified()) {
+                        (Some(source), Some(destination)) if source > destination => {}
+                        (Some(_), Some(_)) => return Ok(Outcome::Skipped),
+                        _ => {
+                            return Ok(Outcome::Conflict {
+                                policy: task.conflict_policy,
+                                dst_size: dst_len,
+                                dst_modified: dst_meta
+                                    .last_modified()
+                                    .and_then(crate::provider::to_datetime)
+                                    .map(|t| t.to_rfc3339()),
+                            })
                         }
-                        if can_append {
-                            resume_from_dst = Some(dst_len);
-                        }
-                        // No append support: fall through and overwrite.
                     }
-                    ConflictPolicy::Rename => {
-                        let new_name = unique_name(&dst_op, &dst_path).await?;
-                        let old_name_len = file_name(&dst_path).len();
-                        dst_path.truncate(dst_path.len() - old_name_len);
-                        dst_path.push_str(&new_name);
-                        dst_browse.truncate(dst_browse.len() - old_name_len);
-                        dst_browse.push_str(&new_name);
-                        store::update_task_dst(pool, task.id, &dst_browse).await?;
+                }
+                ConflictPolicy::Ask => {
+                    return Ok(Outcome::Conflict {
+                        policy: task.conflict_policy,
+                        dst_size: dst_len,
+                        dst_modified: dst_meta
+                            .last_modified()
+                            .and_then(crate::provider::to_datetime)
+                            .map(|t| t.to_rfc3339()),
+                    });
+                }
+                ConflictPolicy::Skip => return Ok(Outcome::Skipped),
+                ConflictPolicy::Resume => {
+                    if dst_len >= size {
+                        return Ok(Outcome::Skipped);
                     }
+                    if can_append {
+                        resume_from_dst = Some(dst_len);
+                    }
+                    // No append support: fall through and overwrite.
+                }
+                ConflictPolicy::Rename => {
+                    let new_name = unique_name(&dst_op, &dst_path).await?;
+                    let old_name_len = file_name(&dst_path).len();
+                    dst_path.truncate(dst_path.len() - old_name_len);
+                    dst_path.push_str(&new_name);
+                    dst_browse.truncate(dst_browse.len() - old_name_len);
+                    dst_browse.push_str(&new_name);
+                    store::update_task_dst(pool, task.id, &dst_browse).await?;
                 }
             }
         }
@@ -166,7 +194,15 @@ async fn run_inner(
         Some(offset) => offset,
         None => resume_offset(&dst_op, &dst_path, task, size, etag.as_deref(), can_append).await,
     };
-    store::update_task_meta(pool, task.id, size, etag.as_deref(), offset).await?;
+    store::update_task_meta(
+        pool,
+        task.id,
+        size,
+        etag.as_deref(),
+        offset,
+        modified.as_deref(),
+    )
+    .await?;
 
     if offset == size && size > 0 {
         finish_transfer(
@@ -344,8 +380,8 @@ async fn unique_name(dst_op: &Operator, dst_path: &str) -> Result<String> {
     let parent = &dst_path[..dst_path.len() - name.len()];
     // "archive.tar.gz" → ("archive", ".tar.gz") is nice-to-have; splitting at
     // the first dot after the first char covers it and keeps dotfiles whole.
-    let (stem, ext) = match name[1..].find('.') {
-        Some(ix) => name.split_at(ix + 1),
+    let (stem, ext) = match name.char_indices().skip(1).find(|(_, c)| *c == '.') {
+        Some((ix, _)) => name.split_at(ix),
         None => (name, ""),
     };
     for n in 1..1000u32 {

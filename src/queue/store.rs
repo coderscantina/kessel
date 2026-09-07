@@ -39,7 +39,7 @@ pub(crate) struct ClaimedTask {
     pub byte_offset: u64,
     pub total_bytes: Option<u64>,
     pub src_etag: Option<String>,
-    /// The owning job's current conflict policy.
+    /// This file's decision, falling back to the owning job's policy.
     pub conflict_policy: ConflictPolicy,
     /// The owning job transfers with move semantics.
     pub move_source: bool,
@@ -206,7 +206,7 @@ pub(crate) async fn claim_task(
              WHERE t.state = 'queued' AND j.state = 'active' AND j.id IN ({ids}) \
              ORDER BY j.priority DESC, t.id LIMIT 1) \
          RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, \
-             (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id) AS conflict_policy, \
+             COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
              (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
     );
     // `ids` is a comma-joined list of i64 job ids, not user input.
@@ -234,14 +234,16 @@ pub(crate) async fn update_task_meta(
     total_bytes: u64,
     src_etag: Option<&str>,
     byte_offset: u64,
+    src_modified: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE transfer_tasks SET total_bytes = ?, src_etag = ?, byte_offset = ?, \
+        "UPDATE transfer_tasks SET total_bytes = ?, src_etag = ?, byte_offset = ?, src_modified = ?, \
          updated_at = datetime('now') WHERE id = ?",
     )
     .bind(total_bytes as i64)
     .bind(src_etag)
     .bind(byte_offset as i64)
+    .bind(src_modified)
     .bind(task_id)
     .execute(pool)
     .await?;
@@ -281,13 +283,17 @@ pub(crate) async fn complete_task(pool: &SqlitePool, task_id: i64, bytes: u64) -
 pub(crate) async fn park_task_conflict(
     pool: &SqlitePool,
     task_id: i64,
+    policy: ConflictPolicy,
     dst_size: u64,
     dst_modified: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE transfer_tasks SET state = 'conflict', dst_size = ?, dst_modified = ?, \
+        "UPDATE transfer_tasks SET state = CASE WHEN COALESCE(conflict_policy, \
+         (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) = ? \
+         THEN 'conflict' ELSE 'queued' END, dst_size = ?, dst_modified = ?, \
          updated_at = datetime('now') WHERE id = ?",
     )
+    .bind(policy.as_str())
     .bind(dst_size as i64)
     .bind(dst_modified)
     .bind(task_id)
@@ -321,13 +327,26 @@ pub(crate) async fn resolve_job_conflicts(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE transfer_tasks SET state = 'queued', updated_at = datetime('now') \
+        "UPDATE transfer_tasks SET conflict_policy = NULL, state = 'queued', updated_at = datetime('now') \
          WHERE job_id = ? AND state = 'conflict'",
     )
     .bind(job_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn resolve_task_conflict(
+    pool: &SqlitePool,
+    task_id: i64,
+    policy: ConflictPolicy,
+) -> Result<()> {
+    sqlx::query("UPDATE transfer_tasks SET conflict_policy = ?, state = 'queued', updated_at = datetime('now') WHERE id = ? AND state = 'conflict'")
+        .bind(policy.as_str())
+        .bind(task_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -655,7 +674,7 @@ pub(crate) async fn job_conflicts(
     limit: i64,
 ) -> Result<Vec<ConflictInfo>> {
     let rows = sqlx::query(
-        "SELECT dst, total_bytes, dst_size, dst_modified FROM transfer_tasks \
+        "SELECT id, dst, total_bytes, src_modified, dst_size, dst_modified FROM transfer_tasks \
          WHERE job_id = ? AND state = 'conflict' ORDER BY id LIMIT ?",
     )
     .bind(job_id)
@@ -665,8 +684,10 @@ pub(crate) async fn job_conflicts(
     Ok(rows
         .into_iter()
         .map(|row| ConflictInfo {
+            id: row.get("id"),
             dst: row.get("dst"),
             src_size: row.get::<Option<i64>, _>("total_bytes").map(|b| b as u64),
+            src_modified: row.get("src_modified"),
             dst_size: row.get::<Option<i64>, _>("dst_size").map(|b| b as u64),
             dst_modified: row.get("dst_modified"),
         })
@@ -760,4 +781,68 @@ pub(crate) async fn task_states(pool: &SqlitePool, job_id: i64) -> Result<HashMa
         .into_iter()
         .map(|row| (row.get("state"), row.get("n")))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn late_conflicts_follow_the_latest_rule() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let job = super::super::NewJob {
+            src_site_id: 0,
+            dst_site_id: 0,
+            src: "source/file".into(),
+            dst_dir: "target/".into(),
+            dst_name: None,
+            conflict_policy: ConflictPolicy::Ask,
+            move_source: false,
+        };
+        let id = enqueue_job(&pool, &job).await.unwrap();
+        begin_expansion(&pool, id).await.unwrap();
+        insert_tasks(
+            &pool,
+            id,
+            &[NewTask {
+                src: job.src,
+                dst: "target/file".into(),
+                total_bytes: Some(3),
+                src_etag: None,
+            }],
+        )
+        .await
+        .unwrap();
+        finish_expansion(&pool, id).await.unwrap();
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        resolve_job_conflicts(&pool, id, ConflictPolicy::Overwrite)
+            .await
+            .unwrap();
+        park_task_conflict(&pool, task.id, task.conflict_policy, 3, None)
+            .await
+            .unwrap();
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert_eq!(task.conflict_policy, ConflictPolicy::Overwrite);
+
+        park_task_conflict(&pool, task.id, task.conflict_policy, 3, None)
+            .await
+            .unwrap();
+        resolve_task_conflict(&pool, task.id, ConflictPolicy::OverwriteNewer)
+            .await
+            .unwrap();
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        park_task_conflict(&pool, task.id, task.conflict_policy, 3, None)
+            .await
+            .unwrap();
+        resolve_job_conflicts(&pool, id, ConflictPolicy::Skip)
+            .await
+            .unwrap();
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert_eq!(task.conflict_policy, ConflictPolicy::Skip);
+    }
 }
