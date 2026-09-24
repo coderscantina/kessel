@@ -573,8 +573,8 @@ async fn prepare_job(
 }
 
 /// Turn the job's source into per-file tasks. A file maps 1:1; a directory
-/// is listed recursively *as a stream* — tasks are inserted in batches while
-/// the listing runs, so arbitrarily large trees never sit in memory.
+/// is walked *as a stream* ([`TreeWalk`]) — tasks are inserted in batches
+/// while the walk runs, so arbitrarily large trees never sit in memory.
 /// Subdirectories are pre-created at the destination (so empty dirs
 /// survive); symlinks and other non-regular entries are left behind.
 /// Returns the number of file tasks created.
@@ -584,8 +584,6 @@ async fn expand_job(
     job: &JobRow,
     skip_hidden: bool,
 ) -> Result<u64> {
-    use futures::TryStreamExt as _;
-
     let (src_op, src_rel) = providers.src.op_for(&job.src)?;
     let name = job
         .dst_name
@@ -625,9 +623,7 @@ async fn expand_job(
     let (src_op, src_rel) = providers.src.op_for(&src_dir)?;
     let base = format!("{}{name}/", job.dst);
 
-    let mut lister = src_op
-        .lister_with(&src_rel)
-        .recursive(true)
+    let mut walk = TreeWalk::new(src_op, src_rel.clone(), skip_hidden)
         .await
         .with_context(|| format!("listing `{src_dir}`"))?;
 
@@ -641,18 +637,8 @@ async fn expand_job(
 
     let mut batch: Vec<NewTask> = Vec::with_capacity(EXPANSION_BATCH);
     let mut count = 0u64;
-    while let Some(entry) = lister
-        .try_next()
-        .await
-        .with_context(|| format!("listing `{src_dir}`"))?
-    {
+    while let Some(entry) = walk.next().await? {
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
-        if rel.is_empty() {
-            continue;
-        }
-        if skip_hidden && rel.split('/').any(|segment| segment.starts_with('.')) {
-            continue;
-        }
         let meta = entry.metadata();
         if meta.is_dir() {
             let (dst_op, dst_rel) = providers.dst.op_for(&format!("{base}{rel}"))?;
@@ -682,6 +668,101 @@ async fn expand_job(
     }
     store::insert_tasks(pool, job.id, &batch).await?;
     Ok(count)
+}
+
+/// Every entry below a directory, excluding the directory itself. Backends
+/// with native recursive listing (S3 and friends) stream it in one go. The
+/// rest are walked one folder at a time: OpenDAL's simulated recursion drops
+/// a folder whose listing fails and gets retried, which silently truncates
+/// big FTP trees. Here a folder listing is retried as a whole.
+enum TreeWalk {
+    Native {
+        lister: opendal::Lister,
+        root: String,
+        skip_hidden: bool,
+    },
+    Folders {
+        op: opendal::Operator,
+        root: String,
+        skip_hidden: bool,
+        pending: Vec<String>,
+        current: std::vec::IntoIter<opendal::Entry>,
+    },
+}
+
+impl TreeWalk {
+    async fn new(op: opendal::Operator, root: String, skip_hidden: bool) -> Result<Self> {
+        Ok(if op.info().capability().list_with_recursive {
+            TreeWalk::Native {
+                lister: op.lister_with(&root).recursive(true).await?,
+                root,
+                skip_hidden,
+            }
+        } else {
+            TreeWalk::Folders {
+                op,
+                pending: vec![root.clone()],
+                root,
+                skip_hidden,
+                current: Vec::new().into_iter(),
+            }
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<opendal::Entry>> {
+        use futures::TryStreamExt as _;
+
+        loop {
+            let (entry, root, skip_hidden) = match self {
+                TreeWalk::Native {
+                    lister,
+                    root,
+                    skip_hidden,
+                } => {
+                    let entry = lister
+                        .try_next()
+                        .await
+                        .with_context(|| format!("listing `{root}`"))?;
+                    (entry, root, *skip_hidden)
+                }
+                TreeWalk::Folders {
+                    op,
+                    root,
+                    skip_hidden,
+                    pending,
+                    current,
+                } => match current.next() {
+                    Some(entry) => (Some(entry), root, *skip_hidden),
+                    None => {
+                        let Some(dir) = pending.pop() else {
+                            return Ok(None);
+                        };
+                        let mut entries = op
+                            .list(&dir)
+                            .await
+                            .with_context(|| format!("listing `{dir}`"))?;
+                        // Some backends list the folder itself.
+                        entries.retain(|entry| entry.path() != dir);
+                        *current = entries.into_iter();
+                        continue;
+                    }
+                },
+            };
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            let rel = entry.path().strip_prefix(root.as_str()).unwrap_or(entry.path());
+            if rel.is_empty() || (skip_hidden && rel.split('/').any(|s| s.starts_with('.'))) {
+                continue;
+            }
+            if let TreeWalk::Folders { pending, .. } = self {
+                if entry.metadata().is_dir() {
+                    pending.push(entry.path().to_string());
+                }
+            }
+            return Ok(Some(entry));
+        }
+    }
 }
 
 /// After a successful move job: skipped or failed files stay put, so only
