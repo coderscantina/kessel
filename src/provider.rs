@@ -216,6 +216,18 @@ impl Provider {
     // The layer stack is the core value proposition: retry, timeout,
     // throttle and observability are OpenDAL's, not ours.
     fn apply_layers(mut op: Operator, layers: &LayerConfig) -> Operator {
+        // Timeout goes inside retry, so a stalled attempt is retried instead
+        // of ending the whole operation. The one knob also bounds each IO
+        // step (a folder listing, a read chunk): OpenDAL's 10s IO default is
+        // too tight for large FTP listings.
+        if let Some(secs) = layers.timeout_secs {
+            let timeout = Duration::from_secs(secs);
+            op = op.layer(
+                TimeoutLayer::new()
+                    .with_timeout(timeout)
+                    .with_io_timeout(timeout),
+            );
+        }
         if let Some(retry) = &layers.retry {
             op = op.layer(
                 RetryLayer::new()
@@ -224,9 +236,6 @@ impl Provider {
                     .with_max_delay(Duration::from_millis(retry.max_delay_ms))
                     .with_jitter(),
             );
-        }
-        if let Some(secs) = layers.timeout_secs {
-            op = op.layer(TimeoutLayer::new().with_timeout(Duration::from_secs(secs)));
         }
         if let Some(throttle) = &layers.throttle {
             op = op.layer(ThrottleLayer::new(throttle.bandwidth, throttle.burst));
