@@ -160,15 +160,33 @@ struct Workspace {
     active: usize,
     split_h: Entity<ResizableState>,
     split_v: Entity<ResizableState>,
-    linked_roots: Option<[(i64, String); 2]>,
+    /// Linked browsing: each pane's (site, folder) as of the last synced move.
+    linked_dirs: Option<[(i64, String); 2]>,
 }
 
-fn linked_directory(root: &str, other_root: &str, path: &str) -> Option<String> {
-    if path.split('/').any(|part| matches!(part, "." | "..")) {
+/// Replay a pane's move from `from` to `to` onto the other pane at `other`:
+/// climb as many levels as the move climbed, then descend into the same
+/// subfolders. `None` once the climb would pass the other pane's root.
+fn linked_directory(from: &str, to: &str, other: &str) -> Option<String> {
+    if to.split('/').any(|part| matches!(part, "." | "..")) {
         return None;
     }
-    let relative = path.strip_prefix(root)?;
-    Some(format!("{other_root}{relative}"))
+    let from_parts: Vec<&str> = from.split_terminator('/').collect();
+    let to_parts: Vec<&str> = to.split_terminator('/').collect();
+    let shared = from_parts
+        .iter()
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let other_parts: Vec<&str> = other.split_terminator('/').collect();
+    let keep = other_parts.len().checked_sub(from_parts.len() - shared)?;
+    Some(
+        other_parts[..keep]
+            .iter()
+            .chain(&to_parts[shared..])
+            .map(|part| format!("{part}/"))
+            .collect(),
+    )
 }
 
 enum TabContent {
@@ -530,7 +548,7 @@ impl KesselApp {
             active: 0,
             split_h,
             split_v,
-            linked_roots: None,
+            linked_dirs: None,
         };
         // Seed each pane's tree orientation from the initial layout.
         for pane in &workspace.panes {
@@ -657,7 +675,7 @@ impl KesselApp {
             workspace.layout = layout;
             if layout == PaneLayout::Single {
                 workspace.active = 0;
-                workspace.linked_roots = None;
+                workspace.linked_dirs = None;
                 for pane in &workspace.panes {
                     pane.update(cx, |pane, _| pane.cancel_linked_navigation());
                 }
@@ -1395,7 +1413,7 @@ impl KesselApp {
         if workspace.layout == PaneLayout::Single {
             return;
         }
-        workspace.linked_roots = if workspace.linked_roots.is_some() {
+        workspace.linked_dirs = if workspace.linked_dirs.is_some() {
             None
         } else {
             Some(workspace.panes.each_ref().map(|pane| {
@@ -1421,27 +1439,32 @@ impl KesselApp {
         let TabContent::Panes(workspace) = &mut self.tabs[tab_ix].content else {
             return;
         };
-        let Some(roots) = &workspace.linked_roots else {
+        let Some(dirs) = &mut workspace.linked_dirs else {
             return;
         };
         let path = pane.read(cx).current_dir();
         let sites_match = workspace
             .panes
             .iter()
-            .zip(roots)
+            .zip(dirs.iter())
             .all(|(pane, (site, _))| pane.read(cx).site_id() == *site);
         let target = sites_match
-            .then(|| linked_directory(&roots[pane_ix].1, &roots[1 - pane_ix].1, &path))
+            .then(|| linked_directory(&dirs[pane_ix].1, &path, &dirs[1 - pane_ix].1))
             .flatten();
         let Some(target) = target else {
-            workspace.linked_roots = None;
+            workspace.linked_dirs = None;
             for pane in &workspace.panes {
                 pane.update(cx, |pane, _| pane.cancel_linked_navigation());
             }
-            window.push_notification("Linked browsing stopped: you left the paired folders.", cx);
+            window.push_notification(
+                "Linked browsing stopped: the other pane has no matching folder.",
+                cx,
+            );
             cx.notify();
             return;
         };
+        dirs[pane_ix].1 = path;
+        dirs[1 - pane_ix].1 = target.clone();
         let other = &workspace.panes[1 - pane_ix];
         if other.read(cx).current_dir() != target {
             other.update(cx, |pane, cx| pane.navigate_linked(target, window, cx));
@@ -1479,7 +1502,7 @@ impl KesselApp {
             PaneEvent::LinkedNavigationFailed => {
                 if let Some((tab_ix, _)) = self.find_pane(pane.entity_id()) {
                     if let TabContent::Panes(workspace) = &mut self.tabs[tab_ix].content {
-                        workspace.linked_roots = None;
+                        workspace.linked_dirs = None;
                         for pane in &workspace.panes {
                             pane.update(cx, |pane, _| pane.cancel_linked_navigation());
                         }
@@ -2392,7 +2415,7 @@ impl KesselApp {
         }
         if let Some(Tab { content: TabContent::Panes(workspace), .. }) = self.active_tab() {
             if workspace.layout != PaneLayout::Single {
-                let linked = workspace.linked_roots.is_some();
+                let linked = workspace.linked_dirs.is_some();
                 right = right.child(
                     Button::new("linked-browsing")
                         .label(if linked { "Unlink panes" } else { "Link panes" })
@@ -3898,36 +3921,31 @@ mod linked_browsing_tests {
     use super::linked_directory;
 
     #[test]
-    fn follows_relative_paths_in_both_directions() {
+    fn replays_moves_down_and_up() {
         assert_eq!(
-            linked_directory(
-                "local/project/",
-                "remote/www/",
-                "local/project/assets/icons/"
-            ),
+            linked_directory("local/project/", "local/project/assets/icons/", "remote/www/"),
             Some("remote/www/assets/icons/".into())
         );
         assert_eq!(
-            linked_directory("remote/www/", "local/project/", "remote/www/assets/"),
-            Some("local/project/assets/".into())
-        );
-        assert_eq!(
-            linked_directory("local/project/", "remote/www/", "local/project/"),
+            linked_directory("local/project/assets/", "local/project/", "remote/www/assets/"),
             Some("remote/www/".into())
         );
         assert_eq!(
-            linked_directory("", "backup/", "photos/"),
-            Some("backup/photos/".into())
+            linked_directory("local/project/", "local/", "remote/www/"),
+            Some("remote/".into())
         );
+        assert_eq!(
+            linked_directory("a/b/c/", "a/x/", "m/n/c/"),
+            Some("m/x/".into())
+        );
+        assert_eq!(linked_directory("", "photos/", "backup/"), Some("backup/photos/".into()));
+        assert_eq!(linked_directory("www/", "www/", "project/"), Some("project/".into()));
     }
 
     #[test]
-    fn stops_at_the_paired_root_boundary() {
-        assert_eq!(linked_directory("project/", "www/", ""), None);
-        assert_eq!(linked_directory("project/", "www/", "project-other/"), None);
-        assert_eq!(
-            linked_directory("project/", "www/", "project/../private/"),
-            None
-        );
+    fn stops_at_either_root() {
+        assert_eq!(linked_directory("a/b/", "a/", "www/"), Some("".into()));
+        assert_eq!(linked_directory("a/b/", "", "www/"), None);
+        assert_eq!(linked_directory("project/", "project/../private/", "www/"), None);
     }
 }
