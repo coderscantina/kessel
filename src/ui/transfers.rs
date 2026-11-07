@@ -382,12 +382,17 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Where a finished download to the local site landed. Falls back to the
-/// destination folder when the item isn't there under its source name
-/// (written as "file (1).txt", say).
+/// Where a finished download to the local site landed: the file a
+/// single-file job wrote (also after a "Keep both" rename), or the copied
+/// folder. Falls back to the destination folder when that is gone, and for
+/// batch jobs.
 fn local_target(job: &JobSnapshot) -> PathBuf {
     let root = crate::localfs::root();
-    let item = crate::localfs::full_path(&root, &format!("{}{}", job.dst, file_name(&job.src)));
+    let written = match &job.dst_file {
+        Some(file) => file.clone(),
+        None => format!("{}{}", job.dst, file_name(&job.src)),
+    };
+    let item = crate::localfs::full_path(&root, &written);
     if item.exists() {
         item
     } else {
@@ -680,6 +685,7 @@ impl TransfersPanel {
             JobState::Active => (t("transfers.state.active"), theme.muted_foreground),
             JobState::Queued => (t("transfers.state.queued"), theme.muted_foreground),
             JobState::Paused => (t("transfers.state.paused"), theme.muted_foreground),
+            JobState::Cancelling => (t("transfers.state.cancelling"), theme.muted_foreground),
             JobState::Cancelled => (t("transfers.state.cancelled"), theme.muted_foreground),
             JobState::Failed => (t("transfers.state.failed"), theme.danger),
             JobState::Done if job.files_failed > 0 => (
@@ -832,10 +838,10 @@ impl TransfersPanel {
                         .on_click(move |_, _, _| queue.resume(id)),
                 )
             })
-            .child({
+            .when(job.state != JobState::Cancelling, |this| {
                 let queue = queue.clone();
                 let terminal = job.state.is_terminal();
-                Button::new(("dismiss", key))
+                this.child(Button::new(("dismiss", key))
                     .icon(Icon::new(if terminal { IconName::Close } else { IconName::CircleX }))
                     .ghost()
                     .xsmall()
@@ -846,7 +852,7 @@ impl TransfersPanel {
                         } else {
                             queue.cancel(id)
                         }
-                    })
+                    }))
             });
 
         let weak = cx.entity().downgrade();
@@ -1180,7 +1186,7 @@ fn build_job_menu(
         let queue = queue.clone();
         menu = menu.item(PopupMenuItem::new(t("transfers.resume")).on_click(move |_, _, _| queue.resume(id)));
     }
-    if !job.state.is_terminal() {
+    if !job.state.is_terminal() && job.state != JobState::Cancelling {
         let top = queue.latest().jobs.iter().map(|job| job.priority).max().unwrap_or(0);
         let first = queue.clone();
         menu = menu.item(
@@ -1214,7 +1220,9 @@ fn build_job_menu(
 
     menu = menu.separator();
     let queue = queue.clone();
-    if job.state.is_terminal() {
+    if job.state == JobState::Cancelling {
+        menu
+    } else if job.state.is_terminal() {
         menu.item(PopupMenuItem::new(t("transfers.remove")).on_click(move |_, _, _| queue.remove(id)))
     } else {
         menu.item(PopupMenuItem::new(t("transfers.cancel")).on_click(move |_, _, _| queue.cancel(id)))

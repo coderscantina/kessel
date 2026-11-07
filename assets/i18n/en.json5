@@ -316,6 +316,7 @@
   "transfers.state.active": "Transferring",
   "transfers.state.queued": "Waiting",
   "transfers.state.paused": "Paused",
+  "transfers.state.cancelling": "Cancelling",
   "transfers.state.cancelled": "Cancelled",
   "transfers.state.failed": "Failed",
   "transfers.state.done": "Done",

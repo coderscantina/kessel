@@ -5,7 +5,8 @@
 //!
 //! There is one session per remote file. Opening a file that already has a
 //! session just reopens its local copy, so unsaved or not-yet-uploaded edits
-//! are never overwritten by a fresh download.
+//! are never overwritten by a fresh download. A second open while the first
+//! is still downloading waits for it and reuses its session.
 //!
 //! Each session remembers what the *server* copy looked like when it was
 //! last in sync (etag / mtime / size). Before uploading a save, the remote
@@ -36,11 +37,18 @@ use crate::queue::{ConflictPolicy, JobState, NewJob, QueueHandle, LOCAL_SITE_ID}
 /// Quiet period after a burst of editor writes before uploading.
 const DEBOUNCE: Duration = Duration::from_millis(750);
 
-/// Live sessions by (site id, remote path), each with the watcher that
-/// keeps it running (dropping a `RecommendedWatcher` stops it).
+/// One slot per (site id, remote path). Its async lock is held while the
+/// session opens, so concurrent opens of the same file share one session.
 type SessionKey = (i64, String);
-static SESSIONS: LazyLock<Mutex<HashMap<SessionKey, (PathBuf, notify::RecommendedWatcher)>>> =
-    LazyLock::new(Mutex::default);
+type SessionSlot = Arc<tokio::sync::Mutex<Option<OpenSession>>>;
+static SESSIONS: LazyLock<Mutex<HashMap<SessionKey, SessionSlot>>> = LazyLock::new(Mutex::default);
+
+/// A running session: the file the editor works on, and the watcher that
+/// keeps the session alive (dropping a `RecommendedWatcher` stops it).
+struct OpenSession {
+    temp: PathBuf,
+    _watcher: notify::RecommendedWatcher,
+}
 
 /// What the remote held when we last were in sync with it.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,25 +145,31 @@ pub async fn start(
     name: String,
     queue: QueueHandle,
 ) -> Result<PathBuf> {
-    let key = (provider.site_id, path.clone());
-    let existing = SESSIONS
+    let temp = session_file(provider, path, name, queue).await?;
+    crate::ui::open_path_or_url(temp.to_string_lossy().as_ref());
+    Ok(temp)
+}
+
+/// The local file of the session for `path`, opening the session (download
+/// and watch) unless one is running or already being opened.
+async fn session_file(provider: Provider, path: String, name: String, queue: QueueHandle) -> Result<PathBuf> {
+    let slot = SESSIONS
         .lock()
         .expect("edit session registry poisoned")
-        .get(&key)
-        .map(|(temp, _)| temp.clone());
-    if let Some(temp) = existing {
-        crate::ui::open_path_or_url(temp.to_string_lossy().as_ref());
-        return Ok(temp);
+        .entry((provider.site_id, path.clone()))
+        .or_default()
+        .clone();
+    let mut open = slot.lock().await;
+    if let Some(session) = open.as_ref() {
+        return Ok(session.temp.clone());
     }
-
     let session = Arc::new(Session::open(provider, path, name, queue).await?);
     let temp = session.temp.clone();
     let watcher = watch(session)?;
-    SESSIONS
-        .lock()
-        .expect("edit session registry poisoned")
-        .insert(key, (temp.clone(), watcher));
-    crate::ui::open_path_or_url(temp.to_string_lossy().as_ref());
+    *open = Some(OpenSession {
+        temp: temp.clone(),
+        _watcher: watcher,
+    });
     Ok(temp)
 }
 
@@ -482,15 +496,14 @@ fn fxhash(s: &str) -> u64 {
 mod tests {
     use super::*;
 
-    /// A session against the local filesystem standing in for a remote.
-    #[test]
-    fn uploads_each_new_save_once_and_never_after_a_failed_check() {
+    /// A queue and a local-filesystem provider standing in for a remote,
+    /// over a fresh temp dir holding `notes.txt` = "v1".
+    fn fixture(tag: &str) -> (tokio::runtime::Runtime, PathBuf, Provider, QueueHandle) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let dir = std::env::temp_dir().join(format!("kessel-edit-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kessel-edit-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let remote_file = dir.join("notes.txt");
-        std::fs::write(&remote_file, b"v1").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"v1").unwrap();
 
         let pool = rt.block_on(crate::db::connect(&dir)).unwrap();
         let cfg = crate::config::TransferConfig {
@@ -509,6 +522,13 @@ mod tests {
             ..Default::default()
         };
         let provider = Provider::connect(&local, &Default::default()).unwrap();
+        (rt, dir, provider, queue)
+    }
+
+    #[test]
+    fn uploads_each_new_save_once_and_never_after_a_failed_check() {
+        let (rt, dir, provider, queue) = fixture("uploads");
+        let remote_file = dir.join("notes.txt");
         let remote_path = remote_file.to_str().unwrap().trim_start_matches('/').to_string();
         let session = rt
             .block_on(Session::open(provider, remote_path, "notes.txt".into(), queue.clone()))
@@ -531,6 +551,33 @@ mod tests {
         assert!(!remote_file.exists());
         assert_eq!(std::fs::read(&session.temp).unwrap(), b"v3 local, longer");
         assert!(matches!(notices.try_recv(), Ok(EditNotice::Failed(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_open_waits_for_and_reuses_the_first() {
+        let (rt, dir, provider, queue) = fixture("reuse");
+        let remote_path = dir.join("notes.txt").to_str().unwrap().trim_start_matches('/').to_string();
+        let reused = dir.join("reused.txt");
+        let opened = rt.block_on(async {
+            let slot = SESSIONS
+                .lock()
+                .unwrap()
+                .entry((provider.site_id, remote_path.clone()))
+                .or_default()
+                .clone();
+            // A first open still downloading holds the slot.
+            let mut first = slot.lock().await;
+            let second = tokio::spawn(session_file(provider, remote_path, "notes.txt".into(), queue));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            *first = Some(OpenSession {
+                temp: reused.clone(),
+                _watcher: notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap(),
+            });
+            drop(first);
+            second.await.unwrap().unwrap()
+        });
+        assert_eq!(opened, reused);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

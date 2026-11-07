@@ -426,10 +426,11 @@ fn report_message(report: &SyncReport) -> String {
         ("reason", report.reason.clone().unwrap_or_default()),
     ];
     let args: Vec<(&str, &str)> = counts.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let mut message = if report.failed == 0 {
-        tf("sync.report.done", &args).to_string()
-    } else {
-        tf("sync.report.partial", &args).to_string()
+    let mut message = match (report.failed, &report.reason) {
+        (0, None) => tf("sync.report.done", &args).to_string(),
+        // Stopped without a failed file, e.g. the copy job was cancelled.
+        (0, Some(_)) => tf("sync.report.failed", &args).to_string(),
+        _ => tf("sync.report.partial", &args).to_string(),
     };
     if report.deletes_skipped {
         message.push(' ');

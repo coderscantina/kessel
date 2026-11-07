@@ -11,7 +11,7 @@
 //! [`PUBLISH_EVERY`], while user commands and job-level state changes
 //! publish at once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,12 +102,29 @@ struct JobRuntime {
     providers: Option<JobProviders>,
     preparing: bool,
     active_tasks: usize,
-    /// A cancelled job's leftover partial files are being removed.
+    /// Partial files nothing will resume are being removed before the job
+    /// settles.
     cleaning: bool,
+    /// Preparation failed transiently this many times in a row.
+    prep_failures: u32,
+    /// Preparation backs off until then.
+    retry_at: Option<Instant>,
+    /// Why preparation is waiting, shown on the job meanwhile.
+    waiting: Option<String>,
+}
+
+impl JobRuntime {
+    /// Work for the job is still in flight; it can't settle, be retried or
+    /// be removed yet.
+    fn settling(&self) -> bool {
+        self.preparing || self.active_tasks > 0 || self.cleaning
+    }
 }
 
 enum Internal {
-    Prepared(i64, Result<JobProviders>),
+    /// Preparation finished: providers, or `None` when a pause, cancel or
+    /// quit stopped the expansion.
+    Prepared(i64, Result<Option<JobProviders>>),
     TaskFinished {
         job_id: i64,
         task_id: i64,
@@ -115,7 +132,7 @@ enum Internal {
         /// The worker's bytes still counted in `JobControl::unpersisted`.
         unpersisted: u64,
     },
-    /// Partial cleanup of a cancelled job finished.
+    /// Partial cleanup of a settling job finished.
     Cleaned(i64),
 }
 
@@ -176,6 +193,17 @@ struct Engine {
 
 impl Engine {
     async fn run(mut self) {
+        // Cancels a quit or crash interrupted still owe their cleanup.
+        match store::unsettled_cancels(&self.pool).await {
+            Ok(ids) => {
+                for id in ids {
+                    if let Err(error) = self.maybe_finalize(id).await {
+                        tracing::error!(job_id = id, %error, "settling an interrupted cancel failed");
+                    }
+                }
+            }
+            Err(error) => tracing::error!(%error, "listing interrupted cancels failed"),
+        }
         self.publish().await;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -198,7 +226,8 @@ impl Engine {
             let ticking = self.dirty
                 || self.busy()
                 || self.jobs.values().any(|rt| {
-                    rt.providers.is_some() && !rt.control.paused.load(Ordering::Relaxed)
+                    rt.retry_at.is_some()
+                        || (rt.providers.is_some() && !rt.control.paused.load(Ordering::Relaxed))
                 });
             tokio::select! {
                 cmd = self.cmds.recv() => match cmd {
@@ -229,24 +258,25 @@ impl Engine {
     }
 
     fn busy(&self) -> bool {
-        self.jobs
-            .values()
-            .any(|rt| rt.preparing || rt.active_tasks > 0 || rt.cleaning)
+        self.jobs.values().any(JobRuntime::settling)
     }
 
     /// Kick off preparation for runnable jobs and claim tasks while
     /// concurrency permits are free.
     async fn schedule(&mut self) -> Result<()> {
+        let now = Instant::now();
         for job in store::runnable_jobs(&self.pool).await? {
             let rt = self.jobs.entry(job.id).or_default();
-            if rt.providers.is_none() && !rt.preparing {
+            let backing_off = rt.retry_at.is_some_and(|at| at > now);
+            if rt.providers.is_none() && !rt.preparing && !rt.cleaning && !backing_off {
                 rt.preparing = true;
+                let control = rt.control.clone();
                 let pool = self.pool.clone();
                 let defaults = self.default_layers.clone();
                 let skip_hidden = self.skip_hidden;
                 let tx = self.internal_tx.clone();
                 tokio::spawn(async move {
-                    let result = prepare_job(&pool, &job, &defaults, skip_hidden).await;
+                    let result = prepare_job(&pool, &job, &defaults, skip_hidden, &control).await;
                     let _ = tx.send(Internal::Prepared(job.id, result));
                 });
             }
@@ -339,12 +369,9 @@ impl Engine {
                 store::retry_failed_tasks(&self.pool, id).await?;
             }
             Command::Retry(id) => {
-                if self.jobs.get(&id).is_some_and(|rt| rt.active_tasks > 0 || rt.cleaning) {
-                    // Old workers still winding down (e.g. right after a
-                    // cancel): hurry them and retry once the last reports in.
-                    if let Some(rt) = self.jobs.get(&id) {
-                        rt.control.cancelled.store(true, Ordering::Relaxed);
-                    }
+                if self.jobs.get(&id).is_some_and(JobRuntime::settling) {
+                    // Still winding down (e.g. right after a cancel): retry
+                    // once the job settled.
                     self.pending_retries.insert(id);
                 } else {
                     self.retry_now(id).await?;
@@ -356,18 +383,8 @@ impl Engine {
             Command::ResolveTask(id, policy) => {
                 store::resolve_task_conflict(&self.pool, id, policy).await?;
             }
-            Command::ClearFinished => {
-                for id in store::clear_finished(&self.pool).await? {
-                    self.jobs.remove(&id);
-                    self.speeds.remove(&id);
-                }
-            }
-            Command::Remove(id) => {
-                if store::remove_job(&self.pool, id).await? {
-                    self.jobs.remove(&id);
-                    self.speeds.remove(&id);
-                }
-            }
+            Command::ClearFinished => self.remove_jobs(None).await?,
+            Command::Remove(id) => self.remove_jobs(Some(id)).await?,
             Command::SetPriority(id, priority) => {
                 store::set_job_priority(&self.pool, id, priority).await?;
             }
@@ -432,19 +449,37 @@ impl Engine {
                 };
                 rt.preparing = false;
                 match result {
-                    Ok(providers) => {
+                    Ok(Some(providers)) => {
                         rt.providers = Some(providers);
+                        rt.prep_failures = 0;
+                        rt.retry_at = None;
+                        rt.waiting = None;
                         // A retried job whose tasks all settled earlier
                         // (e.g. done before a cancel landed) has nothing to
                         // claim — settle it now instead of idling forever.
                         self.maybe_finalize(job_id).await?;
                     }
+                    // Paused or cancelled mid-expansion: a resume or retry
+                    // expands again; a cancel settles now.
+                    Ok(None) => self.maybe_finalize(job_id).await?,
                     Err(error) => {
-                        tracing::error!(job_id, error = %format!("{error:#}"), "job preparation failed");
+                        let transient = is_transient(&error);
+                        tracing::error!(job_id, transient, error = %format!("{error:#}"), "job preparation failed");
                         let reason = crate::errors::humanize(&error).title;
-                        store::fail_job(&self.pool, job_id, &reason).await?;
-                        self.jobs.remove(&job_id);
-                        self.notify_settled(job_id).await?;
+                        rt.prep_failures += 1;
+                        if transient && rt.prep_failures <= self.max_retries {
+                            // Same backoff as a task retry; the job stays
+                            // queued and shows why it waits.
+                            let delay = Duration::from_secs(1 << rt.prep_failures.min(8));
+                            rt.retry_at = Some(Instant::now() + delay);
+                            rt.waiting = Some(reason);
+                            self.maybe_finalize(job_id).await?;
+                        } else if store::fail_job(&self.pool, job_id, &reason).await? {
+                            self.jobs.remove(&job_id);
+                            self.notify_settled(job_id).await?;
+                        } else {
+                            self.maybe_finalize(job_id).await?;
+                        }
                     }
                 }
             }
@@ -452,11 +487,7 @@ impl Engine {
                 if let Some(rt) = self.jobs.get_mut(&job_id) {
                     rt.cleaning = false;
                 }
-                if self.pending_retries.remove(&job_id) {
-                    self.retry_now(job_id).await?;
-                } else {
-                    self.jobs.remove(&job_id);
-                }
+                self.finalize(job_id).await?;
             }
             Internal::TaskFinished {
                 job_id,
@@ -474,15 +505,7 @@ impl Engine {
                     rt.control.unpersisted.fetch_sub(unpersisted, Ordering::Relaxed);
                 }
                 result?;
-                let workers_idle = self
-                    .jobs
-                    .get(&job_id)
-                    .is_none_or(|rt| rt.active_tasks == 0);
-                if workers_idle && self.pending_retries.remove(&job_id) {
-                    self.retry_now(job_id).await?;
-                } else {
-                    self.maybe_finalize(job_id).await?;
-                }
+                self.maybe_finalize(job_id).await?;
             }
         }
         Ok(())
@@ -574,54 +597,68 @@ impl Engine {
         store::retry_job(&self.pool, job_id).await
     }
 
+    /// Settle the job once nothing is in flight and nothing is left to run.
+    /// Partial files nothing will resume are removed first, so a job only
+    /// counts as settled (and removable) once its leftovers are gone.
     async fn maybe_finalize(&mut self, job_id: i64) -> Result<()> {
-        let workers_active = self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|rt| rt.active_tasks > 0 || rt.preparing);
-        if workers_active {
+        if self.jobs.get(&job_id).is_some_and(JobRuntime::settling)
+            || !store::finalizable(&self.pool, job_id).await?
+        {
             return Ok(());
         }
+        let stale = store::stale_partials(&self.pool, job_id).await?;
+        if stale.is_empty() {
+            return self.finalize(job_id).await;
+        }
+        let rt = self.jobs.entry(job_id).or_default();
+        rt.cleaning = true;
+        let dst = rt.providers.as_ref().map(|p| p.dst.clone());
+        let pool = self.pool.clone();
+        let defaults = self.default_layers.clone();
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            if let Err(error) = discard_partials(&pool, job_id, dst, stale, &defaults).await {
+                tracing::warn!(job_id, error = %format!("{error:#}"), "removing partial files failed");
+            }
+            let _ = tx.send(Internal::Cleaned(job_id));
+        });
+        Ok(())
+    }
+
+    /// Write the job's final state, tell waiters, and run a retry that was
+    /// waiting for it to settle.
+    async fn finalize(&mut self, job_id: i64) -> Result<()> {
         let providers = self.jobs.get(&job_id).and_then(|rt| rt.providers.clone());
-        if !store::try_finalize_job(&self.pool, job_id).await? {
-            return Ok(());
-        }
-        self.jobs.remove(&job_id);
-        self.speeds.remove(&job_id);
-        match store::job_final(&self.pool, job_id).await? {
+        if store::try_finalize_job(&self.pool, job_id).await? {
+            self.jobs.remove(&job_id);
+            self.speeds.remove(&job_id);
             // Move semantics: transferred files were deleted per task; once
             // the whole job is done, sweep the emptied source directories.
-            Some((JobState::Done, src)) => {
-                if let Some(providers) = providers.filter(|p| p.move_source) {
+            if let Some(providers) = providers.filter(|p| p.move_source) {
+                if let Some((JobState::Done, src)) = store::job_final(&self.pool, job_id).await? {
                     if src.ends_with('/') {
                         tokio::spawn(cleanup_moved_source(providers.src, src));
                     }
                 }
             }
-            // Tasks cancelled while paused (or failed) still own partial
-            // files; remove them before a retry may start new ones.
-            Some((JobState::Cancelled, _)) => {
-                self.jobs.insert(
-                    job_id,
-                    JobRuntime {
-                        cleaning: true,
-                        ..JobRuntime::default()
-                    },
-                );
-                let pool = self.pool.clone();
-                let defaults = self.default_layers.clone();
-                let tx = self.internal_tx.clone();
-                tokio::spawn(async move {
-                    let dst = providers.map(|p| p.dst);
-                    if let Err(error) = discard_partials(&pool, job_id, dst, &defaults).await {
-                        tracing::warn!(job_id, error = %format!("{error:#}"), "removing partial files failed");
-                    }
-                    let _ = tx.send(Internal::Cleaned(job_id));
-                });
-            }
-            _ => {}
+            self.notify_settled(job_id).await?;
         }
-        self.notify_settled(job_id).await
+        if self.pending_retries.remove(&job_id) {
+            self.retry_now(job_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Drop settled jobs from the queue and delete the partial files their
+    /// tasks still owned (failed files kept them for a retry).
+    async fn remove_jobs(&self, job_id: Option<i64>) -> Result<()> {
+        let partials = store::remove_jobs(&self.pool, job_id).await?;
+        if !partials.is_empty() {
+            let pool = self.pool.clone();
+            let defaults = self.default_layers.clone();
+            tokio::spawn(async move { delete_orphans(&pool, partials, &defaults).await });
+        }
+        Ok(())
     }
 
     async fn publish(&mut self) {
@@ -639,10 +676,14 @@ impl Engine {
         let now = Instant::now();
         let mut total_bps = 0u64;
         for job in &mut jobs {
-            let Some(control) = self.jobs.get(&job.id).map(|rt| &rt.control) else {
+            let Some(rt) = self.jobs.get(&job.id) else {
                 self.speeds.remove(&job.id);
                 continue;
             };
+            if let Some(reason) = &rt.waiting {
+                job.error = Some(reason.clone());
+            }
+            let control = &rt.control;
             job.bytes_done += control.unpersisted.load(Ordering::Relaxed);
             if job.state != JobState::Active {
                 self.speeds.remove(&job.id);
@@ -676,12 +717,14 @@ impl Engine {
 
 /// Connect both providers (keychain access is blocking → spawn_blocking) and,
 /// first time through, fan a directory source out into per-file tasks.
+/// `None` when a pause or cancel stopped the fan-out.
 async fn prepare_job(
     pool: &SqlitePool,
     job: &JobRow,
     defaults: &LayerConfig,
     skip_hidden: bool,
-) -> Result<JobProviders> {
+    control: &JobControl,
+) -> Result<Option<JobProviders>> {
     let providers = JobProviders {
         src: connect_site(pool, job.src_site_id, defaults).await?,
         dst: connect_site(pool, job.dst_site_id, defaults).await?,
@@ -693,12 +736,14 @@ async fn prepare_job(
         // A previously interrupted fan-out may have left partial tasks —
         // start clean, then stream batches in and seal the expansion.
         store::begin_expansion(pool, job.id).await?;
-        expand_job(pool, &providers, job, skip_hidden).await?;
+        if !expand_job(pool, &providers, job, skip_hidden, control).await? {
+            return Ok(None);
+        }
         store::finish_expansion(pool, job.id).await?;
     } else {
         store::activate_job(pool, job.id).await?;
     }
-    Ok(providers)
+    Ok(Some(providers))
 }
 
 /// Connect one site's layered provider (keychain access is blocking).
@@ -723,18 +768,16 @@ fn is_transient(error: &anyhow::Error) -> bool {
             .any(opendal::Error::is_temporary)
 }
 
-/// Remove the partial files of a cancelled job's tasks that stopped before
-/// the cancel (paused, failed), then forget their resume offsets.
+/// Delete a settling job's partial files (`(task id, partial browse path)`)
+/// and forget the ones that are gone. A partial that can't be deleted stays
+/// recorded, so removing the job tries again.
 async fn discard_partials(
     pool: &SqlitePool,
     job_id: i64,
     dst: Option<Provider>,
+    partials: Vec<(i64, String)>,
     defaults: &LayerConfig,
 ) -> Result<()> {
-    let tasks = store::cancelled_partials(pool, job_id).await?;
-    if tasks.is_empty() {
-        return Ok(());
-    }
     let dst = match dst {
         Some(dst) => dst,
         None => {
@@ -744,17 +787,46 @@ async fn discard_partials(
             connect_site(pool, job.dst_site_id, defaults).await?
         }
     };
-    if transfer::stages(&dst.caps) {
-        for (task_id, path) in tasks {
-            let (op, rel) = dst.op_for(&path)?;
-            // Deleting a missing file succeeds, so a partial that never
-            // got written is fine.
-            op.delete(&transfer::partial_path(&rel, task_id))
-                .await
-                .with_context(|| format!("removing the partial file of `{path}`"))?;
+    let mut gone = Vec::with_capacity(partials.len());
+    for (task_id, partial) in partials {
+        // Deleting a missing file succeeds, so a partial that never got
+        // written is fine.
+        match delete_path(&dst, &partial).await {
+            Ok(()) => gone.push(task_id),
+            Err(error) => tracing::warn!(%partial, error = %format!("{error:#}"), "removing a partial file failed"),
         }
     }
-    store::reset_cancelled_offsets(pool, job_id).await
+    store::forget_partials(pool, &gone).await
+}
+
+/// Delete the partial files of removed jobs, `(site id, browse path)`.
+/// Nothing tracks them any more, so failures only reach the log.
+async fn delete_orphans(pool: &SqlitePool, partials: Vec<(i64, String)>, defaults: &LayerConfig) {
+    let mut by_site: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for (site_id, partial) in partials {
+        by_site.entry(site_id).or_default().push(partial);
+    }
+    for (site_id, partials) in by_site {
+        let dst = match connect_site(pool, site_id, defaults).await {
+            Ok(dst) => dst,
+            Err(error) => {
+                tracing::warn!(site_id, error = %format!("{error:#}"), "removing partial files failed");
+                continue;
+            }
+        };
+        for partial in partials {
+            if let Err(error) = delete_path(&dst, &partial).await {
+                tracing::warn!(%partial, error = %format!("{error:#}"), "removing a partial file failed");
+            }
+        }
+    }
+}
+
+async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
+    let (op, rel) = provider.op_for(path)?;
+    op.delete(&rel)
+        .await
+        .with_context(|| format!("deleting `{path}`"))
 }
 
 /// Turn the job's source into per-file tasks. A file maps 1:1; a directory
@@ -762,13 +834,14 @@ async fn discard_partials(
 /// while the walk runs, so arbitrarily large trees never sit in memory.
 /// Subdirectories are pre-created at the destination (so empty dirs
 /// survive); symlinks and other non-regular entries are left behind.
-/// Returns the number of file tasks created.
+/// Returns false when a pause or cancel stopped the walk early.
 async fn expand_job(
     pool: &SqlitePool,
     providers: &JobProviders,
     job: &JobRow,
     skip_hidden: bool,
-) -> Result<u64> {
+    control: &JobControl,
+) -> Result<bool> {
     let (src_op, src_rel) = providers.src.op_for(&job.src)?;
     let name = job
         .dst_name
@@ -788,7 +861,7 @@ async fn expand_job(
                 src_etag: meta.etag().map(str::to_string),
             };
             store::insert_tasks(pool, job.id, &[task]).await?;
-            return Ok(1);
+            return Ok(true);
         }
     }
 
@@ -821,8 +894,10 @@ async fn expand_job(
     }
 
     let mut batch: Vec<NewTask> = Vec::with_capacity(EXPANSION_BATCH);
-    let mut count = 0u64;
     while let Some(entry) = walk.next().await? {
+        if control.halted() {
+            return Ok(false);
+        }
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
         let meta = entry.metadata();
         if meta.is_dir() {
@@ -840,7 +915,6 @@ async fn expand_job(
                 total_bytes: Some(meta.content_length()),
                 src_etag: meta.etag().map(str::to_string),
             });
-            count += 1;
             if batch.len() >= EXPANSION_BATCH {
                 store::insert_tasks(pool, job.id, &batch).await?;
                 batch.clear();
@@ -852,7 +926,7 @@ async fn expand_job(
         }
     }
     store::insert_tasks(pool, job.id, &batch).await?;
-    Ok(count)
+    Ok(true)
 }
 
 /// Every entry below a directory, excluding the directory itself. Backends
@@ -1606,6 +1680,18 @@ mod tests {
             s.jobs.first().is_some_and(|j| j.state == JobState::Active && j.bytes_done > 0)
         });
         let id = snap.jobs[0].id;
+        pause_once_past(env, id, 0);
+        id
+    }
+
+    /// Pause job `id` once it moved more than `bytes` and wait until its
+    /// worker settled the pause.
+    fn pause_once_past(env: &TestEnv, id: i64, bytes: u64) {
+        wait_until(&env.handle, |s| {
+            s.jobs
+                .iter()
+                .any(|j| j.id == id && j.state == JobState::Active && j.bytes_done > bytes)
+        });
         env.handle.pause(id);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -1620,7 +1706,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
-        id
     }
 
     #[test]
@@ -1745,6 +1830,175 @@ mod tests {
         assert!(!dst.join("left-out.txt").exists());
         let snap = wait_until(&env.handle, |snap| snap.jobs.len() == 1);
         assert_eq!(snap.jobs[0].bytes_total, 3);
+    }
+
+    #[test]
+    fn cancel_settles_only_after_workers_and_cleanup() {
+        let (env, src_dir, dst_dir, _) = slow_env("cancel-settles");
+        std::fs::write(dst_dir.join("big.bin"), b"OLD").unwrap();
+        let id = env
+            .rt
+            .block_on(env.handle.submit(slow_job(&src_dir.join("big.bin"), &dst_dir, false)))
+            .unwrap();
+        wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state == JobState::Active && j.bytes_done > 0)
+        });
+        env.handle.cancel(id);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Cancelled);
+        // Settled: the worker stopped and its partial is gone already.
+        let states = env.rt.block_on(store::task_states(&env.pool, id)).unwrap();
+        assert!(!states.contains_key("active"), "{states:?}");
+        assert!(partials(&dst_dir).is_empty());
+        assert_eq!(std::fs::read(dst_dir.join("big.bin")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn resume_in_place_survives_a_pause() {
+        let (env, src_dir, dst_dir, content) = slow_env("resume-in-place");
+        let dst_file = dst_dir.join("big.bin");
+        std::fs::write(&dst_file, &content[..1024 * 1024]).unwrap();
+        let id = env
+            .rt
+            .block_on(env.handle.submit(NewJob {
+                conflict_policy: ConflictPolicy::Resume,
+                ..slow_job(&src_dir.join("big.bin"), &dst_dir, false)
+            }))
+            .unwrap();
+        pause_once_past(&env, id, 0);
+        let appended = std::fs::metadata(&dst_file).unwrap().len();
+        assert!(appended > 1024 * 1024);
+
+        // The resumed run keeps appending in place: no staged copy from zero.
+        env.handle.resume(id);
+        pause_once_past(&env, id, appended);
+        assert!(partials(&dst_dir).is_empty());
+        assert!(std::fs::metadata(&dst_file).unwrap().len() > appended);
+
+        env.handle.resume(id);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert!(std::fs::read(&dst_file).unwrap() == content);
+    }
+
+    #[test]
+    fn cancel_and_remove_delete_every_owned_partial() {
+        let env = test_env("owned-partials");
+        let dst = env.dir.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        // A paused task whose non-append partial checkpointed offset 0, and a
+        // failed task of a settled job: both still own their partial files.
+        let job_with_partial = |state: &str, task_state: &str, name: &str| {
+            let part = dst.join(format!(".{name}.kessel-part"));
+            std::fs::write(&part, b"half").unwrap();
+            env.rt.block_on(async {
+                let job: i64 = sqlx::query_scalar(
+                    "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, state, expanded, finished_at) \
+                     VALUES (0, 0, 'src/x', ?, ?, 1, CASE WHEN ? = 'done' THEN datetime('now') END) RETURNING id",
+                )
+                .bind(format!("{}/", browse(&dst)))
+                .bind(state)
+                .bind(state)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO transfer_tasks (job_id, src, dst, state, total_bytes, partial) \
+                     VALUES (?, 'src/x', ?, ?, 10, ?)",
+                )
+                .bind(job)
+                .bind(browse(&dst.join(name)))
+                .bind(task_state)
+                .bind(browse(&part))
+                .execute(&env.pool)
+                .await
+                .unwrap();
+                (job, part)
+            })
+        };
+        let (paused_job, paused_part) = job_with_partial("paused", "paused", "a.txt");
+        let (settled_job, failed_part) = job_with_partial("done", "failed", "b.txt");
+
+        env.handle.cancel(paused_job);
+        let outcome = env.rt.block_on(env.handle.settled(paused_job)).unwrap();
+        assert_eq!(outcome.state, JobState::Cancelled);
+        assert!(!paused_part.exists());
+
+        env.handle.remove(settled_job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while failed_part.exists() {
+            assert!(std::time::Instant::now() < deadline, "partial of the removed job was kept");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn transient_preparation_failure_keeps_the_job_queued() {
+        let env = test_env_with("prep-transient", |cfg| cfg.retries = 3);
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO sites (id, name, scheme, options) \
+                     VALUES (2, 'Offline', 'webdav', '{\"endpoint\":\"http://127.0.0.1:1\"}')",
+                )
+                .execute(&env.pool),
+            )
+            .unwrap();
+        env.handle.enqueue(NewJob {
+            src_site_id: 2,
+            ..job("file.txt".into(), format!("{}/", browse(&env.dir)), ConflictPolicy::Overwrite)
+        });
+        let snap = wait_until(&env.handle, |s| s.jobs.first().is_some_and(|j| j.error.is_some()));
+        assert_eq!(snap.jobs[0].state, JobState::Queued, "{:?}", snap.jobs[0].error);
+    }
+
+    #[test]
+    fn expansion_stops_when_the_job_is_cancelled() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("kessel-expand-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tree/nested")).unwrap();
+        std::fs::write(dir.join("tree/a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("tree/nested/b.txt"), b"b").unwrap();
+        rt.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::migrate!().run(&pool).await.unwrap();
+            let id = store::enqueue_job(
+                &pool,
+                &job(
+                    format!("{}/", browse(&dir.join("tree"))),
+                    format!("{}/", browse(&dir.join("out"))),
+                    ConflictPolicy::Overwrite,
+                ),
+            )
+            .await
+            .unwrap();
+            let row = store::get_job(&pool, id).await.unwrap().unwrap();
+            let local = Provider::connect(
+                &crate::provider::SiteProfile {
+                    scheme: "fs".into(),
+                    options: [("root".to_string(), "/".to_string())].into(),
+                    ..Default::default()
+                },
+                &LayerConfig::default(),
+            )
+            .unwrap();
+            let providers = JobProviders {
+                src: local.clone(),
+                dst: local,
+                same_site: true,
+                move_source: false,
+            };
+            let control = JobControl::default();
+            control.cancelled.store(true, Ordering::Relaxed);
+            assert!(!expand_job(&pool, &providers, &row, false, &control).await.unwrap());
+            assert!(store::task_states(&pool, id).await.unwrap().is_empty());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

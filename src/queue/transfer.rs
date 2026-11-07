@@ -4,8 +4,9 @@
 //! task writes into its own partial file next to the destination
 //! (`.<name>.<task id>.kessel-part`) and renames it onto the real name only
 //! after the copy finished and verified. The old file stays intact until
-//! then. Object stores write the destination directly: their uploads only
-//! become visible on a successful close.
+//! then. The task records the partial it owns, so cancel and removal can
+//! delete it later. Object stores write the destination directly: their
+//! uploads only become visible on a successful close.
 //!
 //! Resume model: the byte offset is checkpointed to SQLite every 500ms.
 //! When the destination can append, a partial resumes where it stopped: the
@@ -63,6 +64,11 @@ enum Signal {
 }
 
 impl JobControl {
+    /// A pause or cancel was requested.
+    pub fn halted(&self) -> bool {
+        self.signal() != Signal::Run
+    }
+
     fn signal(&self) -> Signal {
         if self.cancelled.load(Ordering::Relaxed) {
             Signal::Cancel
@@ -271,21 +277,25 @@ async fn run_inner(
                     // No append support: fall through and overwrite.
                 }
                 ConflictPolicy::Rename => {
-                    let new_name = unique_name(&dst_op, &dst_path).await?;
+                    let new_name = unique_name(pool, task.id, &dst_op, &dst_path, &dst_browse).await?;
                     let old_name_len = file_name(&dst_path).len();
                     dst_path.truncate(dst_path.len() - old_name_len);
                     dst_path.push_str(&new_name);
                     dst_browse.truncate(dst_browse.len() - old_name_len);
                     dst_browse.push_str(&new_name);
-                    store::update_task_dst(pool, task.id, &dst_browse).await?;
                 }
             }
+        }
+        if resume_from_dst.is_some() != task.in_place {
+            store::set_task_in_place(pool, task.id, resume_from_dst.is_some()).await?;
         }
     }
 
     // Appending onto an existing destination (policy `Resume`) is the one
-    // case that deliberately writes the real file in place.
-    let partial = (stages(&dst.caps) && resume_from_dst.is_none()).then(|| {
+    // case that deliberately writes the real file in place, also when a
+    // later run of the task picks up its resume offset.
+    let in_place = resume_from_dst.is_some() || (task.byte_offset > 0 && task.in_place);
+    let partial = (stages(&dst.caps) && !in_place).then(|| {
         (
             partial_path(&dst_path, task.id),
             partial_path(&dst_browse, task.id),
@@ -297,6 +307,14 @@ async fn run_inner(
         browse: dst_browse,
         partial,
     };
+    if let Some((_, browse)) = &dest.partial {
+        if task.partial.as_deref() != Some(browse.as_str()) {
+            if let Some(stale) = &task.partial {
+                discard_stale_partial(dst, stale).await;
+            }
+            store::set_task_partial(pool, task.id, Some(browse)).await?;
+        }
+    }
 
     let offset = match resume_from_dst {
         Some(offset) => offset,
@@ -315,7 +333,7 @@ async fn run_inner(
     live.persisted = offset;
 
     if offset == size && size > 0 {
-        finish_transfer(src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
+        finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
         return Ok(Outcome::Done { bytes: size });
     }
 
@@ -324,7 +342,7 @@ async fn run_inner(
     if opts.same_site && dst.caps.copy && offset == 0 {
         match dst.copy(&task.src, dest.write_browse()).await {
             Ok(()) => {
-                finish_transfer(src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
+                finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
                 return Ok(Outcome::Done { bytes: size });
             }
             Err(error) => {
@@ -402,15 +420,18 @@ async fn run_inner(
                 .close()
                 .await
                 .with_context(|| format!("finalize `{}`", task.dst))?;
-            finish_transfer(src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
+            finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
             Ok(Outcome::Done { bytes: size })
         }
         Ok(Some(Outcome::Cancelled)) => {
             // Discard: no half-written object or partial file left behind.
             let _ = writer.abort().await;
             if let Some((partial, _)) = &dest.partial {
-                if let Err(error) = dest.op.delete(partial).await {
-                    tracing::warn!(%partial, %error, "removing cancelled partial failed");
+                // A partial that can't be deleted now stays recorded, so
+                // the job's cleanup tries again.
+                match dest.op.delete(partial).await {
+                    Ok(()) => store::set_task_partial(pool, task.id, None).await?,
+                    Err(error) => tracing::warn!(%partial, %error, "removing cancelled partial failed"),
                 }
                 store::update_task_offset(pool, task.id, 0).await?;
             }
@@ -436,6 +457,7 @@ async fn run_inner(
 /// the source deletion move semantics require.
 #[allow(clippy::too_many_arguments)]
 async fn finish_transfer(
+    pool: &SqlitePool,
     src: &Provider,
     src_op: &Operator,
     src_path: &str,
@@ -470,6 +492,7 @@ async fn finish_transfer(
 
     if let Some((partial, _)) = &dest.partial {
         commit_partial(&dest.op, partial, &dest.path).await?;
+        store::set_task_partial(pool, task.id, None).await?;
     }
 
     if opts.preserve_timestamps {
@@ -502,22 +525,57 @@ async fn finish_transfer(
 }
 
 /// Move a finished partial onto the real name. Some servers (SFTP v3) refuse
-/// to rename over an existing file; then the old file is deleted, which is
-/// safe now that the new one is complete, and the rename retried.
+/// to rename over an existing file. Only for that case, with both files
+/// present and no permission or not-found error, the old file is moved
+/// aside to a backup name first, the partial renamed into place, and the
+/// backup deleted. A failure in between moves the old file back, so it is
+/// never lost.
 async fn commit_partial(op: &Operator, partial: &str, path: &str) -> Result<()> {
     let Err(error) = op.rename(partial, path).await else {
         return Ok(());
     };
-    match op.stat(path).await {
-        Ok(_) => {
-            op.delete(path)
-                .await
-                .with_context(|| format!("replacing `{path}`"))?;
-            op.rename(partial, path)
-                .await
-                .with_context(|| format!("moving the finished file to `{path}`"))
+    let context = || format!("moving the finished file to `{path}`");
+    let refused_over_existing = !matches!(
+        error.kind(),
+        opendal::ErrorKind::NotFound | opendal::ErrorKind::PermissionDenied
+    ) && op.exists(partial).await.unwrap_or(false)
+        && op.exists(path).await.unwrap_or(false);
+    if !refused_over_existing {
+        return Err(error).with_context(context);
+    }
+
+    let backup = format!(
+        "{}.old{PARTIAL_SUFFIX}",
+        partial.strip_suffix(PARTIAL_SUFFIX).unwrap_or(partial)
+    );
+    if op.rename(path, &backup).await.is_err() {
+        return Err(error).with_context(context);
+    }
+    match op.rename(partial, path).await {
+        Ok(()) => {
+            if let Err(error) = op.delete(&backup).await {
+                tracing::warn!(%backup, %error, "removing the replaced file's backup failed");
+            }
+            Ok(())
         }
-        Err(_) => Err(error).with_context(|| format!("moving the finished file to `{path}`")),
+        Err(error) => {
+            if let Err(restore) = op.rename(&backup, path).await {
+                tracing::error!(%backup, %path, error = %restore, "restoring the replaced file failed; it is kept under the backup name");
+            }
+            Err(error).with_context(context)
+        }
+    }
+}
+
+/// Delete a partial an earlier run of the task left under another name
+/// (its destination changed since). Best effort: it is only clutter.
+async fn discard_stale_partial(dst: &Provider, partial: &str) {
+    let result = match dst.op_for(partial) {
+        Ok((op, rel)) => op.delete(&rel).await.map_err(anyhow::Error::from),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::warn!(%partial, error = %format!("{error:#}"), "removing an outdated partial failed");
     }
 }
 
@@ -546,11 +604,19 @@ fn same_version(before: &opendal::Metadata, now: &opendal::Metadata) -> bool {
         && before.last_modified() == now.last_modified()
 }
 
-/// First "name (n).ext" the destination doesn't already have (policy
-/// `rename`).
-async fn unique_name(dst_op: &Operator, dst_path: &str) -> Result<String> {
+/// First "name (n).ext" the destination doesn't already have and no other
+/// unfinished task targets (policy `rename`). The name is reserved on the
+/// task row, so concurrent workers never pick the same one.
+async fn unique_name(
+    pool: &SqlitePool,
+    task_id: i64,
+    dst_op: &Operator,
+    dst_path: &str,
+    dst_browse: &str,
+) -> Result<String> {
     let name = file_name(dst_path);
     let parent = &dst_path[..dst_path.len() - name.len()];
+    let browse_parent = &dst_browse[..dst_browse.len() - name.len()];
     // "archive.tar.gz" → ("archive", ".tar.gz") is nice-to-have; splitting at
     // the first dot after the first char covers it and keeps dotfiles whole.
     let (stem, ext) = match name.char_indices().skip(1).find(|(_, c)| *c == '.') {
@@ -560,7 +626,11 @@ async fn unique_name(dst_op: &Operator, dst_path: &str) -> Result<String> {
     for n in 1..1000u32 {
         let candidate = format!("{stem} ({n}){ext}");
         match dst_op.stat(&format!("{parent}{candidate}")).await {
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
+                if store::reserve_task_dst(pool, task_id, &format!("{browse_parent}{candidate}")).await? {
+                    return Ok(candidate);
+                }
+            }
             Err(error) => return Err(error).context("probing rename target"),
             Ok(_) => {}
         }
@@ -654,7 +724,23 @@ mod tests {
             src_modified: modified.map(str::to_string),
             conflict_policy: ConflictPolicy::Overwrite,
             move_source: false,
+            partial: None,
+            in_place: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_keeps_the_old_file() {
+        let dir = std::env::temp_dir().join(format!("kessel-commit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"OLD").unwrap();
+        let op = Operator::via_iter("fs", [("root".to_string(), dir.to_string_lossy().to_string())]).unwrap();
+        // The partial is missing: the rename fails for a reason other than
+        // the destination existing, so the destination must stay.
+        assert!(commit_partial(&op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
+        assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
