@@ -1497,6 +1497,7 @@ impl KesselApp {
                 };
                 self.enqueue_entries(tab_ix, pane_ix, entries.clone(), true, window, cx);
             }
+            PaneEvent::EditSite(site_id) => self.open_bookmarks_dialog(Some(*site_id), window, cx),
             PaneEvent::OpenInNewTab { profile, path } => {
                 self.open_tab_with(profile.clone(), path.clone(), None, window, cx);
             }

@@ -73,7 +73,7 @@
     "ctrl-a": "file_pane::SelectAll",
     "escape": "file_pane::ClearSelection",
 
-    // Navigation.
+    // Navigation. Activate enters a folder or opens a file.
     "enter": "file_pane::Activate",
     "right": "file_pane::Activate",
     "secondary-down": "file_pane::Activate",
@@ -90,7 +90,10 @@
     "space": "file_pane::QuickLook",
     "secondary-f": "file_pane::Search",
     "secondary-r": "file_pane::Refresh",
-    "f5": "file_pane::Refresh",
+    // Commander idioms: F5 copies, F6 moves the selection to the other pane.
+    "f5": "file_pane::CopyToOtherPane",
+    "secondary-shift-c": "file_pane::CopyToOtherPane",
+    "f6": "file_pane::MoveToOtherPane",
     "secondary-shift-n": "file_pane::NewFolder",
     "f2": "file_pane::RenameSelected",
     "secondary-backspace": "file_pane::DeleteSelected",
