@@ -150,6 +150,9 @@ pub struct JobSnapshot {
     pub dst_site: String,
     pub src: String,
     pub dst: String,
+    /// Where a single-file job writes, after any "Keep both" rename; `None`
+    /// for folder and batch jobs.
+    pub dst_file: Option<String>,
     pub state: JobState,
     pub error: Option<String>,
     pub files_total: u64,

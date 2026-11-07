@@ -891,6 +891,8 @@ pub(crate) async fn snapshot_jobs(pool: &SqlitePool) -> Result<Vec<JobSnapshot>>
     let rows = sqlx::query(
         "SELECT j.id, j.src_site_id, j.dst_site_id, j.src, j.dst, j.state, j.error, \
            j.priority, j.move_source, \
+           CASE WHEN j.files_total = 1 THEN (SELECT t.dst FROM transfer_tasks t \
+             WHERE t.job_id = j.id AND t.src = j.src) END AS dst_file, \
            COALESCE(ss.name, 'Local') AS src_site, COALESCE(ds.name, 'Local') AS dst_site, \
            j.files_total, j.files_done, j.files_skipped, j.files_conflict, j.files_failed, \
            j.bytes_total, j.bytes_done \
@@ -914,6 +916,7 @@ pub(crate) async fn snapshot_jobs(pool: &SqlitePool) -> Result<Vec<JobSnapshot>>
             dst_site: row.get("dst_site"),
             src: row.get("src"),
             dst: row.get("dst"),
+            dst_file: row.get("dst_file"),
             state: JobState::from_str(&row.get::<String, _>("state")),
             error: row.get("error"),
             files_total: row.get::<i64, _>("files_total") as u64,

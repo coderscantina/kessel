@@ -382,12 +382,17 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Where a finished download to the local site landed. Falls back to the
-/// destination folder when the item isn't there under its source name
-/// (written as "file (1).txt", say).
+/// Where a finished download to the local site landed: the file a
+/// single-file job wrote (also after a "Keep both" rename), or the copied
+/// folder. Falls back to the destination folder when that is gone, and for
+/// batch jobs.
 fn local_target(job: &JobSnapshot) -> PathBuf {
     let root = crate::localfs::root();
-    let item = crate::localfs::full_path(&root, &format!("{}{}", job.dst, file_name(&job.src)));
+    let written = match &job.dst_file {
+        Some(file) => file.clone(),
+        None => format!("{}{}", job.dst, file_name(&job.src)),
+    };
+    let item = crate::localfs::full_path(&root, &written);
     if item.exists() {
         item
     } else {
