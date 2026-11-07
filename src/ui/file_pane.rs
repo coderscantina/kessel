@@ -81,6 +81,10 @@ actions!(
 const KEY_CONTEXT: &str = "FilePane";
 /// Fixed row height; the rubber band's hit math depends on it.
 const ROW_HEIGHT: f32 = 26.0;
+/// Opening more items than this at once asks first.
+const OPEN_CONFIRM_THRESHOLD: usize = 20;
+/// Suffix of the queue's in-progress partial files, kept out of listings.
+const PARTIAL_SUFFIX: &str = ".kessel-part";
 
 #[derive(Clone)]
 pub struct FsEntry {
@@ -1420,6 +1424,36 @@ impl FilePane {
                 return;
             }
         }
+        if selected.len() > OPEN_CONFIRM_THRESHOLD {
+            self.confirm_open(selected, window, cx);
+        } else {
+            self.open_entries(selected, window, cx);
+        }
+    }
+
+    /// Ask before opening a big selection: each item becomes a window or tab.
+    fn confirm_open(&mut self, entries: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.entity().downgrade();
+        let title = tf("file_pane.open_many.title", &[("count", &entries.len().to_string())]);
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let pane = pane.clone();
+            let entries = entries.clone();
+            dialog
+                .title(title.clone())
+                .width(px(380.))
+                .child(t("file_pane.open_many.body"))
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text(t("file_pane.open_many.ok")))
+                .on_ok(move |_, window, cx| {
+                    let entries = entries.clone();
+                    pane.update(cx, |this, cx| this.open_entries(entries, window, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    /// Folders open in new tabs, files in their default app.
+    fn open_entries(&mut self, selected: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
         let (dirs, files): (Vec<FsEntry>, Vec<FsEntry>) =
             selected.into_iter().partition(|entry| entry.is_dir);
         for dir in dirs {
@@ -1724,28 +1758,25 @@ impl FilePane {
     ) {
         let dst_site = self.site_id();
         let move_source = is_move_drop(&window.modifiers());
-        let queue = cx.global::<AppState>().queue.clone();
-        let mut queued = 0;
-        for entry in &drag.entries {
-            if drag.site_id == dst_site
-                && (parent_of(&entry.path) == dst_dir || entry.path == dst_dir)
-            {
-                continue;
-            }
-            queue.enqueue(NewJob {
+        let conflict_policy = default_conflict_policy(cx);
+        let jobs = drag
+            .entries
+            .iter()
+            .filter(|entry| {
+                drag.site_id != dst_site
+                    || (parent_of(&entry.path) != dst_dir && entry.path != dst_dir)
+            })
+            .map(|entry| NewJob {
                 src_site_id: drag.site_id,
                 dst_site_id: dst_site,
                 src: entry.path.clone(),
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source,
-            });
-            queued += 1;
-        }
-        if queued > 0 {
-            window.push_notification(queued_message(queued), cx);
-        }
+            })
+            .collect();
+        self.submit_jobs(jobs, window, cx);
     }
 
     /// Files dragged in from Finder/Explorer: they're paths on the reserved
@@ -1791,27 +1822,55 @@ impl FilePane {
         cx: &mut Context<Self>,
     ) {
         let dst_site = self.site_id();
-        let queue = cx.global::<AppState>().queue.clone();
-        let mut queued = 0;
-        for path in paths {
-            let src = crate::localfs::browse_path(path, path.is_dir());
-            if dst_site == crate::queue::LOCAL_SITE_ID && parent_of(&src) == dst_dir {
-                continue;
-            }
-            queue.enqueue(NewJob {
+        let conflict_policy = default_conflict_policy(cx);
+        let jobs = paths
+            .iter()
+            .map(|path| crate::localfs::browse_path(path, path.is_dir()))
+            .filter(|src| dst_site != crate::queue::LOCAL_SITE_ID || parent_of(src) != dst_dir)
+            .map(|src| NewJob {
                 src_site_id: crate::queue::LOCAL_SITE_ID,
                 dst_site_id: dst_site,
                 src,
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source: false,
-            });
-            queued += 1;
+            })
+            .collect();
+        self.submit_jobs(jobs, window, cx);
+    }
+
+    /// Start transfers and report what the queue said once it has persisted
+    /// them: one note for the accepted jobs, the reason for each rejected one.
+    fn submit_jobs(&mut self, jobs: Vec<NewJob>, window: &mut Window, cx: &mut Context<Self>) {
+        if jobs.is_empty() {
+            return;
         }
-        if queued > 0 {
-            window.push_notification(queued_message(queued), cx);
-        }
+        let queue = cx.global::<AppState>().queue.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut accepted = 0;
+            let mut rejected = Vec::new();
+            for job in jobs {
+                match queue.submit(job).await {
+                    Ok(_) => accepted += 1,
+                    Err(error) => rejected.push(error),
+                }
+            }
+            cx.update(|window, cx| {
+                if accepted > 0 {
+                    window.push_notification(queued_message(accepted), cx);
+                }
+                for error in &rejected {
+                    let human = humanize(error);
+                    window.push_notification(
+                        Notification::error(human.title).title(t("transfers.start_failed")),
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // --- file operations (context menu) ---
@@ -2002,20 +2061,20 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let queue = cx.global::<AppState>().queue.clone();
-        let count = entries.len();
-        for entry in entries {
-            queue.enqueue(NewJob {
+        let conflict_policy = default_conflict_policy(cx);
+        let jobs = entries
+            .into_iter()
+            .map(|entry| NewJob {
                 src_site_id: self.site_id(),
                 dst_site_id: crate::queue::LOCAL_SITE_ID,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
                 dst_name: dst_name.clone(),
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source: false,
-            });
-        }
-        window.push_notification(queued_message(count), cx);
+            })
+            .collect();
+        self.submit_jobs(jobs, window, cx);
     }
 
     /// Download into the platform Downloads folder (falls back to the
@@ -3946,7 +4005,10 @@ async fn list_dir(
         .into_iter()
         .filter_map(|entry| {
             let is_hidden = entry.name.starts_with('.');
-            if entry.name.is_empty() || (!show_hidden && is_hidden) {
+            if entry.name.is_empty()
+                || (!show_hidden && is_hidden)
+                || entry.name.ends_with(PARTIAL_SUFFIX)
+            {
                 return None;
             }
             Some(FsEntry {
@@ -4134,6 +4196,12 @@ fn items_label(count: usize) -> SharedString {
     } else {
         tf("file_pane.items.other", &[("count", &count.to_string())])
     }
+}
+
+/// The conflict policy for transfers started from a pane
+/// (`transfers.default_conflict_policy`).
+fn default_conflict_policy(cx: &App) -> ConflictPolicy {
+    cx.global::<AppState>().config.transfers.default_conflict_policy.into()
 }
 
 fn queued_message(count: usize) -> SharedString {
