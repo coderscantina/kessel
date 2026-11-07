@@ -1,22 +1,25 @@
 //! Edit-in-external-editor sessions: download the remote file to a temp
-//! path, open it with the OS default app, watch it for saves, and re-upload
-//! each save through the transfer queue (Overwrite policy), so retries,
+//! path, open it with the OS default app, watch it for saves, and upload
+//! each save back through the transfer queue (Overwrite policy), so retries,
 //! throttling and progress all come for free.
 //!
-//! Each session remembers what the *server* copy looked like when it was
-//! last in sync (etag / mtime / size). Before re-uploading a save, the
-//! remote is stat'ed again — if someone else changed it in the meantime the
-//! session raises a conflict instead of silently clobbering their work; the
-//! app shows a dialog (see [`open_conflict_dialog`]) and the session waits
-//! for the decision.
+//! There is one session per remote file. Opening a file that already has a
+//! session just reopens its local copy, so unsaved or not-yet-uploaded edits
+//! are never overwritten by a fresh download.
 //!
-//! Sessions live for the rest of the process — an editor may keep the file
-//! open indefinitely, and a leaked watcher per edited file is cheap.
+//! Each session remembers what the *server* copy looked like when it was
+//! last in sync (etag / mtime / size). Before uploading a save, the remote
+//! is stat'ed again. If someone else changed it, or the check itself fails,
+//! nothing is uploaded: a change raises a conflict the user decides on (see
+//! [`open_conflict_dialog`]), a failed check leaves the local copy as it is.
+//!
+//! Sessions live for the rest of the process. An editor may keep the file
+//! open indefinitely, and a watcher per edited file is cheap.
 
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use gpui::prelude::*;
@@ -24,12 +27,20 @@ use gpui::{px, App, Window};
 use gpui_component::button::Button;
 use gpui_component::{v_flex, ActiveTheme as _, Sizable as _, WindowExt as _};
 use notify::Watcher as _;
+use tokio::sync::mpsc;
 
+use crate::i18n::tf;
 use crate::provider::Provider;
-use crate::queue::{ConflictPolicy, NewJob, QueueHandle, LOCAL_SITE_ID};
+use crate::queue::{ConflictPolicy, JobState, NewJob, QueueHandle, LOCAL_SITE_ID};
 
-/// Keeps watchers alive; dropping a `RecommendedWatcher` stops it.
-static SESSIONS: Mutex<Vec<notify::RecommendedWatcher>> = Mutex::new(Vec::new());
+/// Quiet period after a burst of editor writes before uploading.
+const DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// Live sessions by (site id, remote path), each with the watcher that
+/// keeps it running (dropping a `RecommendedWatcher` stops it).
+type SessionKey = (i64, String);
+static SESSIONS: LazyLock<Mutex<HashMap<SessionKey, (PathBuf, notify::RecommendedWatcher)>>> =
+    LazyLock::new(Mutex::default);
 
 /// What the remote held when we last were in sync with it.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,12 +50,34 @@ struct RemoteState {
     size: u64,
 }
 
-/// A save collided with a server-side change; the session blocks on
+/// Identifies one version of the local file: a save changes the length or
+/// the modified time. Comparing it against the last uploaded version is the
+/// session's dirty check, so saves that land during an upload get their own
+/// upload afterwards, and watcher noise that changes nothing is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalVersion {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl LocalVersion {
+    async fn of(path: &Path) -> Result<Self> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("reading `{}`", path.display()))?;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// A save collided with a server-side change; the session waits on
 /// `decision` until the user picks a side.
 pub struct EditConflict {
     pub name: String,
     pub remote_modified: Option<String>,
-    pub decision: mpsc::Sender<EditDecision>,
+    pub decision: mpsc::UnboundedSender<EditDecision>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,52 +90,71 @@ pub enum EditDecision {
     Cancel,
 }
 
-type ConflictChannel = (
-    smol::channel::Sender<EditConflict>,
-    smol::channel::Receiver<EditConflict>,
-);
+/// The outcome of one save, for a notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditNotice {
+    Saved(String),
+    Failed(String),
+}
 
-fn channel() -> &'static ConflictChannel {
-    static CHANNEL: OnceLock<ConflictChannel> = OnceLock::new();
-    CHANNEL.get_or_init(|| smol::channel::unbounded())
+/// Show an edit session's upload result as a notification.
+pub fn show_notice(notice: EditNotice, window: &mut Window, cx: &mut App) {
+    let notification = match notice {
+        EditNotice::Saved(message) => gpui_component::notification::Notification::success(message),
+        EditNotice::Failed(message) => gpui_component::notification::Notification::error(message),
+    };
+    window.push_notification(notification, cx);
+}
+
+type Channel<T> = (smol::channel::Sender<T>, smol::channel::Receiver<T>);
+
+fn conflicts() -> &'static Channel<EditConflict> {
+    static CHANNEL: OnceLock<Channel<EditConflict>> = OnceLock::new();
+    CHANNEL.get_or_init(smol::channel::unbounded)
+}
+
+fn notices() -> &'static Channel<EditNotice> {
+    static CHANNEL: OnceLock<Channel<EditNotice>> = OnceLock::new();
+    CHANNEL.get_or_init(smol::channel::unbounded)
 }
 
 /// Conflicts raised by edit sessions; the app listens and opens the dialog.
 pub fn subscribe() -> smol::channel::Receiver<EditConflict> {
-    channel().1.clone()
+    conflicts().1.clone()
 }
 
-/// Runs on the app tokio runtime: download `path` from `provider` into a
-/// temp file, open it, and keep re-uploading saves into `dst_dir`/`name`.
+/// Upload results of edit sessions; the app shows each as a notification.
+pub fn subscribe_notices() -> smol::channel::Receiver<EditNotice> {
+    notices().1.clone()
+}
+
+/// Runs on the app tokio runtime: open `path` from `provider` in the default
+/// app, starting a session (download, watch, upload saves) unless one is
+/// already running for it.
 pub async fn start(
     provider: Provider,
     path: String,
     name: String,
     queue: QueueHandle,
 ) -> Result<PathBuf> {
-    let dir = std::env::temp_dir()
-        .join("kessel-edit")
-        .join(format!("{}-{:x}", provider.site_id, fxhash(&path)));
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("creating `{}`", dir.display()))?;
-    let temp = dir.join(&name);
-    provider.read_to_file(&path, &temp).await?;
-    let baseline = stat_remote(&provider, &path).await.ok();
+    let key = (provider.site_id, path.clone());
+    let existing = SESSIONS
+        .lock()
+        .expect("edit session registry poisoned")
+        .get(&key)
+        .map(|(temp, _)| temp.clone());
+    if let Some(temp) = existing {
+        crate::ui::open_path_or_url(temp.to_string_lossy().as_ref());
+        return Ok(temp);
+    }
 
-    let dst_dir = parent_of(&path);
-    let session = Session {
-        provider,
-        remote_path: path,
-        temp: temp.clone(),
-        dst_dir,
-        name,
-        queue,
-        runtime: tokio::runtime::Handle::current(),
-        baseline: Mutex::new(baseline),
-    };
-    watch_and_upload(session)?;
-
+    let session = Arc::new(Session::open(provider, path, name, queue).await?);
+    let temp = session.temp.clone();
+    let watcher = watch(session)?;
+    SESSIONS
+        .lock()
+        .expect("edit session registry poisoned")
+        .insert(key, (temp.clone(), watcher));
     crate::ui::open_path_or_url(temp.to_string_lossy().as_ref());
     Ok(temp)
 }
@@ -110,14 +162,22 @@ pub async fn start(
 struct Session {
     provider: Provider,
     remote_path: String,
+    /// The file the editor works on; its folder is watched.
     temp: PathBuf,
-    dst_dir: String,
+    /// Where each save is copied before uploading, so the upload reads one
+    /// consistent version even if the editor saves again meanwhile.
+    snapshot: PathBuf,
     name: String,
     queue: QueueHandle,
-    runtime: tokio::runtime::Handle,
-    /// Remote state at the last known sync point; `None` means unknown
-    /// (conflict detection sits out one round rather than block editing).
-    baseline: Mutex<Option<RemoteState>>,
+    sync: tokio::sync::Mutex<SyncPoint>,
+}
+
+/// The last state both sides agreed on.
+struct SyncPoint {
+    /// `None` when the server copy couldn't be read after an upload; the
+    /// next save then asks before overwriting.
+    remote: Option<RemoteState>,
+    local: LocalVersion,
 }
 
 async fn stat_remote(provider: &Provider, path: &str) -> Result<RemoteState> {
@@ -133,124 +193,196 @@ async fn stat_remote(provider: &Provider, path: &str) -> Result<RemoteState> {
     })
 }
 
-/// Watch one temp file; each quiet period after a burst of writes enqueues
-/// an upload back to its origin — unless the server copy changed since the
-/// last sync, in which case the user decides.
-fn watch_and_upload(session: Session) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<()>();
+/// Watch the session file's folder (editors that save by writing a new file
+/// and renaming it over the old one replace the watched inode) and upload
+/// after each quiet period following a save.
+fn watch(session: Arc<Session>) -> Result<notify::RecommendedWatcher> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+    let target = session.temp.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if let Ok(event) = result {
-            if matches!(
-                event.kind,
-                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-            ) {
-                tx.send(()).ok();
-            }
+        let Ok(event) = result else { return };
+        let relevant = matches!(
+            event.kind,
+            notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+        ) && event.paths.iter().any(|path| path.file_name() == target.file_name());
+        if relevant {
+            tx.send(()).ok();
         }
     })?;
-    watcher.watch(&session.temp, notify::RecursiveMode::NonRecursive)?;
-    SESSIONS.lock().unwrap().push(watcher);
+    let folder = session
+        .temp
+        .parent()
+        .context("edit file has no parent folder")?;
+    watcher.watch(folder, notify::RecursiveMode::NonRecursive)?;
 
-    // Editors save in bursts (write + rename, backup files, …): wait for
-    // 750ms of quiet before uploading, and coalesce everything in between.
-    std::thread::spawn(move || {
-        while rx.recv().is_ok() {
-            while rx.recv_timeout(Duration::from_millis(750)).is_ok() {}
-            match session.check_conflict() {
-                Some(conflict_state) => {
-                    if !session.resolve_conflict(conflict_state) {
-                        continue;
-                    }
-                }
-                None => {}
-            }
-            session.upload();
-            // Swallow watcher noise our own re-download may have caused.
-            while rx.try_recv().is_ok() {}
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            while let Ok(Some(())) = tokio::time::timeout(DEBOUNCE, rx.recv()).await {}
+            session.flush().await;
         }
     });
-    Ok(())
+    Ok(watcher)
 }
 
 impl Session {
-    fn src(&self) -> String {
-        self.temp.to_string_lossy().trim_start_matches('/').to_string()
+    /// Download the remote file into a fresh per-process folder and record
+    /// the sync point.
+    async fn open(provider: Provider, remote_path: String, name: String, queue: QueueHandle) -> Result<Self> {
+        let dir = std::env::temp_dir()
+            .join("kessel-edit")
+            .join(std::process::id().to_string())
+            .join(format!("{}-{:x}", provider.site_id, fxhash(&remote_path)));
+        for sub in ["edit", "upload"] {
+            tokio::fs::create_dir_all(dir.join(sub))
+                .await
+                .with_context(|| format!("creating `{}`", dir.display()))?;
+        }
+        let temp = dir.join("edit").join(&name);
+        let remote = stat_remote(&provider, &remote_path).await?;
+        provider.read_to_file(&remote_path, &temp).await?;
+        let local = LocalVersion::of(&temp).await?;
+        Ok(Self {
+            provider,
+            remote_path,
+            snapshot: dir.join("upload").join(&name),
+            temp,
+            name,
+            queue,
+            sync: tokio::sync::Mutex::new(SyncPoint {
+                remote: Some(remote),
+                local,
+            }),
+        })
     }
 
-    /// The remote's current state when it differs from the sync baseline.
-    fn check_conflict(&self) -> Option<RemoteState> {
-        let baseline = self.baseline.lock().unwrap().clone()?;
-        let current = self
-            .runtime
-            .block_on(stat_remote(&self.provider, &self.remote_path))
-            .ok()?;
-        (current != baseline).then_some(current)
+    /// Upload the local file until the server holds its latest version, or
+    /// stop at the first failure, conflict left undecided, or discard. The
+    /// local copy is never touched except by an explicit discard.
+    async fn flush(&self) {
+        let mut sync = self.sync.lock().await;
+        loop {
+            let local = match LocalVersion::of(&self.temp).await {
+                Ok(local) => local,
+                Err(error) => return self.failed(&error),
+            };
+            if local == sync.local {
+                return;
+            }
+            let current = match stat_remote(&self.provider, &self.remote_path).await {
+                Ok(current) => current,
+                Err(error) => return self.failed(&error),
+            };
+            if sync.remote.as_ref() != Some(&current) {
+                match self.decide(&current).await {
+                    EditDecision::Overwrite => {}
+                    EditDecision::DiscardLocal => return self.discard(&mut sync, current).await,
+                    EditDecision::Cancel => return,
+                }
+            }
+            match self.upload(local).await {
+                Ok((remote, local)) => {
+                    *sync = SyncPoint { remote, local };
+                    self.notify(EditNotice::Saved(
+                        tf(
+                            "edit.saved",
+                            &[("name", &self.name), ("site", &self.provider.site_name)],
+                        )
+                        .to_string(),
+                    ));
+                }
+                Err(error) => return self.failed(&error),
+            }
+        }
     }
 
-    /// Raise the conflict to the UI and wait. Returns true when the local
-    /// save should still be uploaded.
-    fn resolve_conflict(&self, remote: RemoteState) -> bool {
+    /// Snapshot the local file, upload the snapshot and wait for the queue
+    /// job to settle. Returns the new sync point. `local` was read before
+    /// the snapshot, so a save racing the copy only makes the snapshot newer
+    /// than recorded, and the next pass uploads once more.
+    async fn upload(&self, local: LocalVersion) -> Result<(Option<RemoteState>, LocalVersion)> {
+        tokio::fs::copy(&self.temp, &self.snapshot)
+            .await
+            .with_context(|| format!("copying `{}`", self.temp.display()))?;
+        tracing::info!(file = %self.name, "external edit saved; uploading");
+        let job_id = self
+            .queue
+            .submit(NewJob {
+                src_site_id: LOCAL_SITE_ID,
+                dst_site_id: self.provider.site_id,
+                src: self.snapshot.to_string_lossy().trim_start_matches('/').to_string(),
+                dst_dir: parent_of(&self.remote_path),
+                dst_name: Some(self.name.clone()),
+                conflict_policy: ConflictPolicy::Overwrite,
+                move_source: false,
+            })
+            .await?;
+        let outcome = self.queue.settled(job_id).await?;
+        if outcome.state != JobState::Done || outcome.files_failed > 0 {
+            anyhow::bail!(outcome
+                .error
+                .unwrap_or_else(|| "the upload was cancelled".to_string()));
+        }
+        // Unknown on a failed stat: the next save asks instead of guessing.
+        let remote = stat_remote(&self.provider, &self.remote_path).await.ok();
+        Ok((remote, local))
+    }
+
+    /// Raise the conflict to the UI and wait for the decision.
+    async fn decide(&self, remote: &RemoteState) -> EditDecision {
         tracing::warn!(
             file = %self.name, remote = %self.remote_path,
             "external edit conflicts with a server-side change"
         );
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let conflict = EditConflict {
             name: self.name.clone(),
             remote_modified: remote.modified.clone(),
             decision: tx,
         };
-        if channel().0.try_send(conflict).is_err() {
-            // No UI listening (shutdown?): err on the safe side, skip upload.
-            return false;
+        if conflicts().0.try_send(conflict).is_err() {
+            return EditDecision::Cancel;
         }
-        // A closed dialog (or dropped sender) counts as Cancel.
-        match rx.recv().unwrap_or(EditDecision::Cancel) {
-            EditDecision::Overwrite => true,
-            EditDecision::DiscardLocal => {
-                *self.baseline.lock().unwrap() = Some(remote);
-                if let Err(error) = self
-                    .runtime
-                    .block_on(self.provider.read_to_file(&self.remote_path, &self.temp))
-                {
-                    tracing::error!(%error, "re-downloading the server copy failed");
+        // A closed dialog (dropped sender) counts as Cancel.
+        rx.recv().await.unwrap_or(EditDecision::Cancel)
+    }
+
+    /// Replace the local copy with the server's and make that the sync point.
+    async fn discard(&self, sync: &mut SyncPoint, remote: RemoteState) {
+        if let Err(error) = self
+            .provider
+            .read_to_file(&self.remote_path, &self.temp)
+            .await
+        {
+            return self.failed(&error);
+        }
+        match LocalVersion::of(&self.temp).await {
+            Ok(local) => {
+                *sync = SyncPoint {
+                    remote: Some(remote),
+                    local,
                 }
-                false
             }
-            EditDecision::Cancel => false,
+            Err(error) => self.failed(&error),
         }
     }
 
-    fn upload(&self) {
-        tracing::info!(file = %self.name, "external edit saved; re-uploading");
-        let before = self.baseline.lock().unwrap().clone();
-        self.queue.enqueue(NewJob {
-            src_site_id: LOCAL_SITE_ID,
-            dst_site_id: self.provider.site_id,
-            src: self.src(),
-            dst_dir: self.dst_dir.clone(),
-            dst_name: Some(self.name.clone()),
-            conflict_policy: ConflictPolicy::Overwrite,
-            move_source: false,
-        });
-        // Re-baseline once the upload lands: poll until the remote state
-        // moves off the pre-upload snapshot. Times out into `None`, which
-        // skips conflict detection for one save instead of false-alarming.
-        let new_baseline = self.runtime.block_on(async {
-            for _ in 0..30 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Ok(state) = stat_remote(&self.provider, &self.remote_path).await {
-                    if before.as_ref() != Some(&state) {
-                        return Some(state);
-                    }
-                }
-            }
-            None
-        });
-        if new_baseline.is_none() {
-            tracing::debug!(file = %self.name, "post-upload re-baseline timed out");
-        }
-        *self.baseline.lock().unwrap() = new_baseline;
+    fn failed(&self, error: &anyhow::Error) {
+        tracing::error!(file = %self.name, error = %format!("{error:#}"), "external edit upload failed");
+        self.notify(EditNotice::Failed(
+            tf(
+                "edit.failed",
+                &[
+                    ("name", &self.name),
+                    ("site", &self.provider.site_name),
+                    ("reason", &crate::errors::humanize(error).title),
+                ],
+            )
+            .to_string(),
+        ));
+    }
+
+    fn notify(&self, notice: EditNotice) {
+        notices().0.try_send(notice).ok();
     }
 }
 
@@ -344,4 +476,60 @@ fn parent_of(path: &str) -> String {
 fn fxhash(s: &str) -> u64 {
     s.bytes()
         .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session against the local filesystem standing in for a remote.
+    #[test]
+    fn uploads_each_new_save_once_and_never_after_a_failed_check() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("kessel-edit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let remote_file = dir.join("notes.txt");
+        std::fs::write(&remote_file, b"v1").unwrap();
+
+        let pool = rt.block_on(crate::db::connect(&dir)).unwrap();
+        let cfg = crate::config::TransferConfig {
+            max_parallel: 2,
+            bandwidth_limit: 0,
+            retries: 0,
+            verify: true,
+            preserve_timestamps: false,
+            skip_hidden: false,
+        };
+        let queue = crate::queue::start(&rt, pool, cfg, Default::default());
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), "/".to_string())].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&local, &Default::default()).unwrap();
+        let remote_path = remote_file.to_str().unwrap().trim_start_matches('/').to_string();
+        let session = rt
+            .block_on(Session::open(provider, remote_path, "notes.txt".into(), queue.clone()))
+            .unwrap();
+        let notices = subscribe_notices();
+
+        std::fs::write(&session.temp, b"v2 local").unwrap();
+        rt.block_on(session.flush());
+        assert_eq!(std::fs::read(&remote_file).unwrap(), b"v2 local");
+        assert!(matches!(notices.try_recv(), Ok(EditNotice::Saved(_))));
+
+        // Nothing new locally: no upload, so no notice either.
+        rt.block_on(session.flush());
+        assert!(notices.try_recv().is_err());
+
+        // The server copy can't be checked: keep the local save, upload nothing.
+        std::fs::remove_file(&remote_file).unwrap();
+        std::fs::write(&session.temp, b"v3 local, longer").unwrap();
+        rt.block_on(session.flush());
+        assert!(!remote_file.exists());
+        assert_eq!(std::fs::read(&session.temp).unwrap(), b"v3 local, longer");
+        assert!(matches!(notices.try_recv(), Ok(EditNotice::Failed(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

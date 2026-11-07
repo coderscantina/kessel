@@ -128,6 +128,8 @@ pub struct RemoteEntry {
 #[derive(Clone)]
 pub struct Provider {
     pub site_id: i64,
+    /// The site's display name, for messages about it.
+    pub site_name: String,
     pub caps: Capabilities,
     /// The site's backend scheme, for provider-specific UI (columns, menus).
     /// opendal 0.58 dropped the `Scheme` enum in favour of string schemes.
@@ -186,6 +188,7 @@ impl Provider {
                 .with_context(|| format!("building operator for site `{}`", profile.name))?;
             return Ok(Self {
                 site_id: profile.id,
+                site_name: profile.name.clone(),
                 caps: Self::capabilities(&probe_op),
                 scheme: scheme.to_string(),
                 options: Arc::new(options.clone()),
@@ -207,6 +210,7 @@ impl Provider {
         let caps = Self::capabilities(&op);
         Ok(Self {
             site_id: profile.id,
+            site_name: profile.name.clone(),
             caps,
             scheme: scheme.to_string(),
             options: resolved,
