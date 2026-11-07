@@ -377,6 +377,15 @@ fn prompt_conflict(job: &JobSnapshot, window: &mut Window, cx: &mut App) {
 }
 
 /// Last segment of a browse path, without the trailing `/` of a folder.
+/// The last segment of a browse path for a compact job title; the root
+/// reads as "/".
+fn short_path(path: &str) -> &str {
+    match file_name(path) {
+        "" => "/",
+        name => name,
+    }
+}
+
 fn file_name(path: &str) -> &str {
     let path = path.trim_end_matches('/');
     path.rsplit('/').next().unwrap_or(path)
@@ -861,6 +870,7 @@ impl TransfersPanel {
 
         v_flex()
             .id(("job", key))
+            .w_full()
             .gap_1()
             .px_3()
             .py_2()
@@ -885,7 +895,17 @@ impl TransfersPanel {
                                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_drill(id, false, cx))),
                             )
                             .child(Icon::new(icon).small().text_color(cx.theme().muted_foreground))
-                            .child(div().truncate().text_sm().child(format!("/{} → /{}", job.src, job.dst))),
+                            .child({
+                                let full: SharedString = format!("/{} → /{}", job.src, job.dst).into();
+                                div()
+                                    .id(("job-title", key))
+                                    .truncate()
+                                    .text_sm()
+                                    .child(format!("{} → {}", short_path(&job.src), short_path(&job.dst)))
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                                    })
+                            }),
                     )
                     .child(controls),
             )
@@ -1069,6 +1089,7 @@ impl TransfersPanel {
             parts.push(human_duration((ms / 1000).max(0) as u64));
         }
         v_flex()
+            .w_full()
             .gap_0p5()
             .px_3()
             .py_2()
