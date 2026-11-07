@@ -1972,6 +1972,146 @@ mod tests {
         }
     }
 
+    /// A task row as saved before migration 0013: it ran (`attempts` 1) but
+    /// recorded neither a partial nor a write mode. Returns (job, task) ids.
+    fn legacy_job(
+        env: &TestEnv,
+        (job_state, task_state): (&str, &str),
+        dst_site_id: i64,
+        src: &Path,
+        dst: &Path,
+        byte_offset: u64,
+    ) -> (i64, i64) {
+        env.rt.block_on(async {
+            let meta = opendal::Operator::via_iter("fs", [("root".to_string(), "/".to_string())])
+                .unwrap()
+                .stat(&browse(src))
+                .await
+                .ok();
+            let modified = meta
+                .as_ref()
+                .and_then(|meta| meta.last_modified())
+                .and_then(crate::provider::to_datetime)
+                .map(|t| t.to_rfc3339());
+            let job: i64 = sqlx::query_scalar(
+                "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, state, expanded, finished_at) \
+                 VALUES (0, ?, ?, ?, ?, 1, CASE WHEN ? = 'done' THEN datetime('now') END) RETURNING id",
+            )
+            .bind(dst_site_id)
+            .bind(browse(src))
+            .bind(format!("{}/", browse(dst.parent().unwrap())))
+            .bind(job_state)
+            .bind(job_state)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+            let task: i64 = sqlx::query_scalar(
+                "INSERT INTO transfer_tasks \
+                   (job_id, src, dst, state, byte_offset, total_bytes, src_modified, attempts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+            )
+            .bind(job)
+            .bind(browse(src))
+            .bind(browse(dst))
+            .bind(task_state)
+            .bind(byte_offset as i64)
+            .bind(meta.map(|meta| meta.content_length() as i64))
+            .bind(modified)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+            (job, task)
+        })
+    }
+
+    /// The deterministic partial file of task `id` writing `dst`.
+    fn legacy_partial(dst: &Path, id: i64) -> PathBuf {
+        PathBuf::from(format!("/{}", transfer::partial_path(&browse(dst), id)))
+    }
+
+    #[test]
+    fn a_legacy_task_resumes_its_deterministic_partial() {
+        let env = test_env("legacy-resume");
+        let src = env.dir.join("src/file.bin");
+        let dst = env.dir.join("dst/file.bin");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let content: Vec<u8> = (0..64u8).collect();
+        std::fs::write(&src, &content).unwrap();
+        let (job, task) = legacy_job(&env, ("paused", "paused"), 0, &src, &dst, 16);
+        // Marked bytes prove the copy appended to the partial instead of
+        // starting over.
+        std::fs::write(legacy_partial(&dst, task), [b'X'; 16]).unwrap();
+
+        env.handle.resume(job);
+        let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        let mut expected = vec![b'X'; 16];
+        expected.extend_from_slice(&content[16..]);
+        assert_eq!(std::fs::read(&dst).unwrap(), expected);
+        assert!(partials(dst.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_task_without_a_partial_restarts_and_keeps_the_destination() {
+        let (env, src_dir, dst_dir, content) = slow_env("legacy-restart");
+        let src = src_dir.join("big.bin");
+        let dst = dst_dir.join("big.bin");
+        // Before partial files, a resumed task appended to the destination
+        // in place; what it holds now can't be trusted.
+        std::fs::write(&dst, b"OLD").unwrap();
+        let offset = 1024 * 1024;
+        let (job, task) = legacy_job(&env, ("paused", "paused"), 1, &src, &dst, offset);
+
+        env.handle.resume(job);
+        pause_once_past(&env, job, offset);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"OLD");
+        assert_eq!(partials(&dst_dir), vec![legacy_partial(&dst, task)]);
+
+        env.handle.resume(job);
+        let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert!(std::fs::read(&dst).unwrap() == content);
+        assert!(partials(&dst_dir).is_empty());
+    }
+
+    #[test]
+    fn cancel_and_remove_delete_legacy_partials() {
+        let env = test_env("legacy-partials");
+        let src = env.dir.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let dst = env.dir.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let (paused_job, paused_task) =
+            legacy_job(&env, ("paused", "paused"), 0, &src, &dst.join("a.txt"), 0);
+        let (settled_job, failed_task) =
+            legacy_job(&env, ("done", "failed"), 0, &src, &dst.join("b.txt"), 4);
+        let paused_part = legacy_partial(&dst.join("a.txt"), paused_task);
+        let failed_part = legacy_partial(&dst.join("b.txt"), failed_task);
+        std::fs::write(&paused_part, b"half").unwrap();
+        std::fs::write(&failed_part, b"half").unwrap();
+        // These rows were inserted after migrating; run the backfill that
+        // real databases get for rows saved before 0013.
+        env.rt
+            .block_on(
+                sqlx::raw_sql(include_str!("../../migrations/0014_legacy_task_partials.sql"))
+                    .execute(&env.pool),
+            )
+            .unwrap();
+
+        env.handle.cancel(paused_job);
+        let outcome = env.rt.block_on(env.handle.settled(paused_job)).unwrap();
+        assert_eq!(outcome.state, JobState::Cancelled);
+        assert!(!paused_part.exists());
+
+        env.handle.remove(settled_job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while failed_part.exists() {
+            assert!(std::time::Instant::now() < deadline, "legacy partial of the removed job was kept");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[test]
     fn transient_preparation_failure_keeps_the_job_queued() {
         let env = test_env_with("prep-transient", |cfg| cfg.retries = 3);
