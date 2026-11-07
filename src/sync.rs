@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use crate::queue::{BatchFile, ConflictPolicy, JobState, NewBatch, QueueHandle};
+use crate::queue::{BatchFile, ConflictPolicy, JobOutcome, JobState, NewBatch, QueueHandle};
 use crate::provider::Provider;
 
 /// Clock slack when comparing modified times across backends (FAT, S3 and
@@ -85,7 +85,8 @@ struct FileMeta {
 
 /// Recursively list `root`, keyed by path relative to it (dirs end `/`).
 /// Uses the provider's own per-directory listing so bucket-root S3 sites and
-/// stat-completed fs listings behave exactly like the browser pane.
+/// stat-completed fs listings behave exactly like the browser pane. The
+/// queue's own partial files are not part of either tree.
 async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMeta>> {
     let mut out = BTreeMap::new();
     let mut pending = vec![root.to_string()];
@@ -94,7 +95,7 @@ async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMe
             let Some(rel) = entry.path.strip_prefix(root) else {
                 continue;
             };
-            if rel.is_empty() {
+            if rel.is_empty() || (!entry.is_dir && rel.ends_with(crate::queue::PARTIAL_SUFFIX)) {
                 continue;
             }
             out.insert(
@@ -277,6 +278,7 @@ pub async fn run(
     work: SyncWork,
 ) -> SyncReport {
     let mut report = SyncReport::default();
+    let mut copies_ok = true;
 
     for dir in &work.new_dirs {
         if let Err(error) = dst.create_dir(dir).await {
@@ -298,22 +300,10 @@ pub async fn run(
             Ok(job_id) => queue.settled(job_id).await,
             Err(error) => Err(error),
         };
-        match settled {
-            Ok(outcome) => {
-                report.copied = outcome.files_done;
-                let missing = total.saturating_sub(outcome.files_done);
-                if outcome.state != JobState::Done || missing > 0 {
-                    let reason = outcome
-                        .error
-                        .unwrap_or_else(|| "The transfer was cancelled.".to_string());
-                    report.fail(missing, reason);
-                }
-            }
-            Err(error) => report.fail(total, crate::errors::humanize(&error).title),
-        }
+        copies_ok = record_copies(&mut report, total, settled);
     }
 
-    if report.failed > 0 {
+    if !copies_ok || report.failed > 0 {
         report.deletes_skipped = !work.deletes.is_empty();
         return report;
     }
@@ -324,6 +314,30 @@ pub async fn run(
         }
     }
     report
+}
+
+/// Fold the copy job's outcome into the report. True only when the job
+/// finished `Done` with every file copied; a cancelled job is never a
+/// success, even with nothing missing.
+fn record_copies(report: &mut SyncReport, total: u64, settled: Result<JobOutcome>) -> bool {
+    match settled {
+        Ok(outcome) => {
+            report.copied = outcome.files_done;
+            let missing = total.saturating_sub(outcome.files_done);
+            let ok = outcome.state == JobState::Done && missing == 0;
+            if !ok {
+                let reason = outcome
+                    .error
+                    .unwrap_or_else(|| "The transfer was cancelled.".to_string());
+                report.fail(missing, reason);
+            }
+            ok
+        }
+        Err(error) => {
+            report.fail(total, crate::errors::humanize(&error).title);
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +393,41 @@ mod tests {
         );
         assert_eq!(work.new_dirs, vec!["d/empty/".to_string()]);
         assert_eq!(work.deletes, vec![("d/old/".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_cancelled_copy_holds_back_deletes_even_with_nothing_missing() {
+        let mut report = SyncReport::default();
+        let cancelled = JobOutcome {
+            state: JobState::Cancelled,
+            error: None,
+            files_done: 2,
+            files_failed: 0,
+        };
+        assert!(!record_copies(&mut report, 2, Ok(cancelled)));
+        assert_eq!(report.copied, 2);
+        assert!(report.reason.is_some());
+    }
+
+    #[test]
+    fn walk_leaves_out_partial_files() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("kessel-sync-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join(".a.txt.3.kessel-part"), b"half").unwrap();
+        std::fs::write(dir.join("sub/.b.txt.4.kessel-part"), b"half").unwrap();
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), "/".to_string())].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&local, &Default::default()).unwrap();
+        let root = format!("{}/", dir.to_str().unwrap().trim_start_matches('/'));
+        let tree = rt.block_on(walk(&provider, &root)).unwrap();
+        assert_eq!(tree.keys().map(String::as_str).collect::<Vec<_>>(), ["a.txt", "sub/"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
