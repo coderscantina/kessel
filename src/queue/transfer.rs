@@ -502,22 +502,45 @@ async fn finish_transfer(
 }
 
 /// Move a finished partial onto the real name. Some servers (SFTP v3) refuse
-/// to rename over an existing file; then the old file is deleted, which is
-/// safe now that the new one is complete, and the rename retried.
+/// to rename over an existing file. Only for that case, with both files
+/// present and no permission or not-found error, the old file is moved
+/// aside to a backup name first, the partial renamed into place, and the
+/// backup deleted. A failure in between moves the old file back, so it is
+/// never lost.
 async fn commit_partial(op: &Operator, partial: &str, path: &str) -> Result<()> {
     let Err(error) = op.rename(partial, path).await else {
         return Ok(());
     };
-    match op.stat(path).await {
-        Ok(_) => {
-            op.delete(path)
-                .await
-                .with_context(|| format!("replacing `{path}`"))?;
-            op.rename(partial, path)
-                .await
-                .with_context(|| format!("moving the finished file to `{path}`"))
+    let context = || format!("moving the finished file to `{path}`");
+    let refused_over_existing = !matches!(
+        error.kind(),
+        opendal::ErrorKind::NotFound | opendal::ErrorKind::PermissionDenied
+    ) && op.exists(partial).await.unwrap_or(false)
+        && op.exists(path).await.unwrap_or(false);
+    if !refused_over_existing {
+        return Err(error).with_context(context);
+    }
+
+    let backup = format!(
+        "{}.old{PARTIAL_SUFFIX}",
+        partial.strip_suffix(PARTIAL_SUFFIX).unwrap_or(partial)
+    );
+    if op.rename(path, &backup).await.is_err() {
+        return Err(error).with_context(context);
+    }
+    match op.rename(partial, path).await {
+        Ok(()) => {
+            if let Err(error) = op.delete(&backup).await {
+                tracing::warn!(%backup, %error, "removing the replaced file's backup failed");
+            }
+            Ok(())
         }
-        Err(_) => Err(error).with_context(|| format!("moving the finished file to `{path}`")),
+        Err(error) => {
+            if let Err(restore) = op.rename(&backup, path).await {
+                tracing::error!(%backup, %path, error = %restore, "restoring the replaced file failed; it is kept under the backup name");
+            }
+            Err(error).with_context(context)
+        }
     }
 }
 
@@ -655,6 +678,20 @@ mod tests {
             conflict_policy: ConflictPolicy::Overwrite,
             move_source: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_keeps_the_old_file() {
+        let dir = std::env::temp_dir().join(format!("kessel-commit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"OLD").unwrap();
+        let op = Operator::via_iter("fs", [("root".to_string(), dir.to_string_lossy().to_string())]).unwrap();
+        // The partial is missing: the rename fails for a reason other than
+        // the destination existing, so the destination must stay.
+        assert!(commit_partial(&op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
+        assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
