@@ -411,6 +411,35 @@ pub struct TransferConfig {
     /// per-file transfer tasks.
     #[serde(default)]
     pub skip_hidden: bool,
+    /// What a transfer started from a file pane does when the destination
+    /// file already exists.
+    #[serde(default)]
+    pub default_conflict_policy: DefaultConflictPolicy,
+}
+
+/// The configurable subset of [`crate::queue::ConflictPolicy`], in the
+/// words the conflict dialog uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultConflictPolicy {
+    #[default]
+    Ask,
+    Replace,
+    Skip,
+    KeepBoth,
+    ReplaceIfNewer,
+}
+
+impl From<DefaultConflictPolicy> for crate::queue::ConflictPolicy {
+    fn from(policy: DefaultConflictPolicy) -> Self {
+        match policy {
+            DefaultConflictPolicy::Ask => Self::Ask,
+            DefaultConflictPolicy::Replace => Self::Overwrite,
+            DefaultConflictPolicy::Skip => Self::Skip,
+            DefaultConflictPolicy::KeepBoth => Self::Rename,
+            DefaultConflictPolicy::ReplaceIfNewer => Self::OverwriteNewer,
+        }
+    }
 }
 
 fn default_retries() -> u32 {
@@ -543,6 +572,27 @@ mod tests {
             .update
             .url
             .ends_with("releases/latest/download/latest.json"));
+    }
+
+    /// The default conflict policy is "ask" and accepts the documented names.
+    #[test]
+    fn default_conflict_policy_parses() {
+        let parse = |json5: &str| -> KesselConfig {
+            config::Config::builder()
+                .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Json5))
+                .add_source(config::File::from_str(json5, config::FileFormat::Json5))
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap()
+        };
+        assert_eq!(parse("{}").transfers.default_conflict_policy, DefaultConflictPolicy::Ask);
+        let cfg = parse("{ transfers: { default_conflict_policy: \"keep_both\" } }");
+        assert_eq!(cfg.transfers.default_conflict_policy, DefaultConflictPolicy::KeepBoth);
+        assert_eq!(
+            crate::queue::ConflictPolicy::from(DefaultConflictPolicy::ReplaceIfNewer),
+            crate::queue::ConflictPolicy::OverwriteNewer
+        );
     }
 
     /// Zed-style theme_overrides use dotted style keys ("element.selected");
