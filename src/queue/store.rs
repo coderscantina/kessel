@@ -9,7 +9,8 @@ use sqlx::{Row as _, SqlitePool};
 use crate::provider::{LayerConfig, SiteProfile};
 
 use super::{
-    ConflictInfo, ConflictPolicy, HistoryEntry, JobSnapshot, JobState, NewJob, TaskSnapshot,
+    ConflictInfo, ConflictPolicy, HistoryEntry, JobOutcome, JobSnapshot, JobState, NewJob,
+    TaskSnapshot,
 };
 
 /// A job row as the scheduler sees it.
@@ -39,6 +40,8 @@ pub(crate) struct ClaimedTask {
     pub byte_offset: u64,
     pub total_bytes: Option<u64>,
     pub src_etag: Option<String>,
+    /// Source mtime (RFC 3339) recorded when the resume offset was written.
+    pub src_modified: Option<String>,
     /// This file's decision, falling back to the owning job's policy.
     pub conflict_policy: ConflictPolicy,
     /// The owning job transfers with move semantics.
@@ -104,19 +107,20 @@ pub(crate) async fn runnable_jobs(pool: &SqlitePool) -> Result<Vec<JobRow>> {
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| JobRow {
-            id: row.get("id"),
-            src_site_id: row.get("src_site_id"),
-            dst_site_id: row.get("dst_site_id"),
-            src: row.get("src"),
-            dst: row.get("dst"),
-            dst_name: row.get("dst_name"),
-            expanded: row.get::<i64, _>("expanded") != 0,
-            move_source: row.get::<i64, _>("move_source") != 0,
-        })
-        .collect())
+    Ok(rows.into_iter().map(job_row).collect())
+}
+
+fn job_row(row: sqlx::sqlite::SqliteRow) -> JobRow {
+    JobRow {
+        id: row.get("id"),
+        src_site_id: row.get("src_site_id"),
+        dst_site_id: row.get("dst_site_id"),
+        src: row.get("src"),
+        dst: row.get("dst"),
+        dst_name: row.get("dst_name"),
+        expanded: row.get::<i64, _>("expanded") != 0,
+        move_source: row.get::<i64, _>("move_source") != 0,
+    }
 }
 
 /// Start (or restart) a job's fan-out: drop any tasks a previously
@@ -204,8 +208,9 @@ pub(crate) async fn claim_task(
          WHERE id = (SELECT t.id FROM transfer_tasks t \
              JOIN transfer_jobs j ON j.id = t.job_id \
              WHERE t.state = 'queued' AND j.state = 'active' AND j.id IN ({ids}) \
+               AND (t.not_before IS NULL OR t.not_before <= datetime('now')) \
              ORDER BY j.priority DESC, t.id LIMIT 1) \
-         RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, \
+         RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, \
              COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
              (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
     );
@@ -221,6 +226,7 @@ pub(crate) async fn claim_task(
         byte_offset: row.get::<i64, _>("byte_offset") as u64,
         total_bytes: row.get::<Option<i64>, _>("total_bytes").map(|b| b as u64),
         src_etag: row.get("src_etag"),
+        src_modified: row.get("src_modified"),
         conflict_policy: ConflictPolicy::from_str(&row.get::<String, _>("conflict_policy")),
         move_source: row.get::<i64, _>("move_source") != 0,
     }))
@@ -361,24 +367,58 @@ pub(crate) async fn set_task_state(pool: &SqlitePool, task_id: i64, state: &str)
     Ok(())
 }
 
-/// Task-level retry: re-queue (keeping the resume offset) while attempts
-/// remain, otherwise fail the task for good.
+/// A worker reported `Paused`. The task only stays `paused` while its job is
+/// paused; a pause that came from shutdown, or one the user already resumed,
+/// goes straight back to `queued` so nothing is stranded.
+pub(crate) async fn task_paused(pool: &SqlitePool, task_id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE transfer_tasks SET state = CASE WHEN \
+           (SELECT state FROM transfer_jobs WHERE id = job_id) = 'paused' \
+           THEN 'paused' ELSE 'queued' END, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Task-level retry: a transient error re-queues the task (keeping its
+/// resume offset) with exponential backoff (2s, 4s, … capped at ~4min)
+/// while attempts remain. Anything else fails the task at once. Returns true
+/// when the task failed for good.
 pub(crate) async fn task_failed(
     pool: &SqlitePool,
     task_id: i64,
     error: &str,
+    transient: bool,
     max_retries: u32,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let budget = if transient { i64::from(max_retries) } else { -1 };
+    let state: String = sqlx::query_scalar(
         "UPDATE transfer_tasks SET \
          state = CASE WHEN attempts <= ? THEN 'queued' ELSE 'failed' END, \
-         error = ?, updated_at = datetime('now') WHERE id = ?",
+         not_before = CASE WHEN attempts <= ? \
+           THEN datetime('now', printf('+%d seconds', 1 << MIN(attempts, 8))) END, \
+         error = ?, updated_at = datetime('now') WHERE id = ? RETURNING state",
     )
-    .bind(max_retries as i64)
+    .bind(budget)
+    .bind(budget)
     .bind(error)
     .bind(task_id)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
+    Ok(state == "failed")
+}
+
+/// Keep the first permanent failure's wording on the job, as the
+/// representative reason shown for it.
+pub(crate) async fn note_job_error(pool: &SqlitePool, job_id: i64, title: &str) -> Result<()> {
+    sqlx::query("UPDATE transfer_jobs SET error = COALESCE(error, ?) WHERE id = ?")
+        .bind(title)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -393,14 +433,20 @@ pub(crate) async fn pause_job(pool: &SqlitePool, job_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// A resumed job whose fan-out finished goes straight back to `active`, so
+/// its tasks are claimable again whether or not its providers are still
+/// connected (the scheduler reconnects active jobs that lack them). An
+/// unexpanded job goes to `queued` so preparation reruns the fan-out.
+const RESUMED_STATE: &str = "CASE WHEN expanded = 1 THEN 'active' ELSE 'queued' END";
+
 pub(crate) async fn resume_job(pool: &SqlitePool, job_id: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
-    // Back to `queued`: preparation (providers, and expansion if the pause
-    // hit before fan-out) reruns and re-activates.
-    sqlx::query("UPDATE transfer_jobs SET state = 'queued' WHERE id = ? AND state = 'paused'")
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE transfer_jobs SET state = {RESUMED_STATE} WHERE id = ? AND state = 'paused'"
+    )))
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "UPDATE transfer_tasks SET state = 'queued', updated_at = datetime('now') \
          WHERE job_id = ? AND state = 'paused'",
@@ -447,7 +493,7 @@ pub(crate) async fn retry_job(pool: &SqlitePool, job_id: i64) -> Result<()> {
     if changed > 0 {
         sqlx::query(
             "UPDATE transfer_tasks SET state = 'queued', attempts = 0, error = NULL, \
-             updated_at = datetime('now') \
+             not_before = NULL, updated_at = datetime('now') \
              WHERE job_id = ? AND state IN ('failed', 'cancelled', 'paused')",
         )
         .bind(job_id)
@@ -458,15 +504,53 @@ pub(crate) async fn retry_job(pool: &SqlitePool, job_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// After a graceful shutdown, tasks that workers parked as `paused` belong
-/// to still-`active` jobs (a user pause flips the job too). Re-queue them so
-/// the next launch resumes automatically.
-pub(crate) async fn requeue_shutdown_paused(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        "UPDATE transfer_tasks SET state = 'queued', updated_at = datetime('now') \
-         WHERE state = 'paused' AND job_id IN \
-           (SELECT id FROM transfer_jobs WHERE state = 'active')",
+/// Re-run only the failed files of a settled job (done, possibly with
+/// errors, or failed). Done and skipped files stay as they are; failed ones
+/// re-queue with their resume offsets and a fresh attempt budget.
+pub(crate) async fn retry_failed_tasks(pool: &SqlitePool, job_id: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE transfer_jobs SET state = 'queued', error = NULL, finished_at = NULL \
+         WHERE id = ? AND state IN ('done', 'failed') AND files_failed > 0",
     )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed > 0 {
+        sqlx::query(
+            "UPDATE transfer_tasks SET state = 'queued', attempts = 0, error = NULL, \
+             not_before = NULL, updated_at = datetime('now') \
+             WHERE job_id = ? AND state = 'failed'",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Cancelled tasks that kept a resume offset (paused or failed before the
+/// cancel), as `(task id, destination browse path)`.
+pub(crate) async fn cancelled_partials(pool: &SqlitePool, job_id: i64) -> Result<Vec<(i64, String)>> {
+    let rows = sqlx::query(
+        "SELECT id, dst FROM transfer_tasks \
+         WHERE job_id = ? AND state = 'cancelled' AND byte_offset > 0",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.get("id"), row.get("dst"))).collect())
+}
+
+/// Forget the resume offsets of a cancelled job once its partials are gone.
+pub(crate) async fn reset_cancelled_offsets(pool: &SqlitePool, job_id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE transfer_tasks SET byte_offset = 0, updated_at = datetime('now') \
+         WHERE job_id = ? AND state = 'cancelled' AND byte_offset > 0",
+    )
+    .bind(job_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -487,14 +571,15 @@ pub(crate) async fn fail_job(pool: &SqlitePool, job_id: i64, error: &str) -> Res
 
 /// If nothing is left to run, settle the job's final state and write the
 /// audit row. Idempotent: `finished_at` guards double finalization.
-/// Returns true when the job just reached a terminal state.
+/// A job with some failed files still finishes `done`, with the failure
+/// count and a representative reason in `error`; it only `failed` when no
+/// file made it. Returns true when the job just reached a terminal state.
 pub(crate) async fn try_finalize_job(pool: &SqlitePool, job_id: i64) -> Result<bool> {
     let row = sqlx::query(
-        "SELECT j.state, \
-           SUM(CASE WHEN t.state IN ('queued', 'active', 'paused', 'conflict') THEN 1 ELSE 0 END) AS pending, \
-           SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END) AS failed \
-         FROM transfer_jobs j LEFT JOIN transfer_tasks t ON t.job_id = j.id \
-         WHERE j.id = ? GROUP BY j.id",
+        "SELECT state, files_total, files_done, files_skipped, files_failed, error, \
+           EXISTS (SELECT 1 FROM transfer_tasks WHERE job_id = transfer_jobs.id \
+             AND state IN ('queued', 'active', 'paused', 'conflict')) AS pending \
+         FROM transfer_jobs WHERE id = ?",
     )
     .bind(job_id)
     .fetch_optional(pool)
@@ -502,22 +587,64 @@ pub(crate) async fn try_finalize_job(pool: &SqlitePool, job_id: i64) -> Result<b
     let Some(row) = row else { return Ok(false) };
 
     let state = JobState::from_str(&row.get::<String, _>("state"));
-    let pending: i64 = row.get::<Option<i64>, _>("pending").unwrap_or(0);
-    let failed: i64 = row.get::<Option<i64>, _>("failed").unwrap_or(0);
+    let pending = row.get::<i64, _>("pending") != 0;
+    let total: i64 = row.get("files_total");
+    let settled_ok = row.get::<i64, _>("files_done") + row.get::<i64, _>("files_skipped");
+    let failed: i64 = row.get("files_failed");
+    let reason: Option<String> = row.get("error");
 
-    let outcome = match state {
-        JobState::Active if pending == 0 && failed > 0 => "failed",
-        JobState::Active if pending == 0 => "done",
-        JobState::Cancelled => "cancelled",
+    let (outcome, error) = match state {
+        JobState::Active if pending => return Ok(false),
+        JobState::Active if failed > 0 => {
+            let reason = reason.unwrap_or_else(|| "unknown error".to_string());
+            let error = match (total, settled_ok) {
+                (1, _) => reason,
+                (_, 0) => format!("All {failed} files failed: {reason}"),
+                _ => format!("{failed} of {total} files failed: {reason}"),
+            };
+            (if settled_ok == 0 { "failed" } else { "done" }, Some(error))
+        }
+        JobState::Active => ("done", None),
+        JobState::Cancelled => ("cancelled", reason),
         _ => return Ok(false),
     };
-    sqlx::query("UPDATE transfer_jobs SET state = ? WHERE id = ?")
+    sqlx::query("UPDATE transfer_jobs SET state = ?, error = ? WHERE id = ?")
         .bind(outcome)
+        .bind(error)
         .bind(job_id)
         .execute(pool)
         .await?;
     finalize_history(pool, job_id).await?;
     Ok(true)
+}
+
+/// A job's current outcome fields (`None` if the job doesn't exist). The
+/// caller checks `state.is_terminal()` to know whether it has settled.
+pub(crate) async fn job_outcome(pool: &SqlitePool, job_id: i64) -> Result<Option<JobOutcome>> {
+    let row = sqlx::query(
+        "SELECT state, error, files_done, files_failed FROM transfer_jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| JobOutcome {
+        state: JobState::from_str(&row.get::<String, _>("state")),
+        error: row.get("error"),
+        files_done: row.get::<i64, _>("files_done") as u64,
+        files_failed: row.get::<i64, _>("files_failed") as u64,
+    }))
+}
+
+/// The job row, for connecting its sites outside preparation.
+pub(crate) async fn get_job(pool: &SqlitePool, job_id: i64) -> Result<Option<JobRow>> {
+    let row = sqlx::query(
+        "SELECT id, src_site_id, dst_site_id, src, dst, dst_name, expanded, move_source \
+         FROM transfer_jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(job_row))
 }
 
 /// A job's settled state and source path (move-semantics cleanup).
@@ -551,10 +678,10 @@ async fn finalize_history(pool: &SqlitePool, job_id: i64) -> Result<()> {
     if stamped > 0 {
         sqlx::query(
             "INSERT INTO transfer_history \
-               (job_id, src_site, dst_site, src, dst, outcome, files, bytes, duration_ms, error) \
+               (job_id, src_site, dst_site, src, dst, outcome, files, files_failed, bytes, \
+                duration_ms, error) \
              SELECT j.id, COALESCE(ss.name, '?'), COALESCE(ds.name, '?'), j.src, j.dst, j.state, \
-               (SELECT COUNT(*) FROM transfer_tasks WHERE job_id = j.id AND state = 'done'), \
-               COALESCE((SELECT SUM(byte_offset) FROM transfer_tasks WHERE job_id = j.id), 0), \
+               j.files_done, j.files_failed, j.bytes_done, \
                CAST((julianday(j.finished_at) - julianday(COALESCE(j.started_at, j.created_at))) \
                     * 86400000 AS INTEGER), \
                j.error \
@@ -620,15 +747,15 @@ pub(crate) async fn pause_all_jobs(pool: &SqlitePool) -> Result<Vec<i64>> {
 /// Resume every paused job; returns the affected ids.
 pub(crate) async fn resume_all_jobs(pool: &SqlitePool) -> Result<Vec<i64>> {
     let mut tx = pool.begin().await?;
-    let rows = sqlx::query(
-        "UPDATE transfer_jobs SET state = 'queued' WHERE state = 'paused' RETURNING id",
-    )
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE transfer_jobs SET state = {RESUMED_STATE} WHERE state = 'paused' RETURNING id"
+    )))
     .fetch_all(&mut *tx)
     .await?;
     sqlx::query(
         "UPDATE transfer_tasks SET state = 'queued', updated_at = datetime('now') \
          WHERE state = 'paused' AND job_id IN \
-           (SELECT id FROM transfer_jobs WHERE state = 'queued')",
+           (SELECT id FROM transfer_jobs WHERE state IN ('queued', 'active'))",
     )
     .execute(&mut *tx)
     .await?;
@@ -697,8 +824,8 @@ pub(crate) async fn job_conflicts(
 /// The audit trail, newest first.
 pub(crate) async fn history(pool: &SqlitePool, limit: i64) -> Result<Vec<HistoryEntry>> {
     let rows = sqlx::query(
-        "SELECT src_site, dst_site, src, dst, outcome, files, bytes, duration_ms, error, \
-           finished_at \
+        "SELECT src_site, dst_site, src, dst, outcome, files, files_failed, bytes, duration_ms, \
+           error, finished_at \
          FROM transfer_history ORDER BY id DESC LIMIT ?",
     )
     .bind(limit)
@@ -713,6 +840,7 @@ pub(crate) async fn history(pool: &SqlitePool, limit: i64) -> Result<Vec<History
             dst: row.get("dst"),
             outcome: row.get("outcome"),
             files: row.get("files"),
+            files_failed: row.get("files_failed"),
             bytes: row.get::<i64, _>("bytes") as u64,
             duration_ms: row.get("duration_ms"),
             error: row.get("error"),
@@ -721,24 +849,23 @@ pub(crate) async fn history(pool: &SqlitePool, limit: i64) -> Result<Vec<History
         .collect())
 }
 
-/// Everything the UI shows, in one aggregate query (newest job first).
-/// `bps` is filled in by the engine.
+/// Everything the UI shows, newest job first: every unfinished job plus the
+/// newest 500 overall. Counters come from the job row (trigger-maintained),
+/// so this never touches the task table. `bps` and live bytes are filled in
+/// by the engine.
 pub(crate) async fn snapshot_jobs(pool: &SqlitePool) -> Result<Vec<JobSnapshot>> {
     let rows = sqlx::query(
         "SELECT j.id, j.src_site_id, j.dst_site_id, j.src, j.dst, j.state, j.error, \
            j.priority, j.move_source, \
            COALESCE(ss.name, 'Local') AS src_site, COALESCE(ds.name, 'Local') AS dst_site, \
-           COUNT(t.id) AS files_total, \
-           COALESCE(SUM(CASE WHEN t.state = 'done' THEN 1 ELSE 0 END), 0) AS files_done, \
-           COALESCE(SUM(CASE WHEN t.state = 'skipped' THEN 1 ELSE 0 END), 0) AS files_skipped, \
-           COALESCE(SUM(CASE WHEN t.state = 'conflict' THEN 1 ELSE 0 END), 0) AS files_conflict, \
-           COALESCE(SUM(CASE WHEN t.state != 'skipped' THEN COALESCE(t.total_bytes, 0) ELSE 0 END), 0) AS bytes_total, \
-           COALESCE(SUM(t.byte_offset), 0) AS bytes_done \
+           j.files_total, j.files_done, j.files_skipped, j.files_conflict, j.files_failed, \
+           j.bytes_total, j.bytes_done \
          FROM transfer_jobs j \
-         LEFT JOIN transfer_tasks t ON t.job_id = j.id \
          LEFT JOIN sites ss ON ss.id = j.src_site_id \
          LEFT JOIN sites ds ON ds.id = j.dst_site_id \
-         GROUP BY j.id ORDER BY j.id DESC LIMIT 500",
+         WHERE j.state IN ('queued', 'active', 'paused') \
+            OR j.id IN (SELECT id FROM transfer_jobs ORDER BY id DESC LIMIT 500) \
+         ORDER BY j.id DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -759,6 +886,7 @@ pub(crate) async fn snapshot_jobs(pool: &SqlitePool) -> Result<Vec<JobSnapshot>>
             files_done: row.get::<i64, _>("files_done") as u64,
             files_skipped: row.get::<i64, _>("files_skipped") as u64,
             files_conflict: row.get::<i64, _>("files_conflict") as u64,
+            files_failed: row.get::<i64, _>("files_failed") as u64,
             bytes_total: row.get::<i64, _>("bytes_total") as u64,
             bytes_done: row.get::<i64, _>("bytes_done") as u64,
             bps: 0,
@@ -786,6 +914,125 @@ pub(crate) async fn task_states(pool: &SqlitePool, job_id: i64) -> Result<HashMa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-memory DB with one prepared (expanded, active) job holding one task.
+    async fn prepared_job() -> (SqlitePool, i64) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let job = super::super::NewJob {
+            src_site_id: 0,
+            dst_site_id: 0,
+            src: "source/file".into(),
+            dst_dir: "target/".into(),
+            dst_name: None,
+            conflict_policy: ConflictPolicy::Overwrite,
+            move_source: false,
+        };
+        let id = enqueue_job(&pool, &job).await.unwrap();
+        insert_tasks(
+            &pool,
+            id,
+            &[NewTask {
+                src: job.src,
+                dst: "target/file".into(),
+                total_bytes: Some(3),
+                src_etag: None,
+            }],
+        )
+        .await
+        .unwrap();
+        finish_expansion(&pool, id).await.unwrap();
+        (pool, id)
+    }
+
+    async fn job_state(pool: &SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT state FROM transfer_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_reactivates_a_prepared_job_and_its_settling_workers() {
+        let (pool, id) = prepared_job().await;
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        pause_job(&pool, id).await.unwrap();
+        // Resumed before the worker reported its pause.
+        resume_job(&pool, id).await.unwrap();
+        assert_eq!(job_state(&pool, id).await, "active");
+        task_paused(&pool, task.id).await.unwrap();
+        assert!(claim_task(&pool, &[id]).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn recovery_requeues_tasks_paused_by_shutdown_but_not_by_the_user() {
+        let (pool, running) = prepared_job().await;
+        let task = claim_task(&pool, &[running]).await.unwrap().unwrap();
+        // Shutdown pauses the worker but leaves the job active.
+        task_paused(&pool, task.id).await.unwrap();
+        // A task stranded as `paused` under a running job (crash mid-flush).
+        set_task_state(&pool, task.id, "paused").await.unwrap();
+
+        let user_job = enqueue_job(
+            &pool,
+            &super::super::NewJob {
+                src_site_id: 0,
+                dst_site_id: 0,
+                src: "source/other".into(),
+                dst_dir: "target/".into(),
+                dst_name: None,
+                conflict_policy: ConflictPolicy::Overwrite,
+                move_source: false,
+            },
+        )
+        .await
+        .unwrap();
+        insert_tasks(
+            &pool,
+            user_job,
+            &[NewTask {
+                src: "source/other".into(),
+                dst: "target/other".into(),
+                total_bytes: Some(1),
+                src_etag: None,
+            }],
+        )
+        .await
+        .unwrap();
+        finish_expansion(&pool, user_job).await.unwrap();
+        let user_task = claim_task(&pool, &[user_job]).await.unwrap().unwrap();
+        pause_job(&pool, user_job).await.unwrap();
+        task_paused(&pool, user_task.id).await.unwrap();
+
+        crate::db::requeue_interrupted(&pool).await.unwrap();
+        let states = task_states(&pool, running).await.unwrap();
+        assert_eq!(states.get("queued"), Some(&1));
+        let states = task_states(&pool, user_job).await.unwrap();
+        assert_eq!(states.get("paused"), Some(&1));
+        assert_eq!(job_state(&pool, user_job).await, "paused");
+    }
+
+    #[tokio::test]
+    async fn only_transient_failures_retry_and_they_back_off() {
+        let (pool, id) = prepared_job().await;
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert!(!task_failed(&pool, task.id, "timed out", true, 3).await.unwrap());
+        // Waiting out the backoff: not claimable yet.
+        assert!(claim_task(&pool, &[id]).await.unwrap().is_none());
+        sqlx::query("UPDATE transfer_tasks SET not_before = datetime('now', '-1 second')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+
+        assert!(task_failed(&pool, task.id, "permission denied", false, 3).await.unwrap());
+        assert_eq!(task_states(&pool, id).await.unwrap().get("failed"), Some(&1));
+    }
 
     #[tokio::test]
     async fn late_conflicts_follow_the_latest_rule() {
