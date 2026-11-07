@@ -38,7 +38,9 @@ use crate::provider::{LayerConfig, SiteProfile};
 use crate::queue::{ConflictPolicy, JobState, NewJob, LOCAL_SITE_ID};
 use crate::i18n::{t, tf};
 use crate::ui::bookmarks::{BookmarkEvent, BookmarkManager};
+use crate::bookmarks::QUICK_CONNECT_SPACE;
 use crate::ui::command_bar::{CommandBar, CommandBarEvent, RunRequest};
+use crate::ui::connect::{open_host_key_dialog, QuickConnectEvent, QuickConnectForm};
 use crate::ui::file_pane::{DraggedEntries as DraggedRowEntries, FilePane, FsEntry, PaneEvent, PendingDragOut};
 use crate::ui::logs::LogsPanel;
 use crate::ui::transfers::{TransfersEvent, TransfersPanel};
@@ -66,9 +68,29 @@ actions!(
         SyncPanes,
         Help,
         CheckForUpdates,
+        QuickConnect,
+        SaveAsSite,
         Quit
     ]
 );
+
+/// Open the ssh host key trust dialog for `host:port`. After the user
+/// trusts the key, every pane showing that server reloads. Dispatch it when a
+/// connection fails with `errors::Class::HostKeyUnknown`.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace)]
+pub struct TrustHostKey {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Open the site editor for one saved site (or "Save as site" for a
+/// quick-connect site).
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace)]
+pub struct EditSite {
+    pub site_id: i64,
+}
 
 /// Switch to the nth space (1-based); `ctrl-1…9` by default.
 #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
@@ -289,6 +311,13 @@ pub struct KesselApp {
     space_active: HashMap<i64, u64>,
     /// Shared manager backing the "Bookmarks" dialog (list + editor).
     bookmarks: Entity<BookmarkManager>,
+    /// The quick-connect field of the empty workspace (first run, last tab
+    /// closed). The header button and command bar open their own copy in a
+    /// dialog.
+    quick_connect: Entity<QuickConnectForm>,
+    /// Set when the empty workspace appears; the next render focuses its
+    /// quick-connect field.
+    pending_quick_focus: bool,
     transfers: Entity<TransfersPanel>,
     /// The global log bottom pane (see `crate::logs`).
     logs: Entity<LogsPanel>,
@@ -348,6 +377,10 @@ impl KesselApp {
         cx.subscribe_in(&bookmarks, window, Self::on_bookmark_event)
             .detach();
 
+        let quick_connect = cx.new(|cx| QuickConnectForm::new(window, cx));
+        cx.subscribe_in(&quick_connect, window, Self::on_quick_connect_event)
+            .detach();
+
         let transfers = cx.new(TransfersPanel::new);
         // Re-render the status bar's transfer summary as snapshots arrive.
         cx.observe(&transfers, |_, _, cx| cx.notify()).detach();
@@ -402,6 +435,8 @@ impl KesselApp {
             active_space: first_space,
             space_active: HashMap::new(),
             bookmarks,
+            quick_connect,
+            pending_quick_focus: false,
             transfers,
             logs,
             bottom_dock: None,
@@ -489,9 +524,33 @@ impl KesselApp {
         if let Some(first) = this.tabs.first() {
             this.active_space = first.space_id;
             this.active = first.uid;
+        } else {
+            this.pending_quick_focus = true;
         }
         cx.global_mut::<AppState>().active_space = this.active_space;
+        this.sweep_quick_sites(cx);
         this
+    }
+
+    /// Forget quick-connect sites from earlier runs that no tab or
+    /// unfinished transfer still uses.
+    fn sweep_quick_sites(&self, cx: &mut Context<Self>) {
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let task = state
+            .runtime
+            .spawn(async move { crate::ui::connect::sweep_quick_sites(&pool).await });
+        cx.spawn(async move |_, cx| match task.await {
+            Ok(Ok(removed)) if !removed.is_empty() => {
+                cx.update_global::<AppState, _>(|state, _| {
+                    state.sites.retain(|site| !removed.contains(&site.id));
+                });
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "sweeping quick-connect sites failed"),
+            Err(error) => tracing::warn!(%error, "quick-connect sweep task failed"),
+        })
+        .detach();
     }
 
     // --- tab/pane construction ---
@@ -612,6 +671,7 @@ impl KesselApp {
     /// the workspace renders its empty state — never a synthesized local tab.
     fn clear_active_tab(&mut self, space_id: i64, cx: &mut Context<Self>) {
         self.active = 0;
+        self.pending_quick_focus = true;
         self.active_space = space_id;
         cx.global_mut::<AppState>().active_space = space_id;
         cx.notify();
@@ -1278,6 +1338,7 @@ impl KesselApp {
                         }
                     }
                     RunRequest::Bookmark(site_id) => self.open_bookmark(site_id, window, cx),
+                    RunRequest::QuickConnect(url) => self.open_quick_connect(Some(url), window, cx),
                     RunRequest::Space(space_id) => self.switch_space(space_id, cx),
                 }
             }
@@ -1598,10 +1659,16 @@ impl KesselApp {
                         );
                         let tab = &mut self.tabs[ix];
                         tab.content = TabContent::Panes(workspace);
-                        tab.bookmark_id = (profile.id > 0).then_some(profile.id);
+                        // A one-off connection has no bookmark row to pin to.
+                        tab.bookmark_id = (profile.id > 0
+                            && profile.space_id != QUICK_CONNECT_SPACE)
+                            .then_some(profile.id);
                         let uid = tab.uid;
                         self.activate_tab(uid, cx);
                         self.persist_session(cx);
+                    }
+                    None if profile.space_id == QUICK_CONNECT_SPACE => {
+                        self.open_tab_with(profile, String::new(), None, window, cx);
                     }
                     None => self.open_bookmark(profile.id, window, cx),
                 }
@@ -1610,6 +1677,161 @@ impl KesselApp {
                 self.refresh_tags(cx);
                 cx.notify();
             }
+            BookmarkEvent::Promoted(site_id) => {
+                // The saved site joined the active space: its tabs there
+                // become its pinned bookmark tab, like a bookmark click.
+                let site_id = *site_id;
+                let space = self.active_space;
+                let mut pinned = false;
+                for tab in &mut self.tabs {
+                    let shows_site = matches!(&tab.content, TabContent::Panes(workspace)
+                        if workspace.panes[0].read(cx).site_id() == site_id);
+                    if !pinned && shows_site && tab.space_id == space && tab.bookmark_id.is_none() {
+                        tab.bookmark_id = Some(site_id);
+                        pinned = true;
+                    }
+                }
+                self.persist_session(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    // --- quick connect & host keys ---
+
+    fn on_quick_connect_event(
+        &mut self,
+        _: &Entity<QuickConnectForm>,
+        event: &QuickConnectEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let QuickConnectEvent::Connect(profile) = event;
+        self.open_tab_with(profile.clone(), String::new(), None, window, cx);
+    }
+
+    /// Quick connect from the header or command bar. The empty workspace
+    /// already shows the field, so it just takes focus; otherwise a small
+    /// dialog opens. `url` pre-fills it and connects right away.
+    fn open_quick_connect(&mut self, url: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab().is_none() {
+            let quick = self.quick_connect.clone();
+            quick.update(cx, |quick, cx| {
+                quick.focus(window, cx);
+                if let Some(url) = &url {
+                    quick.connect_to(url, window, cx);
+                }
+            });
+            return;
+        }
+        let quick = cx.new(|cx| QuickConnectForm::new(window, cx));
+        cx.subscribe_in(&quick, window, |this, _, event: &QuickConnectEvent, window, cx| {
+            window.close_dialog(cx);
+            this.on_quick_connect_event(&this.quick_connect.clone(), event, window, cx);
+        })
+        .detach();
+        let dialog_quick = quick.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(t("connect.quick.title"))
+                .w(px(560.))
+                .child(dialog_quick.clone())
+        });
+        quick.update(cx, |quick, cx| {
+            quick.focus(window, cx);
+            if let Some(url) = &url {
+                quick.connect_to(url, window, cx);
+            }
+        });
+    }
+
+    fn on_quick_connect(&mut self, _: &QuickConnect, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_quick_connect(None, window, cx);
+    }
+
+    fn on_trust_host_key(&mut self, action: &TrustHostKey, window: &mut Window, cx: &mut Context<Self>) {
+        let app = cx.entity().downgrade();
+        let (host, port) = (action.host.clone(), action.port);
+        let target = (host.clone(), port);
+        open_host_key_dialog(
+            host,
+            port,
+            std::rc::Rc::new(move |window, cx| {
+                app.update(cx, |this, cx| this.reload_server_panes(&target, window, cx))
+                    .ok();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Reload every pane connected to the sftp server at `host:port`.
+    fn reload_server_panes(&mut self, target: &(String, u16), window: &mut Window, cx: &mut Context<Self>) {
+        let panes: Vec<Entity<FilePane>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Panes(workspace) => Some(workspace.panes.clone()),
+                TabContent::Connect(_) => None,
+            })
+            .flatten()
+            .filter(|pane| {
+                let profile = pane.read(cx).profile();
+                profile.scheme == "sftp"
+                    && profile
+                        .options
+                        .get("endpoint")
+                        .and_then(|endpoint| crate::sftp::host_port(endpoint))
+                        .is_some_and(|found| &found == target)
+            })
+            .collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| pane.refresh(window, cx));
+        }
+    }
+
+    fn on_edit_site(&mut self, action: &EditSite, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_site(action.site_id, window, cx);
+    }
+
+    /// Site editor for `site_id`; a quick-connect site opens as "Save as
+    /// site" and joins the active space on save.
+    fn edit_site(&mut self, site_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let quick = cx
+            .global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.id == site_id && site.space_id == QUICK_CONNECT_SPACE);
+        self.bookmarks.update(cx, |manager, cx| {
+            if quick {
+                manager.open_promote(site_id, window, cx);
+            } else {
+                manager.open_edit(site_id, window, cx);
+            }
+        });
+        let manager = self.bookmarks.clone();
+        let title = if quick { t("connect.save_as_site") } else { "Bookmarks".into() };
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title.clone()).w(px(560.)).child(manager.clone())
+        });
+    }
+
+    /// The quick-connect site shown in the active tab's focused pane.
+    fn active_quick_site(&self, cx: &App) -> Option<i64> {
+        let Some(Tab { content: TabContent::Panes(workspace), .. }) = self.active_tab() else {
+            return None;
+        };
+        let site_id = workspace.panes[workspace.active].read(cx).site_id();
+        cx.global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.id == site_id && site.space_id == QUICK_CONNECT_SPACE)
+            .then_some(site_id)
+    }
+
+    fn on_save_as_site(&mut self, _: &SaveAsSite, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(site_id) = self.active_quick_site(cx) {
+            self.edit_site(site_id, window, cx);
         }
     }
 
@@ -2431,6 +2653,29 @@ impl KesselApp {
                 );
             }
         }
+        if self.active_quick_site(cx).is_some() {
+            right = right.child(
+                Button::new("save-as-site")
+                    .label(t("connect.save_as_site"))
+                    .icon(Icon::new(IconName::Plus))
+                    .ghost()
+                    .small()
+                    .tooltip(t("connect.save_as_site_tooltip"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_save_as_site(&SaveAsSite, window, cx);
+                    })),
+            );
+        }
+        right = right.child(
+            Button::new("quick-connect")
+                .icon(Icon::default().path("icons/zap.svg"))
+                .ghost()
+                .small()
+                .tooltip(t("connect.quick.title"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_quick_connect(None, window, cx);
+                })),
+        );
         if sidebar_right {
             right = right.child(toggle);
         } else {
@@ -3433,29 +3678,96 @@ impl KesselApp {
             .on_click(cx.listener(move |this, _, _, cx| this.set_layout(layout, cx)))
     }
 
+    /// The empty workspace: quick connect first, then the saved sites, a
+    /// full site setup, and the local disk.
+    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let has_sites = cx
+            .global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.space_id == self.active_space);
+        let local_label = if cfg!(target_os = "macos") {
+            t("connect.empty.browse_mac")
+        } else {
+            t("connect.empty.browse_computer")
+        };
+        v_flex()
+            .id("empty-workspace")
+            .size_full()
+            .overflow_y_scroll()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(520.))
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_semibold()
+                                    .child(t("connect.empty.title")),
+                            )
+                            .child(div().text_sm().text_color(muted).child(t("connect.empty.body"))),
+                    )
+                    .child(self.quick_connect.clone())
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .when(has_sites, |row| {
+                                row.child(
+                                    Button::new("empty-saved-site")
+                                        .label(t("connect.empty.saved_site"))
+                                        .icon(Icon::default().path("icons/server.svg"))
+                                        .ghost()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_bookmarks_dialog(None, window, cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("empty-new-site")
+                                    .label(t("connect.empty.new_site"))
+                                    .icon(Icon::new(IconName::Plus))
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.push_connection_tab(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("empty-local")
+                                    .label(local_label)
+                                    .icon(Icon::default().path("icons/hard-drive.svg"))
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_tab_with(
+                                            local_profile(),
+                                            home_path(),
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // No tab selected (fresh space, last tab closed): an inviting blank,
-        // never a synthesized local browser.
+        // No tab selected (first run, fresh space, last tab closed): lead
+        // with the main task, connecting, never a synthesized local browser.
         let Some(tab) = self.active_tab() else {
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_color(cx.theme().muted_foreground)
-                .child(Icon::new(IconName::Globe))
-                .child(div().text_sm().child("No open tabs in this space."))
-                .child(
-                    Button::new("empty-new-tab")
-                        .label("New tab")
-                        .icon(Icon::new(IconName::Plus))
-                        .outline()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.push_connection_tab(window, cx);
-                        })),
-                )
-                .into_any_element();
+            return self.render_empty_workspace(cx);
         };
         match &tab.content {
             // Centered column that scrolls inside the pane, so a tall form
@@ -3591,6 +3903,12 @@ impl Render for KesselApp {
                 }
             }
         }
+        // The empty workspace leads with quick connect: its field takes the
+        // keyboard when it appears.
+        if self.active_tab().is_none() && std::mem::take(&mut self.pending_quick_focus) {
+            let focus = self.quick_connect.focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         // Keyboard shortcuts must work everywhere: when nothing holds focus
         // (empty space, freshly closed dialog), park it on the workspace so
         // Workspace-context bindings (quit, tabs, panels) keep firing.
@@ -3716,6 +4034,10 @@ impl Render for KesselApp {
             .on_action(cx.listener(Self::on_sync_panes))
             .on_action(cx.listener(Self::on_help))
             .on_action(cx.listener(Self::on_check_for_updates))
+            .on_action(cx.listener(Self::on_quick_connect))
+            .on_action(cx.listener(Self::on_trust_host_key))
+            .on_action(cx.listener(Self::on_edit_site))
+            .on_action(cx.listener(Self::on_save_as_site))
             .on_action(cx.listener(Self::on_quit))
             .child(
                 v_flex()
