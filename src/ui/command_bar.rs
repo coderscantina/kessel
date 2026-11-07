@@ -249,9 +249,9 @@ impl CommandBar {
         let is_selected = position == self.selected;
         h_flex()
             .id(("cmd-row", position))
+            .h(px(ROW_HEIGHT))
             .gap_2()
             .px_2()
-            .py_1()
             .rounded_md()
             .cursor_pointer()
             .text_sm()
@@ -287,6 +287,11 @@ impl CommandBar {
     }
 }
 
+/// Row height of the result list. The list gets an explicit height from it:
+/// a uniform list inside an auto-height popover collapses to zero otherwise.
+const ROW_HEIGHT: f32 = 28.;
+const VISIBLE_ROWS: usize = 12;
+
 impl Render for CommandBar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.filtered.len();
@@ -319,8 +324,7 @@ impl Render for CommandBar {
                         }),
                     )
                     .track_scroll(&self.scroll_handle)
-                    .flex_1()
-                    .min_h_0(),
+                    .h(px(ROW_HEIGHT * row_count.min(VISIBLE_ROWS) as f32)),
                 )
             })
             .when(row_count == 0, |el| {
