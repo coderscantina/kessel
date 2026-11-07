@@ -1821,6 +1821,7 @@ mod tests {
                 dst_label: format!("{}/", browse(&dst)),
                 files: vec![pair("a.txt", 1), pair("sub/b.txt", 2)],
                 conflict_policy: ConflictPolicy::Overwrite,
+                move_source: false,
             }))
             .unwrap();
         let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();

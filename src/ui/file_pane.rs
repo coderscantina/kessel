@@ -4295,21 +4295,21 @@ impl Submission {
     }
 }
 
-/// Group plain-file copies that share sites, destination folder and conflict
-/// policy into one batch job each. Folders (recursive), moves (a batch can't
-/// delete its sources) and renamed copies stay separate jobs, and so does a
+/// Group plain-file copies or moves that share sites, destination folder,
+/// conflict policy and move mode into one batch job each. Folders
+/// (recursive) and renamed copies stay separate jobs, and so does a
 /// lone file. Order of first appearance is kept.
 fn plan_submissions(jobs: Vec<NewJob>) -> Vec<Submission> {
-    type Key = (i64, i64, String, ConflictPolicy);
+    type Key = (i64, i64, String, ConflictPolicy, bool);
     let mut plan: Vec<Result<NewJob, Key>> = Vec::new();
     let mut groups: Vec<(Key, Vec<NewJob>)> = Vec::new();
     for job in jobs {
-        let batchable = !job.src.ends_with('/') && !job.move_source && job.dst_name.is_none();
+        let batchable = !job.src.ends_with('/') && job.dst_name.is_none();
         if !batchable {
             plan.push(Ok(job));
             continue;
         }
-        let key = (job.src_site_id, job.dst_site_id, job.dst_dir.clone(), job.conflict_policy);
+        let key = (job.src_site_id, job.dst_site_id, job.dst_dir.clone(), job.conflict_policy, job.move_source);
         match groups.iter_mut().find(|(known, _)| *known == key) {
             Some((_, members)) => members.push(job),
             None => {
@@ -4346,6 +4346,7 @@ fn batch_of(members: Vec<NewJob>) -> NewBatch {
         src_label: label(parent_of(&first.src)),
         dst_label: label(first.dst_dir.clone()),
         conflict_policy: first.conflict_policy,
+        move_source: first.move_source,
         files: members
             .iter()
             .map(|job| BatchFile {
@@ -4475,6 +4476,7 @@ mod tests {
             job("a/tree/", false),
             job("a/two.txt", false),
             job("a/moved.txt", true),
+            job("a/moved2.txt", true),
         ]);
         assert_eq!(plan.len(), 3);
         let Submission::Batch(batch) = &plan[0] else { panic!("files first, as a batch") };
@@ -4482,7 +4484,7 @@ mod tests {
         assert_eq!(batch.files[1].dst, "out/two.txt");
         assert_eq!(batch.src_label, "a/");
         assert!(matches!(&plan[1], Submission::Job(j) if j.src == "a/tree/"));
-        assert!(matches!(&plan[2], Submission::Job(j) if j.move_source));
+        assert!(matches!(&plan[2], Submission::Batch(b) if b.move_source && b.files.len() == 2));
         // A lone file stays a plain job.
         assert!(matches!(plan_submissions(vec![job("x.txt", false)])[0], Submission::Job(_)));
     }

@@ -50,6 +50,8 @@ pub struct NewBatch {
     pub dst_label: String,
     pub files: Vec<BatchFile>,
     pub conflict_policy: ConflictPolicy,
+    /// Delete each source file once it arrived intact.
+    pub move_source: bool,
 }
 
 /// One file of a [`NewBatch`], as full browse paths on each site.

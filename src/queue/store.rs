@@ -110,14 +110,15 @@ pub(crate) async fn enqueue_batch(pool: &SqlitePool, batch: &NewBatch) -> Result
 
     let mut tx = pool.begin().await?;
     let id = sqlx::query(
-        "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, conflict_policy, expanded) \
-         VALUES (?, ?, ?, ?, ?, 1)",
+        "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, conflict_policy, move_source, expanded) \
+         VALUES (?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(batch.src_site_id)
     .bind(batch.dst_site_id)
     .bind(&batch.src_label)
     .bind(&batch.dst_label)
     .bind(batch.conflict_policy.as_str())
+    .bind(batch.move_source)
     .execute(&mut *tx)
     .await?
     .last_insert_rowid();

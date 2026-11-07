@@ -295,6 +295,7 @@ pub async fn run(
             dst_label,
             files: work.copies,
             conflict_policy: ConflictPolicy::Overwrite,
+            move_source: false,
         };
         let settled = match queue.submit_batch(batch).await {
             Ok(job_id) => queue.settled(job_id).await,
