@@ -2940,6 +2940,30 @@ impl FilePane {
             }))
     }
 
+    /// "Review server key" when an sftp failure is an untrusted host key.
+    fn trust_action(&self, human: &Humanized) -> Option<Button> {
+        if human.class != crate::errors::Class::HostKeyUnknown || self.profile.scheme != "sftp" {
+            return None;
+        }
+        let (host, port) = self
+            .profile
+            .options
+            .get("endpoint")
+            .and_then(|endpoint| crate::sftp::host_port(endpoint))?;
+        Some(
+            Button::new("trust-host-key")
+                .label(t("connect.trust.review"))
+                .small()
+                .outline()
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::app::TrustHostKey { host: host.clone(), port }),
+                        cx,
+                    )
+                }),
+        )
+    }
+
     /// The centered state over the file list: connecting, a failed connect
     /// or listing, a slow first load, an empty folder, or a filter with no
     /// matches. `None` while rows tell the story themselves.
@@ -2964,6 +2988,7 @@ impl FilePane {
                     .small()
                     .primary()
                     .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))];
+                actions.extend(self.trust_action(human));
                 if self.profile.id != crate::queue::LOCAL_SITE_ID {
                     let site_id = self.profile.id;
                     actions.push(
@@ -2998,6 +3023,8 @@ impl FilePane {
                     .disabled(self.path.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
             ];
+            let mut actions = actions;
+            actions.extend(self.trust_action(human));
             let icon = Icon::new(IconName::TriangleAlert)
                 .text_color(cx.theme().danger)
                 .into_any_element();

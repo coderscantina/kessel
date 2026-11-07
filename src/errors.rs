@@ -14,6 +14,7 @@ pub struct Humanized {
     pub hint: Option<String>,
     /// The full `{error:#}` chain, for a details disclosure or the log.
     pub details: String,
+    pub class: Class,
 }
 
 /// What kind of failure an error is, independent of backend.
@@ -113,7 +114,8 @@ pub fn classify(error: &anyhow::Error) -> Class {
 /// Turn an error into wording for the UI.
 pub fn humanize(error: &anyhow::Error) -> Humanized {
     let details = format!("{error:#}");
-    let (title, hint) = match classify(error) {
+    let class = classify(error);
+    let (title, hint) = match class {
         Class::NotFound => ("The file or folder no longer exists.", Some("Refresh to see the current contents.")),
         Class::PermissionDenied => ("You don't have permission to do that here.", Some("Check the account's access rights on the server.")),
         Class::AuthFailed => ("The server rejected the login.", Some("Check the user name, password or key in the site settings.")),
@@ -130,13 +132,14 @@ pub fn humanize(error: &anyhow::Error) -> Humanized {
             // Unknown errors keep their own top-level message: it beats a
             // generic sentence.
             let top = error.to_string();
-            return Humanized { title: top, hint: None, details };
+            return Humanized { title: top, hint: None, details, class };
         }
     };
     Humanized {
         title: title.to_string(),
         hint: hint.map(str::to_string),
         details,
+        class,
     }
 }
 

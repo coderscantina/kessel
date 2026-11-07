@@ -12,6 +12,7 @@ use gpui_component::{h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable a
 
 use crate::app::AppState;
 use crate::i18n::{t, tf};
+use crate::bookmarks::{parse_quick_url, QUICK_CONNECT_SPACE};
 use crate::queue::LOCAL_SITE_ID;
 use crate::ui::{bookmark_color, bookmark_icon};
 
@@ -24,6 +25,8 @@ pub enum RunRequest {
     Bookmark(i64),
     /// Switch to a space.
     Space(i64),
+    /// Quick connect to a URL typed into the bar.
+    QuickConnect(String),
 }
 
 pub enum CommandBarEvent {
@@ -42,6 +45,7 @@ struct Entry {
 /// (i18n label key, action name) for every palette command. The action is
 /// dispatched through the focused view, exactly like its keyboard shortcut.
 const COMMANDS: &[(&str, &str)] = &[
+    ("cmdbar.command.quick_connect", "workspace::QuickConnect"),
     ("cmdbar.command.new_tab", "workspace::NewTab"),
     ("cmdbar.command.close_tab", "workspace::CloseTab"),
     ("cmdbar.command.next_tab", "workspace::NextTab"),
@@ -60,6 +64,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "workspace::FocusOtherPane",
     ),
     ("cmdbar.command.bookmarks", "workspace::OpenBookmarks"),
+    ("cmdbar.command.save_as_site", "workspace::SaveAsSite"),
     ("cmdbar.command.preferences", "workspace::OpenPreferences"),
     (
         "cmdbar.command.theme_browser",
@@ -86,6 +91,9 @@ const COMMANDS: &[(&str, &str)] = &[
 pub struct CommandBar {
     input: Entity<InputState>,
     entries: Vec<Entry>,
+    /// Entries built at open; anything past this index is the dynamic
+    /// "Connect to <url>" entry for a query that parses as a URL.
+    base_len: usize,
     /// Indices into `entries`, filtered + ranked by the current query.
     filtered: Vec<usize>,
     selected: usize,
@@ -129,7 +137,7 @@ impl CommandBar {
         }
         let state = cx.global::<AppState>();
         for site in &state.sites {
-            if site.id == LOCAL_SITE_ID {
+            if site.id == LOCAL_SITE_ID || site.space_id == QUICK_CONNECT_SPACE {
                 continue;
             }
             let mut icon = Icon::new(bookmark_icon(site.icon.as_deref(), IconName::Globe));
@@ -159,6 +167,7 @@ impl CommandBar {
         let filtered = (0..entries.len()).collect();
         Self {
             input,
+            base_len: entries.len(),
             entries,
             filtered,
             selected: 0,
@@ -167,7 +176,9 @@ impl CommandBar {
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).value().trim().to_lowercase();
+        let raw = self.input.read(cx).value().trim().to_string();
+        self.entries.truncate(self.base_len);
+        let query = raw.to_lowercase();
         if query.is_empty() {
             self.filtered = (0..self.entries.len()).collect();
         } else {
@@ -181,6 +192,16 @@ impl CommandBar {
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             self.filtered = scored.into_iter().map(|(_, ix)| ix).collect();
+        }
+        // A query that parses as a quick-connect URL ranks first.
+        if let Ok(target) = parse_quick_url(&raw) {
+            self.entries.push(Entry {
+                label: tf("cmdbar.connect_url", &[("url", &target.name)]),
+                keystroke: None,
+                icon: Icon::default().path("icons/zap.svg"),
+                run: RunRequest::QuickConnect(raw),
+            });
+            self.filtered.insert(0, self.entries.len() - 1);
         }
         self.selected = 0;
         self.scroll_handle
