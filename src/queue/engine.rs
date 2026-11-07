@@ -1068,6 +1068,7 @@ mod tests {
             verify: true,
             preserve_timestamps: true,
             skip_hidden: false,
+            default_conflict_policy: Default::default(),
         };
         tweak(&mut cfg);
         let handle = start(&rt, pool.clone(), cfg, LayerConfig::default());

@@ -69,6 +69,10 @@
     // Leave hidden files (dotfiles) out when a directory is expanded into
     // per-file transfer tasks.
     skip_hidden: false,
+    // What a transfer started from a file pane does when the destination file
+    // already exists: "ask" (park it and ask), "replace", "skip", "keep_both"
+    // (write under a unique name) or "replace_if_newer".
+    default_conflict_policy: "ask",
   },
 
   // Default OpenDAL layer stack applied to every site unless the site

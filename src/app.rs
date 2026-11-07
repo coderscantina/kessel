@@ -43,7 +43,7 @@ use crate::ui::command_bar::{CommandBar, CommandBarEvent, RunRequest};
 use crate::ui::connect::{open_host_key_dialog, QuickConnectEvent, QuickConnectForm};
 use crate::ui::file_pane::{DraggedEntries as DraggedRowEntries, FilePane, FsEntry, PaneEvent, PendingDragOut};
 use crate::ui::logs::LogsPanel;
-use crate::ui::transfers::{TransfersEvent, TransfersPanel};
+use crate::ui::transfers::{TransfersEvent, TransfersPanel, TransfersRequest};
 use crate::ui::{bookmark_color, bookmark_icon};
 
 actions!(
@@ -385,6 +385,8 @@ impl KesselApp {
         // Re-render the status bar's transfer summary as snapshots arrive.
         cx.observe(&transfers, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&transfers, window, Self::on_transfers_event)
+            .detach();
+        cx.subscribe_in(&transfers, window, Self::on_transfers_request)
             .detach();
 
         let logs = cx.new(LogsPanel::new);
@@ -1613,6 +1615,60 @@ impl KesselApp {
         }
     }
 
+    fn on_transfers_request(
+        &mut self,
+        _: &Entity<TransfersPanel>,
+        request: &TransfersRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            TransfersRequest::ConflictParked { job_id } => {
+                self.bottom_dock = Some(BottomPanel::Transfers);
+                let job_id = *job_id;
+                self.transfers
+                    .update(cx, |panel, cx| panel.prompt_conflicts(job_id, window, cx));
+                cx.notify();
+            }
+            TransfersRequest::ShowInPane { site_id, dir } => {
+                self.show_in_pane(*site_id, dir.clone(), window, cx);
+            }
+        }
+    }
+
+    /// Point a pane on `site_id` at `dir`: the active tab's pane if it shows
+    /// that site, then any other tab's, else a new tab.
+    fn show_in_pane(&mut self, site_id: i64, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let known = site_id == LOCAL_SITE_ID
+            || cx.global::<AppState>().sites.iter().any(|site| site.id == site_id);
+        if !known {
+            return;
+        }
+        let mut tabs: Vec<&Tab> = self.tabs.iter().collect();
+        tabs.sort_by_key(|tab| tab.uid != self.active);
+        let found = tabs.into_iter().find_map(|tab| {
+            let TabContent::Panes(workspace) = &tab.content else {
+                return None;
+            };
+            workspace
+                .panes
+                .iter()
+                .find(|pane| pane.read(cx).site_id() == site_id)
+                .map(|pane| (tab.uid, pane.clone()))
+        });
+        match found {
+            Some((uid, pane)) => {
+                self.activate_tab(uid, cx);
+                pane.update(cx, |pane, cx| pane.navigate_to(dir, window, cx));
+            }
+            None => {
+                let profile = self.profile_for(Some(site_id), cx);
+                self.open_tab_with(profile, dir, None, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn on_transfers_event(
         &mut self,
         _: &Entity<TransfersPanel>,
@@ -1874,22 +1930,22 @@ impl KesselApp {
         let src_site_id = src_pane.read(cx).site_id();
         let dst_site_id = dst_pane.read(cx).site_id();
         let dst_dir = dst_pane.read(cx).current_dir();
-        let count = entries.len();
-        let queue = cx.global::<AppState>().queue.clone();
-        for entry in entries {
-            queue.enqueue(NewJob {
+        let conflict_policy = crate::ui::file_pane::default_conflict_policy(cx);
+        let jobs = entries
+            .into_iter()
+            .map(|entry| NewJob {
                 src_site_id,
                 dst_site_id,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                // Existing files park as conflicts; the Transfers panel prompts.
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source,
-            });
-        }
-        let verb = if move_source { "move" } else { "item" };
-        window.push_notification(format!("Queued {count} {verb}(s)."), cx);
+            })
+            .collect();
+        src_pane
+            .clone()
+            .update(cx, |pane, cx| pane.submit_jobs(jobs, window, cx));
         // Surface the queue right where the work was kicked off.
         self.bottom_dock = Some(BottomPanel::Transfers);
         cx.notify();

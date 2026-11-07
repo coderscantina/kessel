@@ -399,6 +399,7 @@ mod tests {
             verify: true,
             preserve_timestamps: true,
             skip_hidden: false,
+            default_conflict_policy: Default::default(),
         };
         let queue = crate::queue::start(&rt, pool, cfg, Default::default());
         let local = crate::provider::SiteProfile {
