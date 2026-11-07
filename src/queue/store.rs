@@ -115,7 +115,10 @@ pub(crate) async fn enqueue_batch(pool: &SqlitePool, batch: &NewBatch) -> Result
     )
     .bind(batch.src_site_id)
     .bind(batch.dst_site_id)
-    .bind(&batch.src_label)
+    // A source ending in "/" marks a folder job, whose emptied tree a move
+    // sweeps once done. A batch label names the files' common parent, which
+    // must never be swept, so it is stored without the slash.
+    .bind(batch.src_label.trim_end_matches('/'))
     .bind(&batch.dst_label)
     .bind(batch.conflict_policy.as_str())
     .bind(batch.move_source)

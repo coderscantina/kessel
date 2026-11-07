@@ -1834,6 +1834,45 @@ mod tests {
     }
 
     #[test]
+    fn batch_move_leaves_the_source_folder_alone() {
+        use crate::queue::{BatchFile, NewBatch};
+
+        let env = test_env("batch-move");
+        let src = env.dir.join("inbox");
+        let dst = env.dir.join("dst");
+        std::fs::create_dir_all(src.join("empty")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("b.txt"), b"b").unwrap();
+        let pair = |name: &str| BatchFile {
+            src: browse(&src.join(name)),
+            dst: browse(&dst.join(name)),
+            size: Some(1),
+        };
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit_batch(NewBatch {
+                src_site_id: 0,
+                dst_site_id: 0,
+                src_label: format!("{}/", browse(&src)),
+                dst_label: format!("{}/", browse(&dst)),
+                files: vec![pair("a.txt"), pair("b.txt")],
+                conflict_policy: ConflictPolicy::Overwrite,
+                move_source: true,
+            }))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert_eq!(std::fs::read(dst.join("b.txt")).unwrap(), b"b");
+        assert!(!src.join("a.txt").exists() && !src.join("b.txt").exists());
+        // The folder sweep runs detached after settling; give it time to
+        // (wrongly) act before checking it didn't.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(src.join("empty").is_dir(), "an unselected empty folder was deleted");
+    }
+
+    #[test]
     fn cancel_settles_only_after_workers_and_cleanup() {
         let (env, src_dir, dst_dir, _) = slow_env("cancel-settles");
         std::fs::write(dst_dir.join("big.bin"), b"OLD").unwrap();
