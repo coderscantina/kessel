@@ -1922,7 +1922,7 @@ impl KesselApp {
             return;
         };
         if workspace.layout == PaneLayout::Single {
-            window.push_notification("Switch to split view to copy between panes.", cx);
+            window.push_notification(t("app.split_needed"), cx);
             return;
         }
         let src_pane = &workspace.panes[src_ix];

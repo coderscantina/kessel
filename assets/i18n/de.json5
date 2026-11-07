@@ -373,6 +373,8 @@
   "transfers.conflict.note_title": "Eine Übertragung braucht deine Entscheidung",
   "transfers.conflict.note": "Einige Dateien aus „{name}“ existieren am Ziel bereits.",
   "transfers.conflict.resolve": "Lösen",
+  "app.split_needed": "Wechsle zur geteilten Ansicht, um zwischen den Bereichen zu kopieren.",
+  "file_pane.start_failed.many": "{count} Übertragungen konnten nicht gestartet werden. {reason}",
   "transfers.start_failed": "Übertragung konnte nicht gestartet werden",
   "file_pane.open_many.title": "{count} Objekte öffnen?",
   "file_pane.open_many.body": "Jede Datei öffnet sich in ihrer Standard-App, jeder Ordner in einem neuen Tab.",
