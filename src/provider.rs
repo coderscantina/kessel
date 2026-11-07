@@ -94,7 +94,6 @@ pub struct SiteProfile {
 pub struct Capabilities {
     pub rename: bool,
     pub copy: bool,
-    pub recursive_delete: bool,
     pub presign: bool,
     pub write_can_append: bool,
     /// S3-style backends have no real directories; paths are prefixes.
@@ -298,11 +297,13 @@ impl Provider {
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let (op, from_rel) = self.op_for(from)?;
         let (_, to_rel) = self.op_for(to)?;
-        // A case-only rename stats the source itself on case-insensitive
-        // filesystems, so it skips the existence check.
-        if from_rel.to_lowercase() != to_rel.to_lowercase() {
-            match op.stat(&to_rel).await {
-                Ok(_) => {
+        match op.stat(&to_rel).await {
+            Ok(_) => {
+                // On a case-insensitive filesystem a case-only rename stats
+                // the source itself. Only then may it go ahead: the parent
+                // listing holds the source's spelling but not the new one.
+                let case_only = from_rel.to_lowercase() == to_rel.to_lowercase();
+                if !(case_only && !self.has_exact_sibling(&op, &to_rel).await?) {
                     let name = to_rel.trim_end_matches('/').rsplit('/').next().unwrap_or(&to_rel);
                     return Err(opendal::Error::new(
                         opendal::ErrorKind::AlreadyExists,
@@ -310,9 +311,9 @@ impl Provider {
                     )
                     .into());
                 }
-                Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
             }
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         if self.caps.rename {
             op.rename(&from_rel, &to_rel).await?;
@@ -327,6 +328,21 @@ impl Provider {
             anyhow::bail!("this backend supports neither rename nor copy");
         }
         Ok(())
+    }
+
+    /// Whether the parent listing of `rel` has an entry spelled exactly like
+    /// it, telling a real second file from a case-insensitive alias.
+    async fn has_exact_sibling(&self, op: &Operator, rel: &str) -> Result<bool> {
+        let trimmed = rel.trim_end_matches('/');
+        let (parent, name) = match trimmed.rsplit_once('/') {
+            Some((parent, name)) => (format!("{parent}/"), name),
+            None => ("/".to_string(), trimmed),
+        };
+        let entries = op.list(&parent).await?;
+        Ok(contains_exact_name(
+            entries.iter().map(|entry| entry.name()),
+            name,
+        ))
     }
 
     /// Download one remote file into a local path, streamed in chunks. The
@@ -649,7 +665,6 @@ impl Provider {
         Capabilities {
             rename: cap.rename,
             copy: cap.copy,
-            recursive_delete: cap.delete && cap.list_with_recursive,
             presign: cap.presign,
             write_can_append: cap.write_can_append,
             // Object stores report create_dir but directories are prefixes.
@@ -741,4 +756,26 @@ fn unix_mode(meta: &std::fs::Metadata) -> Option<u32> {
 #[cfg(not(unix))]
 fn unix_mode(_meta: &std::fs::Metadata) -> Option<u32> {
     None
+}
+
+/// Whether `names` (directory entries may end with `/`) has exactly `name`.
+fn contains_exact_name<'a>(names: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+    names
+        .into_iter()
+        .any(|candidate| candidate.trim_end_matches('/') == name)
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::contains_exact_name;
+
+    #[test]
+    fn exact_name_match_tells_a_second_file_from_a_case_alias() {
+        // Case-sensitive backend with both files: the listing has the new spelling.
+        assert!(contains_exact_name(["Report.txt", "report.txt"], "report.txt"));
+        // Case-insensitive fs: the listing only holds the source's spelling.
+        assert!(!contains_exact_name(["Report.txt"], "report.txt"));
+        // Directory entries carry a trailing slash.
+        assert!(contains_exact_name(["Photos/"], "Photos"));
+    }
 }

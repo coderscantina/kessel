@@ -245,6 +245,55 @@ fn known_hosts_append(existing: &str, host: &str, port: u16, keys: &[HostKey]) -
     out
 }
 
+/// Key types in `keys` that known_hosts already holds with a different key.
+/// `found` is `ssh-keygen -F` output: `#` comment lines, then known_hosts
+/// lines (`host type key`, with the host possibly hashed).
+fn changed_key_types(found: &str, keys: &[HostKey]) -> Vec<String> {
+    let mut changed = Vec::new();
+    for line in found.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        let mut parts = line.split_whitespace();
+        let (Some(_host), Some(key_type), Some(public_key)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let differs = keys
+            .iter()
+            .any(|key| key.key_type == key_type && key.public_key != public_key);
+        if differs && !changed.iter().any(|known| known == key_type) {
+            changed.push(key_type.to_string());
+        }
+    }
+    changed
+}
+
+/// Refuse to pin keys that contradict ones already on file for host:port,
+/// hashed entries included (`ssh-keygen -F` matches those).
+async fn ensure_keys_not_changed(
+    known_hosts: &Path,
+    host: &str,
+    port: u16,
+    keys: &[HostKey],
+) -> Result<()> {
+    let output = smol::process::Command::new("ssh-keygen")
+        .arg("-F")
+        .arg(known_hosts_host(host, port))
+        .arg("-f")
+        .arg(known_hosts)
+        .output()
+        .await
+        .context("running ssh-keygen")?;
+    let changed = changed_key_types(&String::from_utf8_lossy(&output.stdout), keys);
+    if !changed.is_empty() {
+        bail!(
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! {host}:{port} already has a different {} host key in {}",
+            changed.join(", "),
+            known_hosts.display()
+        );
+    }
+    Ok(())
+}
+
 /// Trust `keys` for host:port: append them to `~/.ssh/known_hosts` (created
 /// 0600 in a 0700 `~/.ssh` when missing) and record the decision in SQLite.
 pub async fn trust_host_keys(
@@ -273,6 +322,9 @@ pub async fn trust_host_keys(
             return Err(error).with_context(|| format!("reading `{}`", path.display()));
         }
     };
+    if !existing.is_empty() {
+        ensure_keys_not_changed(&path, host, port, keys).await?;
+    }
     let append = known_hosts_append(&existing, host, port, keys);
     if !append.is_empty() {
         std::fs::OpenOptions::new()
@@ -327,6 +379,29 @@ mod tests {
         assert_eq!(keys[0].key_type, "ssh-ed25519");
         // Same value `ssh-keygen -lf` printed for this key.
         assert_eq!(keys[0].fingerprint, "SHA256:7tsIRTofeNHISUdIW2Ow9dKuz1G4NPp1M12VLvR7dF4");
+    }
+
+    #[test]
+    fn changed_key_of_same_type_is_detected() {
+        let other = "AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyOtherKeyOtherKeyOtherKeyOtherKey0000";
+        let new = |key_type: &str, public_key: &str| HostKey {
+            key_type: key_type.into(),
+            public_key: public_key.into(),
+            fingerprint: String::new(),
+        };
+        let found = format!(
+            "# Host [h.example]:2222 found: line 3\n|1|c2FsdA==|aGFzaA== ssh-ed25519 {other}\n\
+             # Host [h.example]:2222 found: line 4\n[h.example]:2222 ssh-rsa AAAAB3Rsa\n"
+        );
+        // Same type, different blob: changed (hashed entry included).
+        assert_eq!(
+            changed_key_types(&found, &[new("ssh-ed25519", ED25519)]),
+            vec!["ssh-ed25519"]
+        );
+        // Identical key, or a type that isn't on file: fine.
+        assert!(changed_key_types(&found, &[new("ssh-ed25519", other)]).is_empty());
+        assert!(changed_key_types(&found, &[new("ecdsa-sha2-nistp256", ED25519)]).is_empty());
+        assert!(changed_key_types("", &[new("ssh-ed25519", ED25519)]).is_empty());
     }
 
     #[test]

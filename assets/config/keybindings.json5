@@ -73,9 +73,10 @@
     "ctrl-a": "file_pane::SelectAll",
     "escape": "file_pane::ClearSelection",
 
-    // Navigation. Activate enters a folder or opens a file.
+    // Navigation. Activate enters a folder or opens a file; right arrow only
+    // enters a folder.
     "enter": "file_pane::Activate",
-    "right": "file_pane::Activate",
+    "right": "file_pane::EnterFolder",
     "secondary-down": "file_pane::Activate",
     "backspace": "file_pane::GoUp",
     "left": "file_pane::GoUp",

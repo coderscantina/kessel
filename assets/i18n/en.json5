@@ -384,6 +384,8 @@
   "transfers.conflict.note_title": "A transfer needs your decision",
   "transfers.conflict.note": "Some files from “{name}” already exist at the destination.",
   "transfers.conflict.resolve": "Resolve",
+  "app.split_needed": "Switch to split view to copy between panes.",
+  "file_pane.start_failed.many": "{count} transfers couldn't start. {reason}",
   "transfers.start_failed": "Couldn't start the transfer",
   "file_pane.open_many.title": "Open {count} items?",
   "file_pane.open_many.body": "Each file opens in its default app and each folder in a new tab.",

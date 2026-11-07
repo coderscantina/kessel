@@ -603,17 +603,19 @@ async fn create_quick_site(
 }
 
 /// Drop quick-connect sites nothing needs anymore: no open tab shows them
-/// and no unfinished transfer uses them. Runs once at startup; returns the
-/// removed ids.
+/// and no transfer job the user can still act on uses them (queued, active,
+/// paused, failed, cancelled, or done with failed files). Deleting a site
+/// cascades to its jobs, so only plain clean `done` jobs may go with it.
+/// Runs once at startup; returns the removed ids.
 pub async fn sweep_quick_sites(pool: &SqlitePool) -> Result<Vec<i64>> {
     let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
         "SELECT id, secret_handle FROM sites WHERE space_id = ? AND id != 0 \
            AND id NOT IN (SELECT a_site_id FROM open_tabs WHERE a_site_id IS NOT NULL) \
            AND id NOT IN (SELECT b_site_id FROM open_tabs WHERE b_site_id IS NOT NULL) \
            AND id NOT IN (SELECT src_site_id FROM transfer_jobs \
-                          WHERE state NOT IN ('done', 'cancelled')) \
+                          WHERE NOT (state = 'done' AND files_failed = 0)) \
            AND id NOT IN (SELECT dst_site_id FROM transfer_jobs \
-                          WHERE state NOT IN ('done', 'cancelled'))",
+                          WHERE NOT (state = 'done' AND files_failed = 0))",
     )
     .bind(QUICK_CONNECT_SPACE)
     .fetch_all(pool)

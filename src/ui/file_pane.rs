@@ -45,7 +45,7 @@ use crate::app::AppState;
 use crate::errors::{humanize, Humanized};
 use crate::i18n::{t, tf};
 use crate::provider::{Provider, SiteProfile};
-use crate::queue::{ConflictPolicy, NewJob};
+use crate::queue::{BatchFile, ConflictPolicy, NewBatch, NewJob};
 use crate::ui::file_icons::{self, FileIcons};
 use crate::ui::{human_size, human_time};
 
@@ -61,6 +61,7 @@ actions!(
         SelectAll,
         ClearSelection,
         Activate,
+        EnterFolder,
         GoUp,
         GoBack,
         GoForward,
@@ -1411,7 +1412,20 @@ impl FilePane {
         cx.notify();
     }
 
-    /// Enter / right arrow / double-click: a single folder is entered;
+    /// Right arrow: enter a single selected folder; files and multi-selections
+    /// are left alone (opening a file is Enter's job).
+    fn enter_folder(&mut self, _: &EnterFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_stale() {
+            return;
+        }
+        if let [entry] = self.selected_entries().as_slice() {
+            if entry.is_dir {
+                self.navigate_to(entry.path.clone(), window, cx);
+            }
+        }
+    }
+
+    /// Enter / double-click: a single folder is entered;
     /// files open in their default app, extra folders in new tabs.
     fn activate(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_stale() {
@@ -1491,14 +1505,27 @@ impl FilePane {
             .unwrap_or_else(crate::localfs::root)
     }
 
-    fn copy_to_other_pane(&mut self, _: &CopyToOtherPane, _: &mut Window, cx: &mut Context<Self>) {
+    /// Whether the path bar or the filter box has keyboard focus; pane-wide
+    /// shortcuts must not fire while the user types there.
+    fn text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path_input.focus_handle(cx).is_focused(window)
+            || self.search_input.focus_handle(cx).is_focused(window)
+    }
+
+    fn copy_to_other_pane(&mut self, _: &CopyToOtherPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input_focused(window, cx) {
+            return;
+        }
         let selected = self.selected_entries();
         if !selected.is_empty() && !self.is_stale() {
             cx.emit(PaneEvent::CopyRequested(selected));
         }
     }
 
-    fn move_to_other_pane(&mut self, _: &MoveToOtherPane, _: &mut Window, cx: &mut Context<Self>) {
+    fn move_to_other_pane(&mut self, _: &MoveToOtherPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input_focused(window, cx) {
+            return;
+        }
         let selected = self.selected_entries();
         if !selected.is_empty() && !self.is_stale() {
             cx.emit(PaneEvent::MoveRequested(selected));
@@ -1841,29 +1868,49 @@ impl FilePane {
     }
 
     /// Start transfers and report what the queue said once it has persisted
-    /// them: one note for the accepted jobs, the reason for each rejected one.
+    /// them: one note for what was accepted and one grouped note for what
+    /// was rejected. Plain file copies of one action share a batch job.
     pub fn submit_jobs(&mut self, jobs: Vec<NewJob>, window: &mut Window, cx: &mut Context<Self>) {
         if jobs.is_empty() {
             return;
         }
         let queue = cx.global::<AppState>().queue.clone();
+        let submissions = plan_submissions(jobs);
         cx.spawn_in(window, async move |_, cx| {
             let mut accepted = 0;
-            let mut rejected = Vec::new();
-            for job in jobs {
-                match queue.submit(job).await {
-                    Ok(_) => accepted += 1,
-                    Err(error) => rejected.push(error),
+            let mut rejected = 0;
+            let mut first_error: Option<anyhow::Error> = None;
+            for submission in submissions {
+                let entries = submission.entries();
+                let result = match submission {
+                    Submission::Job(job) => queue.submit(job).await,
+                    Submission::Batch(batch) => queue.submit_batch(batch).await,
+                };
+                match result {
+                    Ok(_) => accepted += entries,
+                    Err(error) => {
+                        rejected += entries;
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
             cx.update(|window, cx| {
                 if accepted > 0 {
                     window.push_notification(queued_message(accepted), cx);
                 }
-                for error in &rejected {
-                    let human = humanize(error);
+                if let Some(error) = &first_error {
+                    let reason = humanize(error).title;
+                    let message = if rejected == 1 {
+                        reason
+                    } else {
+                        tf(
+                            "file_pane.start_failed.many",
+                            &[("count", &rejected.to_string()), ("reason", &reason)],
+                        )
+                        .to_string()
+                    };
                     window.push_notification(
-                        Notification::error(human.title).title(t("transfers.start_failed")),
+                        Notification::error(message).title(t("transfers.start_failed")),
                         cx,
                     );
                 }
@@ -3601,6 +3648,7 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
             .on_action(cx.listener(Self::activate))
+            .on_action(cx.listener(Self::enter_folder))
             .on_action(cx.listener(Self::go_up_action))
             .on_action(cx.listener(Self::go_back_action))
             .on_action(cx.listener(Self::go_forward_action))
@@ -4231,6 +4279,84 @@ pub fn default_conflict_policy(cx: &App) -> ConflictPolicy {
     cx.global::<AppState>().config.transfers.default_conflict_policy.into()
 }
 
+/// What one `submit_jobs` call hands the queue.
+enum Submission {
+    Job(NewJob),
+    Batch(NewBatch),
+}
+
+impl Submission {
+    /// How many requested entries this submission stands for.
+    fn entries(&self) -> usize {
+        match self {
+            Self::Job(_) => 1,
+            Self::Batch(batch) => batch.files.len(),
+        }
+    }
+}
+
+/// Group plain-file copies that share sites, destination folder and conflict
+/// policy into one batch job each. Folders (recursive), moves (a batch can't
+/// delete its sources) and renamed copies stay separate jobs, and so does a
+/// lone file. Order of first appearance is kept.
+fn plan_submissions(jobs: Vec<NewJob>) -> Vec<Submission> {
+    type Key = (i64, i64, String, ConflictPolicy);
+    let mut plan: Vec<Result<NewJob, Key>> = Vec::new();
+    let mut groups: Vec<(Key, Vec<NewJob>)> = Vec::new();
+    for job in jobs {
+        let batchable = !job.src.ends_with('/') && !job.move_source && job.dst_name.is_none();
+        if !batchable {
+            plan.push(Ok(job));
+            continue;
+        }
+        let key = (job.src_site_id, job.dst_site_id, job.dst_dir.clone(), job.conflict_policy);
+        match groups.iter_mut().find(|(known, _)| *known == key) {
+            Some((_, members)) => members.push(job),
+            None => {
+                plan.push(Err(key.clone()));
+                groups.push((key, vec![job]));
+            }
+        }
+    }
+    plan.into_iter()
+        .flat_map(|slot| match slot {
+            Ok(job) => vec![Submission::Job(job)],
+            Err(key) => {
+                let members = groups
+                    .iter()
+                    .position(|(known, _)| *known == key)
+                    .map(|ix| groups.swap_remove(ix).1)
+                    .unwrap_or_default();
+                match <[NewJob; 1]>::try_from(members) {
+                    Ok([job]) => vec![Submission::Job(job)],
+                    Err(members) => vec![Submission::Batch(batch_of(members))],
+                }
+            }
+        })
+        .collect()
+}
+
+/// One batch job for several plain-file copies with a common route.
+fn batch_of(members: Vec<NewJob>) -> NewBatch {
+    let first = &members[0];
+    let label = |dir: String| if dir.is_empty() { "/".to_string() } else { dir };
+    NewBatch {
+        src_site_id: first.src_site_id,
+        dst_site_id: first.dst_site_id,
+        src_label: label(parent_of(&first.src)),
+        dst_label: label(first.dst_dir.clone()),
+        conflict_policy: first.conflict_policy,
+        files: members
+            .iter()
+            .map(|job| BatchFile {
+                src: job.src.clone(),
+                dst: format!("{}{}", job.dst_dir, job.src.rsplit('/').next().unwrap_or(&job.src)),
+                size: None,
+            })
+            .collect(),
+    }
+}
+
 fn queued_message(count: usize) -> SharedString {
     if count == 1 {
         t("file_pane.queued.one")
@@ -4331,6 +4457,34 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn plain_file_copies_share_one_batch() {
+        let job = |src: &str, move_source: bool| NewJob {
+            src_site_id: 1,
+            dst_site_id: 2,
+            src: src.into(),
+            dst_dir: "out/".into(),
+            dst_name: None,
+            conflict_policy: ConflictPolicy::Skip,
+            move_source,
+        };
+        let plan = plan_submissions(vec![
+            job("a/one.txt", false),
+            job("a/tree/", false),
+            job("a/two.txt", false),
+            job("a/moved.txt", true),
+        ]);
+        assert_eq!(plan.len(), 3);
+        let Submission::Batch(batch) = &plan[0] else { panic!("files first, as a batch") };
+        assert_eq!(batch.files.len(), 2);
+        assert_eq!(batch.files[1].dst, "out/two.txt");
+        assert_eq!(batch.src_label, "a/");
+        assert!(matches!(&plan[1], Submission::Job(j) if j.src == "a/tree/"));
+        assert!(matches!(&plan[2], Submission::Job(j) if j.move_source));
+        // A lone file stays a plain job.
+        assert!(matches!(plan_submissions(vec![job("x.txt", false)])[0], Submission::Job(_)));
     }
 
     #[test]
