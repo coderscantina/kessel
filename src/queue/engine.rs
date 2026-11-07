@@ -299,6 +299,9 @@ impl Engine {
             Command::Submit(job, reply) => {
                 let _ = reply.send(self.enqueue(&job).await);
             }
+            Command::SubmitBatch(batch, reply) => {
+                let _ = reply.send(self.enqueue_batch(&batch).await);
+            }
             Command::Settled(id, reply) => match store::job_outcome(&self.pool, id).await? {
                 None => {
                     let _ = reply.send(Err(anyhow::anyhow!("transfer {id} doesn't exist")));
@@ -535,6 +538,17 @@ impl Engine {
             "source and destination are the same"
         );
         store::enqueue_job(&self.pool, job).await
+    }
+
+    /// Validate and persist a multi-file job, already expanded.
+    async fn enqueue_batch(&self, batch: &super::NewBatch) -> Result<i64> {
+        anyhow::ensure!(!batch.files.is_empty(), "nothing to transfer");
+        anyhow::ensure!(
+            batch.src_site_id != batch.dst_site_id
+                || batch.files.iter().all(|file| file.src != file.dst),
+            "source and destination are the same"
+        );
+        store::enqueue_batch(&self.pool, batch).await
     }
 
     /// Answer everyone waiting for this job to settle.
@@ -1693,6 +1707,43 @@ mod tests {
         assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
         assert_eq!((outcome.files_done, outcome.files_failed), (2, 0));
         assert_eq!(std::fs::read(dst.join("tree/b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn batch_copies_listed_files_as_one_job() {
+        use crate::queue::{BatchFile, NewBatch};
+
+        let env = test_env("batch");
+        let src = env.dir.join("src");
+        let dst = env.dir.join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"bb").unwrap();
+        std::fs::write(src.join("left-out.txt"), b"x").unwrap();
+        let pair = |rel: &str, size| BatchFile {
+            src: browse(&src.join(rel)),
+            dst: browse(&dst.join(rel)),
+            size: Some(size),
+        };
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit_batch(NewBatch {
+                src_site_id: 0,
+                dst_site_id: 0,
+                src_label: format!("{}/", browse(&src)),
+                dst_label: format!("{}/", browse(&dst)),
+                files: vec![pair("a.txt", 1), pair("sub/b.txt", 2)],
+                conflict_policy: ConflictPolicy::Overwrite,
+            }))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert_eq!((outcome.files_done, outcome.files_failed), (2, 0));
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"bb");
+        assert!(!dst.join("left-out.txt").exists());
+        let snap = wait_until(&env.handle, |snap| snap.jobs.len() == 1);
+        assert_eq!(snap.jobs[0].bytes_total, 3);
     }
 
     #[test]
