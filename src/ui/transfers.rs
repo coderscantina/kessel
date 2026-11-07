@@ -376,7 +376,6 @@ fn prompt_conflict(job: &JobSnapshot, window: &mut Window, cx: &mut App) {
     window.push_notification(note, cx);
 }
 
-/// Last segment of a browse path, without the trailing `/` of a folder.
 /// The last segment of a browse path for a compact job title; the root
 /// reads as "/".
 fn short_path(path: &str) -> &str {
@@ -386,6 +385,7 @@ fn short_path(path: &str) -> &str {
     }
 }
 
+/// Last segment of a browse path, without the trailing `/` of a folder.
 fn file_name(path: &str) -> &str {
     let path = path.trim_end_matches('/');
     path.rsplit('/').next().unwrap_or(path)
