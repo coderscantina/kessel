@@ -431,11 +431,15 @@ pub async fn set_site_secret_handle(
 /// On launch, anything left `active` by a crash goes back to `queued` so the
 /// queue resumes where it stopped — tasks keep their byte_offset. A task is
 /// only `paused` while its job is paused by the user, so a paused task under
-/// a running job was stranded mid-pause and is re-queued too.
+/// a running job was stranded mid-pause and is re-queued too. A task caught
+/// running under a cancel that hadn't settled is cancelled instead; the
+/// engine finishes that cancel on start.
 pub async fn requeue_interrupted(pool: &SqlitePool) -> Result<u64> {
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE transfer_tasks SET state = 'queued' \
+        "UPDATE transfer_tasks SET state = CASE WHEN \
+           (SELECT state FROM transfer_jobs WHERE id = job_id) = 'cancelled' \
+           THEN 'cancelled' ELSE 'queued' END \
          WHERE state = 'active' OR (state = 'paused' AND job_id IN \
            (SELECT id FROM transfer_jobs WHERE state IN ('queued', 'active')))",
     )

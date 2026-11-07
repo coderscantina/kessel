@@ -14,6 +14,7 @@ pub(crate) mod store;
 mod transfer;
 
 pub use engine::start;
+pub(crate) use transfer::PARTIAL_SUFFIX;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -108,6 +109,9 @@ pub enum JobState {
     Paused,
     Failed,
     Done,
+    /// Cancel requested; workers and partial cleanup are still winding
+    /// down. Never stored: a `cancelled` row that hasn't settled yet.
+    Cancelling,
     Cancelled,
 }
 
@@ -119,6 +123,7 @@ impl JobState {
             Self::Paused => "paused",
             Self::Failed => "failed",
             Self::Done => "done",
+            Self::Cancelling => "cancelling",
             Self::Cancelled => "cancelled",
         }
     }
@@ -129,6 +134,7 @@ impl JobState {
             "paused" => Self::Paused,
             "failed" => Self::Failed,
             "done" => Self::Done,
+            "cancelling" => Self::Cancelling,
             "cancelled" => Self::Cancelled,
             _ => Self::Queued,
         }
