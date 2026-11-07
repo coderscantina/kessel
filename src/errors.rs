@@ -140,6 +140,28 @@ pub fn humanize(error: &anyhow::Error) -> Humanized {
     }
 }
 
+/// [`humanize`] for an error persisted as text (`{error:#}`), such as a
+/// failed transfer task's reason. The OpenDAL kind survives only as its
+/// display name, so it's recovered from there.
+pub fn humanize_text(raw: &str) -> Humanized {
+    const KINDS: &[(&str, ErrorKind)] = &[
+        ("NotFound (", ErrorKind::NotFound),
+        ("PermissionDenied (", ErrorKind::PermissionDenied),
+        ("AlreadyExists (", ErrorKind::AlreadyExists),
+        ("RateLimited (", ErrorKind::RateLimited),
+        ("Unsupported (", ErrorKind::Unsupported),
+        ("ConfigInvalid (", ErrorKind::ConfigInvalid),
+    ];
+    let error = match KINDS.iter().find(|(name, _)| raw.contains(name)) {
+        Some((_, kind)) => anyhow::Error::new(opendal::Error::new(*kind, raw.to_string())),
+        None => anyhow::anyhow!(raw.to_string()),
+    };
+    Humanized {
+        details: raw.to_string(),
+        ..humanize(&error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +190,13 @@ mod tests {
         let h = humanize(&anyhow::anyhow!("weird thing"));
         assert_eq!(h.title, "weird thing");
         assert_eq!(h.hint, None);
+    }
+
+    #[test]
+    fn stored_text_keeps_the_opendal_kind() {
+        let raw = "writing `a.txt`: PermissionDenied (permanent) at write => denied";
+        let h = humanize_text(raw);
+        assert_eq!(h.title, "You don't have permission to do that here.");
+        assert_eq!(h.details, raw);
     }
 }
