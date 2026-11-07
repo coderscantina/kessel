@@ -9,8 +9,8 @@ use sqlx::{Row as _, SqlitePool};
 use crate::provider::{LayerConfig, SiteProfile};
 
 use super::{
-    ConflictInfo, ConflictPolicy, HistoryEntry, JobOutcome, JobSnapshot, JobState, NewJob,
-    TaskSnapshot,
+    ConflictInfo, ConflictPolicy, HistoryEntry, JobOutcome, JobSnapshot, JobState, NewBatch,
+    NewJob, TaskSnapshot,
 };
 
 /// A job row as the scheduler sees it.
@@ -94,6 +94,40 @@ pub(crate) async fn enqueue_job(pool: &SqlitePool, job: &NewJob) -> Result<i64> 
     .execute(pool)
     .await?
     .last_insert_rowid();
+    Ok(id)
+}
+
+/// Persist a multi-file job and all its tasks in one transaction. The job
+/// is born `expanded`, so preparation only connects and activates it and a
+/// retry never re-walks anything.
+pub(crate) async fn enqueue_batch(pool: &SqlitePool, batch: &NewBatch) -> Result<i64> {
+    /// Rows per INSERT, well below SQLite's bound-parameter limit.
+    const CHUNK: usize = 500;
+
+    let mut tx = pool.begin().await?;
+    let id = sqlx::query(
+        "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, conflict_policy, expanded) \
+         VALUES (?, ?, ?, ?, ?, 1)",
+    )
+    .bind(batch.src_site_id)
+    .bind(batch.dst_site_id)
+    .bind(&batch.src_label)
+    .bind(&batch.dst_label)
+    .bind(batch.conflict_policy.as_str())
+    .execute(&mut *tx)
+    .await?
+    .last_insert_rowid();
+    for chunk in batch.files.chunks(CHUNK) {
+        let mut builder = sqlx::QueryBuilder::new("INSERT INTO transfer_tasks (job_id, src, dst, total_bytes) ");
+        builder.push_values(chunk, |mut row, file| {
+            row.push_bind(id)
+                .push_bind(&file.src)
+                .push_bind(&file.dst)
+                .push_bind(file.size.map(|b| b as i64));
+        });
+        builder.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(id)
 }
 

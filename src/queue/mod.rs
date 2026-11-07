@@ -37,6 +37,29 @@ pub struct NewJob {
     pub move_source: bool,
 }
 
+/// An explicit list of files copied as one job with one task per file, for
+/// callers that already know every pair (sync). Directories in between are
+/// created implicitly by the writes. `src_label` / `dst_label` are what the
+/// transfers panel shows as the job's source and destination.
+#[derive(Debug, Clone)]
+pub struct NewBatch {
+    pub src_site_id: i64,
+    pub dst_site_id: i64,
+    pub src_label: String,
+    pub dst_label: String,
+    pub files: Vec<BatchFile>,
+    pub conflict_policy: ConflictPolicy,
+}
+
+/// One file of a [`NewBatch`], as full browse paths on each site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFile {
+    pub src: String,
+    pub dst: String,
+    /// Expected size, so the job's total is right before files start.
+    pub size: Option<u64>,
+}
+
 /// What to do when a destination file already exists. Applied per file at
 /// transfer time; `Ask` parks the file until the user decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -231,6 +254,8 @@ pub(crate) enum Command {
     EnqueueTracked(NewJob, oneshot::Sender<i64>),
     /// Enqueue and report the persisted id or the rejection reason.
     Submit(NewJob, oneshot::Sender<anyhow::Result<i64>>),
+    /// Persist a multi-file job and report its id or the rejection reason.
+    SubmitBatch(NewBatch, oneshot::Sender<anyhow::Result<i64>>),
     /// Report the job's outcome once it settles.
     Settled(i64, oneshot::Sender<anyhow::Result<JobOutcome>>),
     Pause(i64),
@@ -298,6 +323,15 @@ impl QueueHandle {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Command::Submit(job, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
+    }
+    /// Persist a multi-file job (one task per listed file) and return its id.
+    pub async fn submit_batch(&self, batch: NewBatch) -> anyhow::Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::SubmitBatch(batch, tx))
             .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?

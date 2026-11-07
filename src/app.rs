@@ -480,6 +480,21 @@ impl KesselApp {
         })
         .detach();
 
+        // "Saved notes.txt to example.com" and upload failures from
+        // external-edit sessions.
+        let edit_notices = crate::edit::subscribe_notices();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(notice) = edit_notices.recv().await {
+                let alive = this.update_in(cx, |_, window, cx| {
+                    crate::edit::show_notice(notice, window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // config.json5 hot reload (see `watch_config`): when the epoch bumps,
         // re-seed panel layout from the freshly loaded values.
         cx.observe_global::<AppState>(|this, cx| {

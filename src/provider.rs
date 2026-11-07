@@ -128,6 +128,8 @@ pub struct RemoteEntry {
 #[derive(Clone)]
 pub struct Provider {
     pub site_id: i64,
+    /// The site's display name, for messages about it.
+    pub site_name: String,
     pub caps: Capabilities,
     /// The site's backend scheme, for provider-specific UI (columns, menus).
     /// opendal 0.58 dropped the `Scheme` enum in favour of string schemes.
@@ -186,6 +188,7 @@ impl Provider {
                 .with_context(|| format!("building operator for site `{}`", profile.name))?;
             return Ok(Self {
                 site_id: profile.id,
+                site_name: profile.name.clone(),
                 caps: Self::capabilities(&probe_op),
                 scheme: scheme.to_string(),
                 options: Arc::new(options.clone()),
@@ -207,6 +210,7 @@ impl Provider {
         let caps = Self::capabilities(&op);
         Ok(Self {
             site_id: profile.id,
+            site_name: profile.name.clone(),
             caps,
             scheme: scheme.to_string(),
             options: resolved,
@@ -325,13 +329,37 @@ impl Provider {
         Ok(())
     }
 
-    /// Download one remote file into a local path (in memory; meant for
-    /// previews and external edits, not bulk transfers — those go through
-    /// the queue).
+    /// Download one remote file into a local path, streamed in chunks. The
+    /// bytes land in a sibling `.part` file that replaces `dest` only once
+    /// complete, so a failed download never leaves a truncated `dest`.
+    /// Meant for previews and external edits; bulk transfers use the queue.
     pub async fn read_to_file(&self, path: &str, dest: &std::path::Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
         let (op, rel) = self.op_for(path)?;
-        let data = op.read(&rel).await?;
-        tokio::fs::write(dest, data.to_bytes())
+        let mut part = dest.as_os_str().to_owned();
+        part.push(".part");
+        let part = std::path::PathBuf::from(part);
+
+        let result: Result<()> = async {
+            let mut stream = op.reader(&rel).await?.into_bytes_stream(..).await?;
+            let mut file = tokio::fs::File::create(&part)
+                .await
+                .with_context(|| format!("creating `{}`", part.display()))?;
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?)
+                    .await
+                    .with_context(|| format!("writing `{}`", part.display()))?;
+            }
+            file.flush().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(error);
+        }
+        tokio::fs::rename(&part, dest)
             .await
             .with_context(|| format!("writing `{}`", dest.display()))?;
         Ok(())
