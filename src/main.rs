@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod dragout;
 mod edit;
+mod errors;
 mod i18n;
 mod keymap;
 mod localfs;
