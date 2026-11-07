@@ -247,7 +247,7 @@ impl Provider {
         if let Some(limit) = layers.concurrent_limit {
             op = op.layer(ConcurrentLimitLayer::new(limit));
         }
-        op.layer(LoggingLayer::default()).layer(TracingLayer::new())
+        op.layer(LoggingLayer::new(QuietNotFound)).layer(TracingLayer::new())
     }
 
     /// Resolve a browse path to the Operator serving it plus the
@@ -777,5 +777,27 @@ mod rename_tests {
         assert!(!contains_exact_name(["Report.txt"], "report.txt"));
         // Directory entries carry a trailing slash.
         assert!(contains_exact_name(["Photos/"], "Photos"));
+    }
+}
+
+/// OpenDAL's default logging, except a `stat` that finds nothing: kessel
+/// stats destinations before every write, so "not found" is the normal
+/// answer there and must not show up as a warning in the logs panel.
+#[derive(Clone, Copy, Debug)]
+struct QuietNotFound;
+
+impl opendal::layers::LoggingInterceptor for QuietNotFound {
+    fn log(
+        &self,
+        info: &opendal::raw::ServiceInfo,
+        operation: opendal::raw::Operation,
+        context: &[(&str, &str)],
+        message: &str,
+        err: Option<&opendal::Error>,
+    ) {
+        let expected = operation == opendal::raw::Operation::Stat
+            && err.is_some_and(|err| err.kind() == opendal::ErrorKind::NotFound);
+        let err = if expected { None } else { err };
+        opendal::layers::DefaultLoggingInterceptor.log(info, operation, context, message, err);
     }
 }
