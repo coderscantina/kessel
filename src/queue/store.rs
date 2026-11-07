@@ -355,17 +355,19 @@ pub(crate) async fn park_task_conflict(
     Ok(())
 }
 
-/// Atomically point a task at `dst` (policy `rename`) unless another
-/// unfinished task on the same destination site already targets it, so two
-/// workers can't pick the same free name. Persisted, so retries and resumes
-/// keep the name. Returns whether it was reserved.
+/// Atomically point a task at `dst` (policy `rename`) unless another task on
+/// the same destination site that may still write it already targets it, so
+/// two workers can't pick the same free name. Failed tasks keep holding
+/// theirs: a retry resumes its partial without checking the destination
+/// again. Persisted, so retries and resumes keep the name. Returns whether
+/// it was reserved.
 pub(crate) async fn reserve_task_dst(pool: &SqlitePool, task_id: i64, dst: &str) -> Result<bool> {
     let reserved = sqlx::query(
         "UPDATE transfer_tasks SET dst = ?, updated_at = datetime('now') \
          WHERE id = ? AND NOT EXISTS (SELECT 1 FROM transfer_tasks t \
              JOIN transfer_jobs j ON j.id = t.job_id \
              WHERE t.dst = ? AND t.id <> ? \
-               AND t.state IN ('queued', 'active', 'paused', 'conflict') \
+               AND t.state IN ('queued', 'active', 'paused', 'conflict', 'failed') \
                AND j.dst_site_id = (SELECT dst_site_id FROM transfer_jobs \
                    WHERE id = (SELECT job_id FROM transfer_tasks WHERE id = ?)))",
     )
@@ -378,6 +380,16 @@ pub(crate) async fn reserve_task_dst(pool: &SqlitePool, task_id: i64, dst: &str)
     .await?
     .rows_affected();
     Ok(reserved > 0)
+}
+
+/// Point a task back at `dst` unconditionally, releasing a reserved name.
+pub(crate) async fn set_task_dst(pool: &SqlitePool, task_id: i64, dst: &str) -> Result<()> {
+    sqlx::query("UPDATE transfer_tasks SET dst = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(dst)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Record (or forget, with `None`) the partial file a task owns.

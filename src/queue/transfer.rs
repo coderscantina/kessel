@@ -605,8 +605,10 @@ fn same_version(before: &opendal::Metadata, now: &opendal::Metadata) -> bool {
 }
 
 /// First "name (n).ext" the destination doesn't already have and no other
-/// unfinished task targets (policy `rename`). The name is reserved on the
-/// task row, so concurrent workers never pick the same one.
+/// task that may still write it targets (policy `rename`). Each candidate is
+/// reserved on the task row first and probed while held: a task that still
+/// writes the name blocks the reservation, one that finished it left the
+/// file behind for the probe. A candidate that exists is released again.
 async fn unique_name(
     pool: &SqlitePool,
     task_id: i64,
@@ -625,14 +627,16 @@ async fn unique_name(
     };
     for n in 1..1000u32 {
         let candidate = format!("{stem} ({n}){ext}");
-        match dst_op.stat(&format!("{parent}{candidate}")).await {
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
-                if store::reserve_task_dst(pool, task_id, &format!("{browse_parent}{candidate}")).await? {
-                    return Ok(candidate);
-                }
-            }
-            Err(error) => return Err(error).context("probing rename target"),
-            Ok(_) => {}
+        if !store::reserve_task_dst(pool, task_id, &format!("{browse_parent}{candidate}")).await? {
+            continue;
+        }
+        let probe = dst_op.stat(&format!("{parent}{candidate}")).await;
+        if matches!(&probe, Err(error) if error.kind() == opendal::ErrorKind::NotFound) {
+            return Ok(candidate);
+        }
+        store::set_task_dst(pool, task_id, dst_browse).await?;
+        if let Err(error) = probe {
+            return Err(error).context("probing rename target");
         }
     }
     anyhow::bail!("no free rename target for `{name}` after 999 tries")
@@ -740,6 +744,55 @@ mod tests {
         // the destination existing, so the destination must stay.
         assert!(commit_partial(&op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
         assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn keep_both_never_hands_out_a_name_another_task_may_write() {
+        let dir = std::env::temp_dir().join(format!("kessel-rename-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"OLD").unwrap();
+        let op = Operator::via_iter("fs", [("root".to_string(), dir.to_string_lossy().to_string())]).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let job: i64 = sqlx::query_scalar(
+            "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, state, expanded) \
+             VALUES (0, 0, 'src', '', 'active', 1) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO transfer_tasks (job_id, src, dst, state) \
+                 VALUES (?, 'src', 'file.txt', 'active') RETURNING id",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let name = |id| unique_name(&pool, id, &op, "file.txt", "file.txt");
+
+        // A holds "file (1).txt" before writing it: B's reservation fails
+        // although the name is still free on disk.
+        assert_eq!(name(a).await.unwrap(), "file (1).txt");
+        assert_eq!(name(b).await.unwrap(), "file (2).txt");
+        // A commits and completes, so its row stops holding the name; the
+        // file now does. B fails and keeps "(2)" for a retry that resumes
+        // its partial without looking at the destination again.
+        std::fs::write(dir.join("file (1).txt"), b"A").unwrap();
+        store::complete_task(&pool, a, 1).await.unwrap();
+        assert!(store::task_failed(&pool, b, "denied", false, 0).await.unwrap());
+        assert_eq!(name(c).await.unwrap(), "file (3).txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
