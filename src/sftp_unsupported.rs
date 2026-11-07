@@ -40,3 +40,28 @@ pub async fn set_mtime(
 pub async fn chmod(_options: &HashMap<String, String>, _path: &str, _mode: u32) -> Result<()> {
     bail!("sftp is not supported on this platform")
 }
+
+/// Mirrors `sftp::HostKey`; never constructed on this platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKey {
+    pub key_type: String,
+    pub public_key: String,
+    pub fingerprint: String,
+}
+
+pub fn host_port(_endpoint: &str) -> Option<(String, u16)> {
+    None
+}
+
+pub async fn scan_host_keys(_host: &str, _port: u16) -> Result<Vec<HostKey>> {
+    bail!("sftp is not supported on this platform")
+}
+
+pub async fn trust_host_keys(
+    _pool: &sqlx::SqlitePool,
+    _host: &str,
+    _port: u16,
+    _keys: &[HostKey],
+) -> Result<()> {
+    bail!("sftp is not supported on this platform")
+}
