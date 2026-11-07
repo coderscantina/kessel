@@ -429,14 +429,22 @@ pub async fn set_site_secret_handle(
 }
 
 /// On launch, anything left `active` by a crash goes back to `queued` so the
-/// queue resumes where it stopped — tasks keep their byte_offset.
+/// queue resumes where it stopped — tasks keep their byte_offset. A task is
+/// only `paused` while its job is paused by the user, so a paused task under
+/// a running job was stranded mid-pause and is re-queued too.
 pub async fn requeue_interrupted(pool: &SqlitePool) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE transfer_tasks SET state = 'queued' \
+         WHERE state = 'active' OR (state = 'paused' AND job_id IN \
+           (SELECT id FROM transfer_jobs WHERE state IN ('queued', 'active')))",
+    )
+    .execute(&mut *tx)
+    .await?;
     let jobs = sqlx::query("UPDATE transfer_jobs SET state = 'queued' WHERE state = 'active'")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-    sqlx::query("UPDATE transfer_tasks SET state = 'queued' WHERE state = 'active'")
-        .execute(pool)
-        .await?;
+    tx.commit().await?;
     Ok(jobs)
 }

@@ -134,7 +134,11 @@ pub struct JobSnapshot {
     pub files_skipped: u64,
     /// Files parked awaiting a conflict decision.
     pub files_conflict: u64,
+    /// Files that failed for good. A `Done` job with failed files finished
+    /// with errors; `error` then holds the count and a representative reason.
+    pub files_failed: u64,
     pub bytes_total: u64,
+    /// Bytes transferred, including in-flight bytes not yet checkpointed.
     pub bytes_done: u64,
     /// Smoothed bytes/sec while the job is active.
     pub bps: u64,
@@ -174,10 +178,23 @@ pub struct HistoryEntry {
     pub dst: String,
     pub outcome: String,
     pub files: i64,
+    pub files_failed: i64,
     pub bytes: u64,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub finished_at: String,
+}
+
+/// How a job settled, as reported by [`QueueHandle::settled`].
+#[derive(Debug, Clone)]
+pub struct JobOutcome {
+    /// `Done` (possibly with failed files), `Failed` or `Cancelled`.
+    pub state: JobState,
+    /// What went wrong, in plain words: the reason for a failed job, or the
+    /// failure count plus a representative reason for a done one.
+    pub error: Option<String>,
+    pub files_done: u64,
+    pub files_failed: u64,
 }
 
 impl JobSnapshot {
@@ -201,8 +218,8 @@ pub struct QueueSnapshot {
     pub total_bps: u64,
     /// Current global concurrency cap (runtime-adjustable).
     pub max_parallel: usize,
-    /// Current global bandwidth cap in bytes/sec, 0 = unlimited
-    /// (runtime-adjustable; applies to jobs started afterwards).
+    /// Current global bandwidth cap in bytes/sec, 0 = unlimited, shared by
+    /// all transfers (runtime-adjustable; applies to files started afterwards).
     pub bandwidth_limit: u64,
 }
 
@@ -212,10 +229,16 @@ pub(crate) enum Command {
     /// Enqueue and report the created job id back — used by drag-out file
     /// promises, which must know when *their* job settles.
     EnqueueTracked(NewJob, oneshot::Sender<i64>),
+    /// Enqueue and report the persisted id or the rejection reason.
+    Submit(NewJob, oneshot::Sender<anyhow::Result<i64>>),
+    /// Report the job's outcome once it settles.
+    Settled(i64, oneshot::Sender<anyhow::Result<JobOutcome>>),
     Pause(i64),
     Resume(i64),
     Cancel(i64),
     Retry(i64),
+    /// Re-run only the failed files of a settled job.
+    RetryFailed(i64),
     /// Apply a decision to a job's parked conflicts (and future ones).
     Resolve(i64, ConflictPolicy),
     ResolveTask(i64, ConflictPolicy),
@@ -230,7 +253,7 @@ pub(crate) enum Command {
     /// Adjust the global concurrency cap at runtime.
     SetMaxParallel(usize),
     /// Adjust the global bandwidth cap (bytes/sec, 0 = unlimited) at
-    /// runtime; takes effect for jobs prepared afterwards.
+    /// runtime; takes effect for files started afterwards.
     SetBandwidth(u64),
     /// Apply reloaded `transfers.*` config values (retries, verify,
     /// preserve_timestamps, skip_hidden) at runtime.
@@ -257,6 +280,8 @@ pub struct QueueHandle {
 }
 
 impl QueueHandle {
+    /// Fire-and-forget enqueue; a rejected job only reaches the log.
+    /// Prefer [`Self::submit`].
     pub fn enqueue(&self, job: NewJob) {
         let _ = self.cmds.send(Command::Enqueue(job));
     }
@@ -267,28 +292,34 @@ impl QueueHandle {
         let _ = self.cmds.send(Command::EnqueueTracked(job, tx));
         rx
     }
-    /// Wait until the job reaches a terminal state. A job that vanishes from
-    /// the snapshot after having been seen (user cleared finished jobs)
-    /// counts as done; one that never appears keeps waiting until the engine
-    /// itself goes away.
+    /// Enqueue and wait until the job is persisted. Returns its id, or the
+    /// reason it was rejected (e.g. source and destination are the same).
+    pub async fn submit(&self, job: NewJob) -> anyhow::Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::Submit(job, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
+    }
+    /// Wait until the job settles (done, failed or cancelled) and return its
+    /// outcome. Resolves at once for a job that already settled. Errors if
+    /// the job doesn't exist or the engine stops first.
+    pub async fn settled(&self, job_id: i64) -> anyhow::Result<JobOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::Settled(job_id, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
+    }
+    /// Wait until the job reaches a terminal state. Prefer [`Self::settled`],
+    /// which also carries the error; this reports an unknown job or a
+    /// stopped engine as `Cancelled`.
     pub async fn wait_terminal(&self, job_id: i64) -> JobState {
-        let mut rx = self.subscribe();
-        let mut seen = false;
-        loop {
-            let state = {
-                let snapshot = rx.borrow();
-                snapshot.jobs.iter().find(|job| job.id == job_id).map(|job| job.state)
-            };
-            match state {
-                Some(state) if state.is_terminal() => return state,
-                Some(_) => seen = true,
-                None if seen => return JobState::Done,
-                None => {}
-            }
-            if rx.changed().await.is_err() {
-                return JobState::Cancelled;
-            }
-        }
+        self.settled(job_id)
+            .await
+            .map_or(JobState::Cancelled, |outcome| outcome.state)
     }
     pub fn pause(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Pause(job_id));
@@ -301,6 +332,10 @@ impl QueueHandle {
     }
     pub fn retry(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Retry(job_id));
+    }
+    /// Re-run only the failed files of a settled job; done files stay done.
+    pub fn retry_failed(&self, job_id: i64) {
+        let _ = self.cmds.send(Command::RetryFailed(job_id));
     }
     /// Resolve a job's parked conflicts; the policy also applies to any
     /// conflicts the job hits later.
@@ -330,7 +365,8 @@ impl QueueHandle {
     pub fn set_max_parallel(&self, limit: usize) {
         let _ = self.cmds.send(Command::SetMaxParallel(limit));
     }
-    /// Bytes/sec, 0 = unlimited. Applies to jobs started afterwards.
+    /// Bytes/sec, 0 = unlimited, shared by all transfers. Applies to files
+    /// started afterwards.
     pub fn set_bandwidth(&self, bps: u64) {
         let _ = self.cmds.send(Command::SetBandwidth(bps));
     }

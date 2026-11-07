@@ -6,6 +6,10 @@
 //! `done` / `failed` / `cancelled` (+ history row). Every state change goes
 //! through SQLite first, so a crash at any point resumes cleanly on
 //! relaunch (`db::requeue_interrupted` flips orphaned `active` rows back).
+//!
+//! Snapshots for the UI are coalesced: progress publishes at most every
+//! [`PUBLISH_EVERY`], while user commands and job-level state changes
+//! publish at once.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -17,29 +21,28 @@ use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use opendal::layers::ThrottleLayer;
+
 use crate::config::TransferConfig;
-use crate::provider::{LayerConfig, Provider, ThrottleConfig};
+use crate::provider::{LayerConfig, Provider};
 
 use super::store::{self, JobRow, NewTask};
 use super::transfer::{self, JobControl, Outcome, TransferOpts};
-use super::{Command, JobState, QueueHandle, QueueSnapshot};
+use super::{Command, JobOutcome, JobState, QueueHandle, QueueSnapshot};
 
 /// Tasks are inserted in batches of this many rows while the source tree is
 /// still being listed, so a million-file bucket never sits in memory.
 const EXPANSION_BATCH: usize = 200;
+/// Minimum gap between coalesced snapshot publishes.
+const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 
 /// Spawn the engine on the app runtime and hand back its control handle.
 pub fn start(
     runtime: &tokio::runtime::Runtime,
     pool: SqlitePool,
     cfg: TransferConfig,
-    mut default_layers: LayerConfig,
+    default_layers: LayerConfig,
 ) -> QueueHandle {
-    // The global bandwidth cap rides on OpenDAL's ThrottleLayer: it becomes
-    // the default per-site throttle wherever a site doesn't set its own.
-    if cfg.bandwidth_limit > 0 && default_layers.throttle.is_none() {
-        default_layers.throttle = throttle_for(cfg.bandwidth_limit);
-    }
     let max_parallel = cfg.max_parallel.max(1);
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -56,6 +59,7 @@ pub fn start(
         max_retries: cfg.retries,
         max_parallel,
         bandwidth_limit: cfg.bandwidth_limit,
+        throttle: global_throttle(cfg.bandwidth_limit),
         verify: cfg.verify,
         preserve_timestamps: cfg.preserve_timestamps,
         skip_hidden: cfg.skip_hidden,
@@ -66,6 +70,10 @@ pub fn start(
         jobs: HashMap::new(),
         speeds: HashMap::new(),
         pending_retries: HashSet::new(),
+        waiters: HashMap::new(),
+        dirty: true,
+        urgent: true,
+        last_publish: Instant::now(),
         shutdown_ack: None,
     };
     runtime.spawn(engine.run());
@@ -94,6 +102,8 @@ struct JobRuntime {
     providers: Option<JobProviders>,
     preparing: bool,
     active_tasks: usize,
+    /// A cancelled job's leftover partial files are being removed.
+    cleaning: bool,
 }
 
 enum Internal {
@@ -102,25 +112,28 @@ enum Internal {
         job_id: i64,
         task_id: i64,
         outcome: Outcome,
+        /// The worker's bytes still counted in `JobControl::unpersisted`.
+        unpersisted: u64,
     },
+    /// Partial cleanup of a cancelled job finished.
+    Cleaned(i64),
 }
 
-/// Bytes/sec sampling per job, smoothed with an EMA so the UI number
-/// doesn't flicker with checkpoint granularity.
+/// Bytes/sec sampling per job from its live byte counter, smoothed with an
+/// EMA so the UI number doesn't flicker.
 struct Speed {
-    last_bytes: u64,
+    last_moved: u64,
     last_at: Instant,
     ema_bps: f64,
 }
 
-/// bytes/sec → OpenDAL throttle config (None = unlimited).
-fn throttle_for(bps: u64) -> Option<ThrottleConfig> {
+/// bytes/sec → one rate limiter shared by every transfer (None = unlimited).
+/// OpenDAL's ThrottleLayer shares its limiter between clones; the burst must
+/// cover the largest single write, one chunk.
+fn global_throttle(bps: u64) -> Option<ThrottleLayer> {
     (bps > 0).then(|| {
-        let bandwidth = bps.min(u32::MAX as u64) as u32;
-        ThrottleConfig {
-            bandwidth,
-            burst: bandwidth.saturating_mul(2).max(bandwidth),
-        }
+        let bandwidth = bps.min(u64::from(u32::MAX)) as u32;
+        ThrottleLayer::new(bandwidth, bandwidth.max(transfer::CHUNK as u32))
     })
 }
 
@@ -131,8 +144,10 @@ struct Engine {
     /// Global concurrency cap, enforced against the engine's own in-flight
     /// worker count so it can be adjusted at runtime.
     max_parallel: usize,
-    /// Mirror of the default throttle for the UI (bytes/sec, 0 = unlimited).
+    /// Global bandwidth cap for the UI (bytes/sec, 0 = unlimited).
     bandwidth_limit: u64,
+    /// The limiter enforcing `bandwidth_limit` across all running transfers.
+    throttle: Option<ThrottleLayer>,
     /// Post-transfer verification / timestamp preservation / expansion
     /// filtering, from `transfers.*` in the config.
     verify: bool,
@@ -148,6 +163,13 @@ struct Engine {
     /// tasks under a live worker would let its final state-write race the
     /// re-queued run of the same task.
     pending_retries: HashSet<i64>,
+    /// Callers waiting for a job to settle ([`QueueHandle::settled`]).
+    waiters: HashMap<i64, Vec<oneshot::Sender<Result<JobOutcome>>>>,
+    /// Something changed since the last snapshot.
+    dirty: bool,
+    /// A user-visible state change: publish without waiting for the tick.
+    urgent: bool,
+    last_publish: Instant,
     /// Set while a graceful shutdown drains workers; acked when idle.
     shutdown_ack: Option<oneshot::Sender<()>>,
 }
@@ -160,10 +182,9 @@ impl Engine {
 
         loop {
             if self.shutdown_ack.is_some() {
+                // Workers parked by shutdown already went back to `queued`
+                // (their jobs stay active), so the next launch resumes them.
                 if !self.busy() {
-                    if let Err(error) = store::requeue_shutdown_paused(&self.pool).await {
-                        tracing::error!(%error, "shutdown flush failed");
-                    }
                     if let Some(ack) = self.shutdown_ack.take() {
                         let _ = ack.send(());
                     }
@@ -172,9 +193,17 @@ impl Engine {
             } else if let Err(error) = self.schedule().await {
                 tracing::error!(%error, "queue scheduling failed");
             }
+            // Connected running jobs keep ticking: tasks waiting out a retry
+            // backoff become claimable without any other event.
+            let ticking = self.dirty
+                || self.busy()
+                || self.jobs.values().any(|rt| {
+                    rt.providers.is_some() && !rt.control.paused.load(Ordering::Relaxed)
+                });
             tokio::select! {
                 cmd = self.cmds.recv() => match cmd {
                     Some(cmd) => {
+                        self.urgent = true;
                         if let Err(error) = self.handle_command(cmd).await {
                             tracing::error!(%error, "queue command failed");
                         }
@@ -183,20 +212,26 @@ impl Engine {
                     None => break,
                 },
                 Some(msg) = self.internal_rx.recv() => {
+                    self.dirty = true;
                     if let Err(error) = self.handle_internal(msg).await {
                         tracing::error!(%error, "queue bookkeeping failed");
                     }
                 },
-                _ = tick.tick(), if self.busy() => {},
+                _ = tick.tick(), if ticking => {
+                    // Live byte counters move without any message.
+                    self.dirty |= self.busy();
+                },
             }
-            self.publish().await;
+            if self.urgent || (self.dirty && self.last_publish.elapsed() >= PUBLISH_EVERY) {
+                self.publish().await;
+            }
         }
     }
 
     fn busy(&self) -> bool {
         self.jobs
             .values()
-            .any(|rt| rt.preparing || rt.active_tasks > 0)
+            .any(|rt| rt.preparing || rt.active_tasks > 0 || rt.cleaning)
     }
 
     /// Kick off preparation for runnable jobs and claim tasks while
@@ -243,6 +278,7 @@ impl Engine {
                 same_site: providers.same_site,
                 verify: self.verify,
                 preserve_timestamps: self.preserve_timestamps,
+                throttle: self.throttle.clone(),
             };
             let pool = self.pool.clone();
             let tx = self.internal_tx.clone();
@@ -254,24 +290,24 @@ impl Engine {
     async fn handle_command(&mut self, cmd: Command) -> Result<()> {
         match cmd {
             Command::Enqueue(job) => {
-                let dst_name = job.dst_name.as_deref().unwrap_or(file_name(&job.src));
-                anyhow::ensure!(
-                    job.src_site_id != job.dst_site_id
-                        || !format!("{}{dst_name}", job.dst_dir).eq(&job.src),
-                    "source and destination are the same"
-                );
-                store::enqueue_job(&self.pool, &job).await?;
+                self.enqueue(&job).await?;
             }
             Command::EnqueueTracked(job, reply) => {
-                let dst_name = job.dst_name.as_deref().unwrap_or(file_name(&job.src));
-                anyhow::ensure!(
-                    job.src_site_id != job.dst_site_id
-                        || !format!("{}{dst_name}", job.dst_dir).eq(&job.src),
-                    "source and destination are the same"
-                );
-                let id = store::enqueue_job(&self.pool, &job).await?;
+                let id = self.enqueue(&job).await?;
                 let _ = reply.send(id);
             }
+            Command::Submit(job, reply) => {
+                let _ = reply.send(self.enqueue(&job).await);
+            }
+            Command::Settled(id, reply) => match store::job_outcome(&self.pool, id).await? {
+                None => {
+                    let _ = reply.send(Err(anyhow::anyhow!("transfer {id} doesn't exist")));
+                }
+                Some(outcome) if outcome.state.is_terminal() => {
+                    let _ = reply.send(Ok(outcome));
+                }
+                Some(_) => self.waiters.entry(id).or_default().push(reply),
+            },
             Command::Pause(id) => {
                 if let Some(rt) = self.jobs.get(&id) {
                     rt.control.paused.store(true, Ordering::Relaxed);
@@ -283,6 +319,8 @@ impl Engine {
                 if let Some(rt) = self.jobs.get(&id) {
                     rt.control.paused.store(false, Ordering::Relaxed);
                 }
+                // The pause may have landed after the last file finished.
+                self.maybe_finalize(id).await?;
             }
             Command::Cancel(id) => {
                 if let Some(rt) = self.jobs.get(&id) {
@@ -291,8 +329,14 @@ impl Engine {
                 store::cancel_job(&self.pool, id).await?;
                 self.maybe_finalize(id).await?;
             }
+            Command::RetryFailed(id) => {
+                // Only settled jobs qualify, and those have no workers left.
+                self.jobs.remove(&id);
+                self.speeds.remove(&id);
+                store::retry_failed_tasks(&self.pool, id).await?;
+            }
             Command::Retry(id) => {
-                if self.jobs.get(&id).is_some_and(|rt| rt.active_tasks > 0) {
+                if self.jobs.get(&id).is_some_and(|rt| rt.active_tasks > 0 || rt.cleaning) {
                     // Old workers still winding down (e.g. right after a
                     // cancel): hurry them and retry once the last reports in.
                     if let Some(rt) = self.jobs.get(&id) {
@@ -336,6 +380,7 @@ impl Engine {
                     if let Some(rt) = self.jobs.get(&id) {
                         rt.control.paused.store(false, Ordering::Relaxed);
                     }
+                    self.maybe_finalize(id).await?;
                 }
             }
             Command::SetMaxParallel(limit) => {
@@ -344,10 +389,10 @@ impl Engine {
                 self.max_parallel = limit.max(1);
             }
             Command::SetBandwidth(bps) => {
-                // Becomes the default per-site throttle for jobs prepared
-                // from now on; running jobs keep their connected stack.
+                // Files started from now on share the new limiter; running
+                // ones finish under the old one.
                 self.bandwidth_limit = bps;
-                self.default_layers.throttle = throttle_for(bps);
+                self.throttle = global_throttle(bps);
             }
             Command::SetTransferSettings {
                 retries,
@@ -360,12 +405,7 @@ impl Engine {
                 self.preserve_timestamps = preserve_timestamps;
                 self.skip_hidden = skip_hidden;
             }
-            Command::SetDefaultLayers(mut layers) => {
-                // The runtime bandwidth cap stays the default throttle
-                // wherever the reloaded config doesn't set its own.
-                if self.bandwidth_limit > 0 && layers.throttle.is_none() {
-                    layers.throttle = throttle_for(self.bandwidth_limit);
-                }
+            Command::SetDefaultLayers(layers) => {
                 self.default_layers = layers;
             }
             Command::Shutdown(ack) => {
@@ -398,52 +438,39 @@ impl Engine {
                     }
                     Err(error) => {
                         tracing::error!(job_id, error = %format!("{error:#}"), "job preparation failed");
-                        store::fail_job(&self.pool, job_id, &format!("{error:#}")).await?;
+                        let reason = crate::errors::humanize(&error).title;
+                        store::fail_job(&self.pool, job_id, &reason).await?;
                         self.jobs.remove(&job_id);
+                        self.notify_settled(job_id).await?;
                     }
+                }
+            }
+            Internal::Cleaned(job_id) => {
+                if let Some(rt) = self.jobs.get_mut(&job_id) {
+                    rt.cleaning = false;
+                }
+                if self.pending_retries.remove(&job_id) {
+                    self.retry_now(job_id).await?;
+                } else {
+                    self.jobs.remove(&job_id);
                 }
             }
             Internal::TaskFinished {
                 job_id,
                 task_id,
                 outcome,
+                unpersisted,
             } => {
                 if let Some(rt) = self.jobs.get_mut(&job_id) {
                     rt.active_tasks = rt.active_tasks.saturating_sub(1);
                 }
-                match outcome {
-                    Outcome::Done { bytes } => {
-                        store::complete_task(&self.pool, task_id, bytes).await?;
-                    }
-                    Outcome::Skipped => {
-                        store::set_task_state(&self.pool, task_id, "skipped").await?;
-                    }
-                    Outcome::Conflict {
-                        policy,
-                        dst_size,
-                        dst_modified,
-                    } => {
-                        store::park_task_conflict(
-                            &self.pool,
-                            task_id,
-                            policy,
-                            dst_size,
-                            dst_modified.as_deref(),
-                        )
-                        .await?;
-                    }
-                    Outcome::Paused => {
-                        store::set_task_state(&self.pool, task_id, "paused").await?;
-                    }
-                    Outcome::Cancelled => {
-                        store::set_task_state(&self.pool, task_id, "cancelled").await?;
-                    }
-                    Outcome::Failed(error) => {
-                        let msg = format!("{error:#}");
-                        tracing::warn!(job_id, task_id, error = %msg, "transfer task failed");
-                        store::task_failed(&self.pool, task_id, &msg, self.max_retries).await?;
-                    }
+                let result = self.record_outcome(job_id, task_id, outcome).await;
+                // Only now that the outcome is persisted does the worker's
+                // live share leave the counter, so progress never dips.
+                if let Some(rt) = self.jobs.get(&job_id) {
+                    rt.control.unpersisted.fetch_sub(unpersisted, Ordering::Relaxed);
                 }
+                result?;
                 let workers_idle = self
                     .jobs
                     .get(&job_id)
@@ -454,6 +481,73 @@ impl Engine {
                     self.maybe_finalize(job_id).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn record_outcome(&self, job_id: i64, task_id: i64, outcome: Outcome) -> Result<()> {
+        match outcome {
+            Outcome::Done { bytes } => {
+                store::complete_task(&self.pool, task_id, bytes).await?;
+            }
+            Outcome::Skipped => {
+                store::set_task_state(&self.pool, task_id, "skipped").await?;
+            }
+            Outcome::Conflict {
+                policy,
+                dst_size,
+                dst_modified,
+            } => {
+                store::park_task_conflict(
+                    &self.pool,
+                    task_id,
+                    policy,
+                    dst_size,
+                    dst_modified.as_deref(),
+                )
+                .await?;
+            }
+            Outcome::Paused => {
+                store::task_paused(&self.pool, task_id).await?;
+            }
+            Outcome::Cancelled => {
+                store::set_task_state(&self.pool, task_id, "cancelled").await?;
+            }
+            Outcome::Failed(error) => {
+                let msg = format!("{error:#}");
+                let transient = is_transient(&error);
+                tracing::warn!(job_id, task_id, transient, error = %msg, "transfer task failed");
+                if store::task_failed(&self.pool, task_id, &msg, transient, self.max_retries).await? {
+                    let reason = crate::errors::humanize(&error).title;
+                    store::note_job_error(&self.pool, job_id, &reason).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and persist a new job.
+    async fn enqueue(&self, job: &super::NewJob) -> Result<i64> {
+        let dst_name = job.dst_name.as_deref().unwrap_or(file_name(&job.src));
+        anyhow::ensure!(
+            job.src_site_id != job.dst_site_id
+                || !format!("{}{dst_name}", job.dst_dir).eq(&job.src),
+            "source and destination are the same"
+        );
+        store::enqueue_job(&self.pool, job).await
+    }
+
+    /// Answer everyone waiting for this job to settle.
+    async fn notify_settled(&mut self, job_id: i64) -> Result<()> {
+        self.urgent = true;
+        let Some(waiters) = self.waiters.remove(&job_id) else {
+            return Ok(());
+        };
+        let outcome = store::job_outcome(&self.pool, job_id)
+            .await?
+            .with_context(|| format!("transfer {job_id} vanished"))?;
+        for waiter in waiters {
+            let _ = waiter.send(Ok(outcome.clone()));
         }
         Ok(())
     }
@@ -475,25 +569,51 @@ impl Engine {
             return Ok(());
         }
         let providers = self.jobs.get(&job_id).and_then(|rt| rt.providers.clone());
-        if store::try_finalize_job(&self.pool, job_id).await? {
-            self.jobs.remove(&job_id);
-            self.speeds.remove(&job_id);
+        if !store::try_finalize_job(&self.pool, job_id).await? {
+            return Ok(());
+        }
+        self.jobs.remove(&job_id);
+        self.speeds.remove(&job_id);
+        match store::job_final(&self.pool, job_id).await? {
             // Move semantics: transferred files were deleted per task; once
             // the whole job is done, sweep the emptied source directories.
-            if let Some(providers) = providers.filter(|p| p.move_source) {
-                if let Some((JobState::Done, src)) =
-                    store::job_final(&self.pool, job_id).await?
-                {
+            Some((JobState::Done, src)) => {
+                if let Some(providers) = providers.filter(|p| p.move_source) {
                     if src.ends_with('/') {
                         tokio::spawn(cleanup_moved_source(providers.src, src));
                     }
                 }
             }
+            // Tasks cancelled while paused (or failed) still own partial
+            // files; remove them before a retry may start new ones.
+            Some((JobState::Cancelled, _)) => {
+                self.jobs.insert(
+                    job_id,
+                    JobRuntime {
+                        cleaning: true,
+                        ..JobRuntime::default()
+                    },
+                );
+                let pool = self.pool.clone();
+                let defaults = self.default_layers.clone();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    let dst = providers.map(|p| p.dst);
+                    if let Err(error) = discard_partials(&pool, job_id, dst, &defaults).await {
+                        tracing::warn!(job_id, error = %format!("{error:#}"), "removing partial files failed");
+                    }
+                    let _ = tx.send(Internal::Cleaned(job_id));
+                });
+            }
+            _ => {}
         }
-        Ok(())
+        self.notify_settled(job_id).await
     }
 
     async fn publish(&mut self) {
+        self.dirty = false;
+        self.urgent = false;
+        self.last_publish = Instant::now();
         let mut jobs = match store::snapshot_jobs(&self.pool).await {
             Ok(jobs) => jobs,
             Err(error) => {
@@ -505,20 +625,26 @@ impl Engine {
         let now = Instant::now();
         let mut total_bps = 0u64;
         for job in &mut jobs {
+            let Some(control) = self.jobs.get(&job.id).map(|rt| &rt.control) else {
+                self.speeds.remove(&job.id);
+                continue;
+            };
+            job.bytes_done += control.unpersisted.load(Ordering::Relaxed);
             if job.state != JobState::Active {
                 self.speeds.remove(&job.id);
                 continue;
             }
+            let moved = control.moved.load(Ordering::Relaxed);
             let speed = self.speeds.entry(job.id).or_insert(Speed {
-                last_bytes: job.bytes_done,
+                last_moved: moved,
                 last_at: now,
                 ema_bps: 0.0,
             });
             let dt = now.duration_since(speed.last_at).as_secs_f64();
             if dt >= 0.4 {
-                let delta = job.bytes_done.saturating_sub(speed.last_bytes) as f64;
+                let delta = moved.saturating_sub(speed.last_moved) as f64;
                 speed.ema_bps = 0.6 * speed.ema_bps + 0.4 * (delta / dt);
-                speed.last_bytes = job.bytes_done;
+                speed.last_moved = moved;
                 speed.last_at = now;
             }
             job.bps = speed.ema_bps as u64;
@@ -542,23 +668,12 @@ async fn prepare_job(
     defaults: &LayerConfig,
     skip_hidden: bool,
 ) -> Result<JobProviders> {
-    let src_profile = store::get_site(pool, job.src_site_id).await?;
-    let dst_profile = store::get_site(pool, job.dst_site_id).await?;
-    let defaults = defaults.clone();
-    let same_site = job.src_site_id == job.dst_site_id;
-    let move_source = job.move_source;
-    let providers = tokio::task::spawn_blocking(move || -> Result<JobProviders> {
-        Ok(JobProviders {
-            src: Provider::connect(&src_profile, &defaults)
-                .with_context(|| format!("connecting `{}`", src_profile.name))?,
-            dst: Provider::connect(&dst_profile, &defaults)
-                .with_context(|| format!("connecting `{}`", dst_profile.name))?,
-            same_site,
-            move_source,
-        })
-    })
-    .await
-    .context("provider connect task panicked")??;
+    let providers = JobProviders {
+        src: connect_site(pool, job.src_site_id, defaults).await?,
+        dst: connect_site(pool, job.dst_site_id, defaults).await?,
+        same_site: job.src_site_id == job.dst_site_id,
+        move_source: job.move_source,
+    };
 
     if !job.expanded {
         // A previously interrupted fan-out may have left partial tasks —
@@ -570,6 +685,62 @@ async fn prepare_job(
         store::activate_job(pool, job.id).await?;
     }
     Ok(providers)
+}
+
+/// Connect one site's layered provider (keychain access is blocking).
+async fn connect_site(pool: &SqlitePool, site_id: i64, defaults: &LayerConfig) -> Result<Provider> {
+    let profile = store::get_site(pool, site_id).await?;
+    let defaults = defaults.clone();
+    tokio::task::spawn_blocking(move || {
+        Provider::connect(&profile, &defaults)
+            .with_context(|| format!("connecting `{}`", profile.name))
+    })
+    .await
+    .context("provider connect task panicked")?
+}
+
+/// Whether a failed task is worth re-queueing: the error class says the
+/// same request can succeed later, or OpenDAL marked it temporary.
+fn is_transient(error: &anyhow::Error) -> bool {
+    crate::errors::classify(error).is_transient()
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<opendal::Error>())
+            .any(opendal::Error::is_temporary)
+}
+
+/// Remove the partial files of a cancelled job's tasks that stopped before
+/// the cancel (paused, failed), then forget their resume offsets.
+async fn discard_partials(
+    pool: &SqlitePool,
+    job_id: i64,
+    dst: Option<Provider>,
+    defaults: &LayerConfig,
+) -> Result<()> {
+    let tasks = store::cancelled_partials(pool, job_id).await?;
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let dst = match dst {
+        Some(dst) => dst,
+        None => {
+            let job = store::get_job(pool, job_id)
+                .await?
+                .with_context(|| format!("transfer {job_id} vanished"))?;
+            connect_site(pool, job.dst_site_id, defaults).await?
+        }
+    };
+    if transfer::stages(&dst.caps) {
+        for (task_id, path) in tasks {
+            let (op, rel) = dst.op_for(&path)?;
+            // Deleting a missing file succeeds, so a partial that never
+            // got written is fine.
+            op.delete(&transfer::partial_path(&rel, task_id))
+                .await
+                .with_context(|| format!("removing the partial file of `{path}`"))?;
+        }
+    }
+    store::reset_cancelled_offsets(pool, job_id).await
 }
 
 /// Turn the job's source into per-file tasks. A file maps 1:1; a directory
@@ -752,7 +923,10 @@ impl TreeWalk {
                 return Ok(None);
             };
             let rel = entry.path().strip_prefix(root.as_str()).unwrap_or(entry.path());
-            if rel.is_empty() || (skip_hidden && rel.split('/').any(|s| s.starts_with('.'))) {
+            if rel.is_empty()
+                || (skip_hidden && rel.split('/').any(|s| s.starts_with('.')))
+                || (entry.metadata().is_file() && rel.ends_with(transfer::PARTIAL_SUFFIX))
+            {
                 continue;
             }
             if let TreeWalk::Folders { pending, .. } = self {
@@ -767,19 +941,31 @@ impl TreeWalk {
 
 /// After a successful move job: skipped or failed files stay put, so only
 /// sweep the source tree when nothing but directories remains under it.
+/// Folders are removed one by one, deepest first, with non-recursive
+/// deletes: a file that shows up meanwhile keeps its folder alive instead
+/// of being swept away with it.
 async fn cleanup_moved_source(provider: Provider, src: String) {
     use futures::TryStreamExt as _;
 
     let result: Result<()> = async {
         let (op, rel) = provider.op_for(&src)?;
         let mut lister = op.lister_with(&rel).recursive(true).await?;
+        let mut dirs = vec![rel.clone()];
         while let Some(entry) = lister.try_next().await? {
             if !entry.metadata().is_dir() {
                 tracing::debug!(%src, "move: files remain at the source; leaving it in place");
                 return Ok(());
             }
+            if entry.path() != rel {
+                dirs.push(entry.path().to_string());
+            }
         }
-        op.delete_with(&rel).recursive(true).await?;
+        dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
+        for dir in dirs {
+            if let Err(error) = op.delete(&dir).await {
+                tracing::debug!(%dir, %error, "move: source folder not removed");
+            }
+        }
         Ok(())
     }
     .await;
@@ -796,12 +982,13 @@ async fn run_worker(
     opts: TransferOpts,
     tx: mpsc::UnboundedSender<Internal>,
 ) {
-    let outcome =
+    let (outcome, unpersisted) =
         transfer::run_task(&pool, &providers.src, &providers.dst, &task, &control, opts).await;
     let _ = tx.send(Internal::TaskFinished {
         job_id: task.job_id,
         task_id: task.id,
         outcome,
+        unpersisted,
     });
 }
 
@@ -1352,6 +1539,160 @@ mod tests {
         let dst_meta = std::fs::metadata(dst_dir.join("old.txt")).unwrap();
         let dst_mtime = filetime::FileTime::from_last_modification_time(&dst_meta);
         assert_eq!(dst_mtime.unix_seconds(), 1_600_000_000);
+    }
+
+    /// Leftover task-owned partial files under `dir`.
+    fn partials(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(transfer::PARTIAL_SUFFIX))
+            .collect()
+    }
+
+    /// A 40 MiB source behind an 8 MiB/s global cap: the first chunks pass
+    /// at once, the rest takes seconds, leaving time to act mid-transfer.
+    /// Jobs built with [`slow_job`] target a second local site, so bytes
+    /// stream instead of taking the same-site server-side copy.
+    fn slow_env(name: &str) -> (TestEnv, PathBuf, PathBuf, Vec<u8>) {
+        let env = test_env_with(name, |cfg| cfg.bandwidth_limit = 8 * 1024 * 1024);
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO sites (id, name, scheme, options) \
+                     VALUES (1, 'Local copy', 'fs', '{\"root\":\"/\"}')",
+                )
+                .execute(&env.pool),
+            )
+            .unwrap();
+        let src_dir = env.dir.join("src");
+        let dst_dir = env.dir.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let content: Vec<u8> = (0..40 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src_dir.join("big.bin"), &content).unwrap();
+        (env, src_dir, dst_dir, content)
+    }
+
+    fn slow_job(src: &Path, dst_dir: &Path, move_source: bool) -> NewJob {
+        NewJob {
+            dst_site_id: 1,
+            move_source,
+            ..job(browse(src), format!("{}/", browse(dst_dir)), ConflictPolicy::Overwrite)
+        }
+    }
+
+    /// Start an overwrite of `dst/big.bin` (holding "OLD") and pause it once
+    /// bytes are flowing and its worker has settled.
+    fn start_and_pause_overwrite(env: &TestEnv, src_dir: &Path, dst_dir: &Path) -> i64 {
+        std::fs::write(dst_dir.join("big.bin"), b"OLD").unwrap();
+        env.handle.enqueue(slow_job(&src_dir.join("big.bin"), dst_dir, false));
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state == JobState::Active && j.bytes_done > 0)
+        });
+        let id = snap.jobs[0].id;
+        env.handle.pause(id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let states = env.rt.block_on(store::task_states(&env.pool, id)).unwrap();
+            if states.contains_key("paused") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never settled the pause: {states:?} {:?}",
+                env.handle.latest()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        id
+    }
+
+    #[test]
+    fn overwrite_keeps_the_old_file_until_a_resumed_copy_commits() {
+        let (env, src_dir, dst_dir, content) = slow_env("staged-overwrite");
+        let id = start_and_pause_overwrite(&env, &src_dir, &dst_dir);
+        assert_eq!(std::fs::read(dst_dir.join("big.bin")).unwrap(), b"OLD");
+        assert_eq!(partials(&dst_dir).len(), 1);
+
+        env.handle.resume(id);
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state.is_terminal())
+        });
+        assert_eq!(snap.jobs[0].state, JobState::Done, "{:?}", snap.jobs[0].error);
+        assert!(std::fs::read(dst_dir.join("big.bin")).unwrap() == content);
+        assert!(partials(&dst_dir).is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_paused_overwrite_removes_its_partial() {
+        let (env, src_dir, dst_dir, _) = slow_env("cancel-partial");
+        let id = start_and_pause_overwrite(&env, &src_dir, &dst_dir);
+        env.handle.cancel(id);
+        wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state == JobState::Cancelled)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !partials(&dst_dir).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "partial was not removed");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(std::fs::read(dst_dir.join("big.bin")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn move_keeps_a_source_that_changed_during_the_copy() {
+        let (env, src_dir, dst_dir, _) = slow_env("move-changed");
+        let src_file = src_dir.join("big.bin");
+        env.handle.enqueue(slow_job(&src_file, &dst_dir, true));
+        wait_until(&env.handle, |s| s.jobs.first().is_some_and(|j| j.bytes_done > 0));
+        filetime::set_file_mtime(&src_file, filetime::FileTime::from_unix_time(1_000_000, 0))
+            .unwrap();
+        let snap = wait_until(&env.handle, |s| {
+            s.jobs.first().is_some_and(|j| j.state.is_terminal())
+        });
+        assert_eq!(snap.jobs[0].state, JobState::Failed);
+        assert!(snap.jobs[0].error.as_deref().unwrap_or("").contains("changed"));
+        assert!(src_file.exists());
+    }
+
+    #[test]
+    fn one_failed_file_finishes_with_errors_and_retries_alone() {
+        let env = test_env("done-with-errors");
+        let src = env.dir.join("tree");
+        let dst = env.dir.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("b.txt"), b"b").unwrap();
+        // A folder squatting on b.txt's destination name fails that file.
+        std::fs::create_dir_all(dst.join("tree/b.txt")).unwrap();
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit(job(
+                format!("{}/", browse(&src)),
+                format!("{}/", browse(&dst)),
+                ConflictPolicy::Overwrite,
+            )))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done);
+        assert_eq!((outcome.files_done, outcome.files_failed), (1, 1));
+        assert!(outcome.error.unwrap().starts_with("1 of 2 files failed"));
+        let failed: i64 = env
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT files_failed FROM transfer_history").fetch_one(&env.pool),
+            )
+            .unwrap();
+        assert_eq!(failed, 1);
+
+        std::fs::remove_dir(dst.join("tree/b.txt")).unwrap();
+        env.handle.retry_failed(id);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert_eq!((outcome.files_done, outcome.files_failed), (2, 0));
+        assert_eq!(std::fs::read(dst.join("tree/b.txt")).unwrap(), b"b");
     }
 
     #[test]
