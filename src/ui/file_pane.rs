@@ -26,10 +26,14 @@ use gpui::prelude::*;
 use gpui::{
     actions, canvas, div, px, uniform_list, App, Bounds, ClickEvent, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, PathPromptOptions, Pixels,
-    Point, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, UniformListScrollHandle,
+    Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_component::dialog::DialogButtonProps;
+use gpui_component::notification::Notification;
+use gpui_component::spinner::Spinner;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::{
@@ -38,7 +42,9 @@ use gpui_component::{
 };
 
 use crate::app::AppState;
-use crate::provider::Provider;
+use crate::errors::{humanize, Humanized};
+use crate::i18n::{t, tf};
+use crate::provider::{Provider, SiteProfile};
 use crate::queue::{ConflictPolicy, NewJob};
 use crate::ui::file_icons::{self, FileIcons};
 use crate::ui::{human_size, human_time};
@@ -66,7 +72,9 @@ actions!(
         QuickLook,
         Search,
         ToggleTree,
-        EditPath
+        EditPath,
+        CopyToOtherPane,
+        MoveToOtherPane
     ]
 );
 
@@ -275,6 +283,8 @@ pub enum PaneEvent {
     LinkedNavigationFailed,
     /// The user interacted with this pane; it becomes the tab's active pane.
     Focused,
+    /// "Edit site" on a failed connection: open this site's settings.
+    EditSite(i64),
 }
 
 impl EventEmitter<PaneEvent> for FilePane {}
@@ -307,12 +317,20 @@ impl gpui::Global for PendingDragOut {}
 /// the pill way off to the side. The stored offset pads the pill back under
 /// the pointer, just below-right so the cursor doesn't cover it.
 struct DragGhost {
-    label: SharedString,
+    /// What is dragged ("report.pdf", "3 items"); the operation is prefixed
+    /// live from the held modifiers.
+    what: SharedString,
     grab_offset: Point<Pixels>,
 }
 
 impl Render for DragGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = if is_move_drop(&window.modifiers()) {
+            "file_pane.drag.move"
+        } else {
+            "file_pane.drag.copy"
+        };
+        let label = tf(key, &[("what", &self.what)]);
         div()
             .pl(self.grab_offset.x + px(12.))
             .pt(self.grab_offset.y + px(12.))
@@ -325,9 +343,23 @@ impl Render for DragGhost {
                     .text_color(cx.theme().primary_foreground)
                     .text_xs()
                     .whitespace_nowrap()
-                    .child(self.label.clone()),
+                    .child(label),
             )
     }
+}
+
+/// Holding Shift (or Cmd on macOS, as in Finder) turns a drop into a move.
+fn is_move_drop(modifiers: &Modifiers) -> bool {
+    modifiers.shift || (cfg!(target_os = "macos") && modifiers.platform)
+}
+
+/// Where the pane's backend connection stands. Connecting runs on the app
+/// runtime because it reads the keychain and may call AWS STS; a failure
+/// keeps the requested site so the pane can retry or open its settings.
+enum Connection {
+    Connecting,
+    Failed(Humanized),
+    Ready(Provider),
 }
 
 /// An in-progress rubber-band selection, in content coordinates (y = 0 is
@@ -341,10 +373,10 @@ struct RubberBand {
 
 pub struct FilePane {
     label: SharedString,
-    provider: Provider,
+    connection: Connection,
     /// Profile the provider was built from — cloned into "open in new tab"
     /// requests and used for the URL-style path display.
-    profile: crate::provider::SiteProfile,
+    profile: SiteProfile,
     /// Current directory, OpenDAL-style: `""` or `some/dir/`.
     path: String,
     /// Per-pane navigation history (paths within the current site).
@@ -354,6 +386,8 @@ pub struct FilePane {
     /// True while the path bar shows the editable input instead of the
     /// clickable breadcrumb (toggled by `EditPath` / cmd-l).
     editing_path: bool,
+    /// Why the last path-bar entry was rejected (a URL for another site).
+    path_error: Option<SharedString>,
     /// Rendered listing — `all_entries` narrowed by the type-to-search
     /// filter (or a plain copy when no search is active). All row/selection
     /// indices refer to this view.
@@ -367,7 +401,16 @@ pub struct FilePane {
     /// entity (updated from its change events).
     search_query: String,
     loading: bool,
-    error: Option<SharedString>,
+    /// A listing has been in flight for longer than a blink: shows the
+    /// path-bar spinner.
+    slow_loading: bool,
+    /// Directory the rows in `all_entries` belong to. While a listing for
+    /// another path loads, the old rows stay visible but dimmed and inert.
+    loaded_path: Option<String>,
+    /// Failed listing of the current directory.
+    error: Option<Humanized>,
+    /// The error state's "Details" disclosure is open.
+    details_open: bool,
     selection: BTreeSet<usize>,
     /// Keyboard focus row.
     cursor: Option<usize>,
@@ -426,26 +469,25 @@ impl Focusable for FilePane {
 
 impl FilePane {
     /// A pane browsing any site profile (local is just the reserved fs
-    /// profile). A backend that fails to build falls back to the local
-    /// filesystem with the error surfaced in the pane.
+    /// profile). Remote sites connect in the background; a failed connect
+    /// stays on the site and shows the error with Retry and Edit site.
     pub fn for_profile(
-        profile: crate::provider::SiteProfile,
+        profile: SiteProfile,
         start_path: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let defaults = cx.global::<AppState>().config.layers.clone();
-        let (profile, start_path, provider, error) =
-            match Provider::connect(&profile, &defaults) {
-                Ok(provider) => (profile, start_path, provider, None),
-                Err(error) => {
-                    tracing::error!(site = %profile.name, %error, "connecting site failed");
-                    let local = crate::app::local_profile();
-                    let provider = Provider::connect(&local, &defaults)
-                        .expect("local fs operator must build");
-                    (local, String::new(), provider, Some(format!("{error:#}").into()))
-                }
-            };
+        // A plain local site builds without any I/O, so it connects inline
+        // and never flashes a connecting state.
+        let connection = if profile.scheme == "fs" && profile.secret_handle.is_none() {
+            let defaults = &cx.global::<AppState>().config.layers;
+            match Provider::connect(&profile, defaults) {
+                Ok(provider) => Connection::Ready(provider),
+                Err(error) => Connection::Failed(humanize(&error)),
+            }
+        } else {
+            Connection::Connecting
+        };
 
         let path_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/dir"));
 
@@ -455,8 +497,17 @@ impl FilePane {
             |this, input, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     let raw = input.read(cx).value();
-                    this.editing_path = false;
-                    this.navigate_to(parse_path_input(&raw), window, cx);
+                    match parse_path_input(&raw, &this.profile) {
+                        PathInput::Here(path) => {
+                            this.editing_path = false;
+                            this.navigate_to(path, window, cx);
+                        }
+                        PathInput::Elsewhere(url) => {
+                            this.path_error =
+                                Some(tf("file_pane.path_elsewhere", &[("url", &url)]));
+                            cx.notify();
+                        }
+                    }
                 }
             },
         )
@@ -497,20 +548,24 @@ impl FilePane {
 
         let mut this = Self {
             label: profile.name.clone().into(),
-            provider,
+            connection,
             profile,
             path: start_path,
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             path_input,
             editing_path: false,
+            path_error: None,
             entries: Vec::new(),
             all_entries: Vec::new(),
             search_input,
             search_active: false,
             search_query: String::new(),
             loading: false,
-            error,
+            slow_loading: false,
+            loaded_path: None,
+            error: None,
+            details_open: false,
             selection: BTreeSet::new(),
             cursor: None,
             anchor: None,
@@ -537,11 +592,65 @@ impl FilePane {
             config_epoch_seen: config_epoch,
         };
         this.init_watcher(window, cx);
-        this.reload(window, cx);
-        if this.tree_visible {
-            this.tree_load(String::new(), cx);
+        match this.connection {
+            Connection::Ready(_) => this.on_connected(window, cx),
+            Connection::Connecting => this.connect(window, cx),
+            Connection::Failed(_) => {}
         }
         this
+    }
+
+    fn provider(&self) -> Option<&Provider> {
+        match &self.connection {
+            Connection::Ready(provider) => Some(provider),
+            Connection::Connecting | Connection::Failed(_) => None,
+        }
+    }
+
+    /// Build the site's provider on the app runtime (keychain reads and AWS
+    /// STS block), then load the listing.
+    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection = Connection::Connecting;
+        self.details_open = false;
+        let profile = self.profile.clone();
+        let state = cx.global::<AppState>();
+        let defaults = state.config.layers.clone();
+        let task = state
+            .runtime
+            .spawn_blocking(move || Provider::connect(&profile, &defaults));
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(join_error) => Err(anyhow::anyhow!("connect task failed: {join_error}")),
+            };
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(provider) => {
+                        this.connection = Connection::Ready(provider);
+                        this.on_connected(window, cx);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            site = %this.profile.name,
+                            error = %format!("{error:#}"),
+                            "connecting site failed"
+                        );
+                        this.connection = Connection::Failed(humanize(&error));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn on_connected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload(window, cx);
+        if self.tree_visible {
+            self.tree_load(String::new(), cx);
+        }
     }
 
     /// Config hot reload: re-seed the per-pane values that come from
@@ -596,7 +705,7 @@ impl FilePane {
             .unwrap_or_else(|| column.default_width()))
     }
 
-    /// Re-sort in place, keeping the selection (by name).
+    /// Re-sort in place; the selection follows its entries.
     fn set_sort(&mut self, column: Option<Column>, cx: &mut Context<Self>) {
         if self.sort.column == column {
             self.sort.ascending = !self.sort.ascending;
@@ -606,21 +715,7 @@ impl FilePane {
                 ascending: true,
             };
         }
-        let selected: Vec<SharedString> = self
-            .selected_entries()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
         self.apply_sort();
-        self.selection = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| !entry.is_parent && selected.contains(&entry.name))
-            .map(|(ix, _)| ix)
-            .collect();
-        self.cursor = None;
-        self.anchor = None;
         cx.notify();
     }
 
@@ -633,27 +728,40 @@ impl FilePane {
     // --- type-to-search ---
 
     /// Rebuild the rendered `entries` view from `all_entries` and the fuzzy
-    /// query, resetting row-index state (selection, cursor, rubber band).
+    /// query. Row indices change, so selection and cursor are carried over
+    /// by path; entries the filter hides drop out of the selection.
     fn rebuild_view(&mut self) {
-        self.selection.clear();
-        self.cursor = None;
-        self.anchor = None;
+        let selected: HashSet<String> = self
+            .selected_entries()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        let cursor_path = self
+            .cursor
+            .and_then(|ix| self.entries.get(ix))
+            .map(|entry| entry.path.clone());
         self.rubber = None;
         let query = self.search_query.trim();
-        if !self.search_active || query.is_empty() {
-            self.entries = self.all_entries.clone();
-            return;
-        }
-        self.entries = self
-            .all_entries
-            .iter()
-            .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
-            .cloned()
-            .collect();
+        self.entries = if !self.search_active || query.is_empty() {
+            self.all_entries.clone()
+        } else {
+            self.all_entries
+                .iter()
+                .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
+                .cloned()
+                .collect()
+        };
+        self.selection = select_paths(&self.entries, &selected);
+        self.cursor = cursor_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path));
+        self.anchor = self.cursor;
         // Preselect the first match so Enter opens it right away.
-        if let Some(first) = self.entries.iter().position(|entry| !entry.is_parent) {
-            self.selection.insert(first);
-            self.cursor = Some(first);
+        if self.search_active && !query.is_empty() && self.selection.is_empty() {
+            if let Some(first) = self.entries.iter().position(|entry| !entry.is_parent) {
+                self.selection.insert(first);
+                self.cursor = Some(first);
+                self.anchor = Some(first);
+            }
         }
     }
 
@@ -768,11 +876,10 @@ impl FilePane {
 
     /// Load a directory's subdirectories into the tree cache.
     fn tree_load(&mut self, dir: String, cx: &mut Context<Self>) {
-        if self.tree_loading.contains(&dir) {
+        let Some(provider) = self.provider().cloned() else { return };
+        if !self.tree_loading.insert(dir.clone()) {
             return;
         }
-        self.tree_loading.insert(dir.clone());
-        let provider = self.provider.clone();
         let show_hidden = self.show_hidden;
         let list_dir = dir.clone();
         let task = cx
@@ -1021,7 +1128,7 @@ impl FilePane {
     /// via `load_seq`.
     fn fetch_details(&mut self, cx: &mut Context<Self>) {
         let seq = self.load_seq;
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = self.path.clone();
         let scheme = self.profile.scheme.clone();
         let runtime = cx.global::<AppState>().runtime.handle().clone();
@@ -1076,6 +1183,11 @@ impl FilePane {
                     if this.load_seq != seq {
                         return;
                     }
+                    let sorted_by = match &detail {
+                        Detail::Permissions(_) => Column::Permissions,
+                        Detail::StorageClasses(_) => Column::StorageClass,
+                        Detail::Regions(_) => Column::Region,
+                    };
                     // `entries` holds clones of `all_entries`, so merge into
                     // both the source listing and the rendered view.
                     for entry in this.all_entries.iter_mut().chain(this.entries.iter_mut()) {
@@ -1098,6 +1210,9 @@ impl FilePane {
                             }
                         }
                     }
+                    if this.sort.column == Some(sorted_by) {
+                        this.apply_sort();
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -1117,7 +1232,7 @@ impl FilePane {
     /// Site backing this pane (0 = the reserved local-fs site), used to
     /// address transfer jobs.
     pub fn site_id(&self) -> i64 {
-        self.provider.site_id
+        self.profile.id
     }
 
     /// Current directory as a browse path (`""` = root, otherwise ends `/`).
@@ -1159,6 +1274,12 @@ impl FilePane {
         status
     }
 
+    /// A listing for another directory is in flight, so the visible rows
+    /// belong to the previous one and must not be acted on.
+    fn is_stale(&self) -> bool {
+        self.loading && self.loaded_path.as_deref() != Some(self.path.as_str())
+    }
+
     // --- selection model ---
 
     fn selectable(&self, ix: usize) -> bool {
@@ -1185,6 +1306,9 @@ impl FilePane {
     ) {
         window.focus(&self.focus_handle, cx);
         cx.emit(PaneEvent::Focused);
+        if self.is_stale() {
+            return;
+        }
         let Some(entry) = self.entries.get(ix).cloned() else {
             return;
         };
@@ -1194,6 +1318,8 @@ impl FilePane {
                 self.go_up(window, cx);
             } else if entry.is_dir {
                 self.navigate_to(entry.path, window, cx);
+            } else {
+                self.open_files(vec![entry], window, cx);
             }
             return;
         }
@@ -1223,7 +1349,7 @@ impl FilePane {
     /// context menu opens (Finder behavior).
     fn on_row_right_down(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
-        if self.selectable(ix) && !self.selection.contains(&ix) {
+        if !self.is_stale() && self.selectable(ix) && !self.selection.contains(&ix) {
             self.select_single(ix);
             cx.notify();
         }
@@ -1281,7 +1407,12 @@ impl FilePane {
         cx.notify();
     }
 
+    /// Enter / right arrow / double-click: a single folder is entered;
+    /// files open in their default app, extra folders in new tabs.
     fn activate(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_stale() {
+            return;
+        }
         let selected = self.selected_entries();
         if let [entry] = selected.as_slice() {
             if entry.is_dir {
@@ -1289,10 +1420,54 @@ impl FilePane {
                 return;
             }
         }
-        // Enter on files starts their transfer to the other pane.
-        let files: Vec<FsEntry> = selected.into_iter().filter(|entry| !entry.is_dir).collect();
-        if !files.is_empty() {
-            cx.emit(PaneEvent::CopyRequested(files));
+        let (dirs, files): (Vec<FsEntry>, Vec<FsEntry>) =
+            selected.into_iter().partition(|entry| entry.is_dir);
+        for dir in dirs {
+            cx.emit(PaneEvent::OpenInNewTab {
+                profile: self.profile.clone(),
+                path: dir.path,
+            });
+        }
+        self.open_files(files, window, cx);
+    }
+
+    /// Open files in their default app. Local files open in place; remote
+    /// ones go through the external-edit path, which downloads them and
+    /// uploads saves back.
+    fn open_files(&mut self, files: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile.scheme == "fs" {
+            let root = self.local_root();
+            for file in files {
+                let full = crate::localfs::full_path(&root, &file.path);
+                crate::ui::open_path_or_url(&full.to_string_lossy());
+            }
+        } else {
+            for file in files {
+                self.edit_external(file, window, cx);
+            }
+        }
+    }
+
+    /// Filesystem root of a local (fs) site.
+    fn local_root(&self) -> String {
+        self.profile
+            .options
+            .get("root")
+            .cloned()
+            .unwrap_or_else(crate::localfs::root)
+    }
+
+    fn copy_to_other_pane(&mut self, _: &CopyToOtherPane, _: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_entries();
+        if !selected.is_empty() && !self.is_stale() {
+            cx.emit(PaneEvent::CopyRequested(selected));
+        }
+    }
+
+    fn move_to_other_pane(&mut self, _: &MoveToOtherPane, _: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_entries();
+        if !selected.is_empty() && !self.is_stale() {
+            cx.emit(PaneEvent::MoveRequested(selected));
         }
     }
 
@@ -1352,12 +1527,15 @@ impl FilePane {
         if entry.is_bucket {
             return false;
         }
+        let Some(caps) = self.provider().map(|provider| provider.caps) else {
+            return false;
+        };
         if entry.is_dir {
             // On virtual-dir backends a directory is only a prefix, so
             // renaming it isn't a single server-side op.
-            self.provider.caps.rename && !self.provider.caps.virtual_dirs
+            caps.rename && !caps.virtual_dirs
         } else {
-            self.provider.caps.rename || self.provider.caps.copy
+            caps.rename || caps.copy
         }
     }
 
@@ -1390,8 +1568,8 @@ impl FilePane {
             window.push_notification("Quick Look works on remote files, not folders.", cx);
             return;
         }
-        let provider = self.provider.clone();
-        let tmp = quicklook_dir(self.provider.site_id, &self.path);
+        let Some(provider) = self.provider().cloned() else { return };
+        let tmp = quicklook_dir(self.site_id(), &self.path);
         let task = cx.global::<AppState>().runtime.spawn(async move {
             tokio::fs::create_dir_all(&tmp).await?;
             let mut paths = Vec::new();
@@ -1412,7 +1590,7 @@ impl FilePane {
                 Ok(paths) => preview_files(paths),
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "quick look failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1534,8 +1712,9 @@ impl FilePane {
 
     // --- drag & drop ---
 
-    /// Entries an internal drag drops here: enqueue transfers into `dst_dir`.
-    /// Dropping something onto the directory it's already in is a no-op.
+    /// Entries an internal drag drops here: enqueue transfers into `dst_dir`,
+    /// moving when Shift (macOS: also Cmd) is held. Dropping something onto
+    /// the directory it's already in is a no-op.
     fn accept_entries(
         &mut self,
         drag: &DraggedEntries,
@@ -1543,7 +1722,8 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dst_site = self.provider.site_id;
+        let dst_site = self.site_id();
+        let move_source = is_move_drop(&window.modifiers());
         let queue = cx.global::<AppState>().queue.clone();
         let mut queued = 0;
         for entry in &drag.entries {
@@ -1559,12 +1739,12 @@ impl FilePane {
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
                 conflict_policy: ConflictPolicy::Ask,
-                move_source: false,
+                move_source,
             });
             queued += 1;
         }
         if queued > 0 {
-            window.push_notification(format!("Queued {queued} item(s)."), cx);
+            window.push_notification(queued_message(queued), cx);
         }
     }
 
@@ -1610,7 +1790,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dst_site = self.provider.site_id;
+        let dst_site = self.site_id();
         let queue = cx.global::<AppState>().queue.clone();
         let mut queued = 0;
         for path in paths {
@@ -1630,7 +1810,7 @@ impl FilePane {
             queued += 1;
         }
         if queued > 0 {
-            window.push_notification(format!("Queued {queued} item(s)."), cx);
+            window.push_notification(queued_message(queued), cx);
         }
     }
 
@@ -1653,7 +1833,7 @@ impl FilePane {
             this.update_in(cx, |this, window, cx| {
                 if let Err(error) = result {
                     tracing::error!(error = %format!("{error:#}"), "file operation failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
                 this.reload(window, cx);
             })
@@ -1662,47 +1842,71 @@ impl FilePane {
         .detach();
     }
 
+    /// Confirm, then delete. Local entries go to the OS trash; remote
+    /// deletes are permanent and the dialog says so.
     fn confirm_delete(
         &mut self,
         entries: Vec<FsEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if entries.is_empty() {
+        if entries.is_empty() || self.is_stale() {
             return;
         }
         let pane = cx.entity().downgrade();
-        let title: SharedString = if let [entry] = entries.as_slice() {
-            format!(
-                "Delete {} `{}`?",
-                if entry.is_dir { "folder" } else { "file" },
-                entry.name
-            )
-            .into()
+        let to_trash = self.profile.scheme == "fs";
+        let bin = t(if cfg!(windows) {
+            "file_pane.trash.bin_windows"
         } else {
-            format!("Delete {} items?", entries.len()).into()
+            "file_pane.trash.bin"
+        });
+        let count = entries.len().to_string();
+        let (title_one, title_other) = if to_trash {
+            ("file_pane.trash.title_one", "file_pane.trash.title_other")
+        } else {
+            ("file_pane.delete.title_one", "file_pane.delete.title_other")
         };
-        let any_dir = entries.iter().any(|entry| entry.is_dir);
+        let title = match entries.as_slice() {
+            [entry] => tf(title_one, &[("name", &entry.name), ("bin", &bin)]),
+            _ => tf(title_other, &[("count", &count), ("bin", &bin)]),
+        };
+        let body = if to_trash {
+            tf("file_pane.trash.body", &[("bin", &bin)])
+        } else if entries.iter().any(|entry| entry.is_dir) {
+            t("file_pane.delete.body_folders")
+        } else {
+            t("file_pane.delete.body")
+        };
+        let ok_text = if to_trash {
+            tf("file_pane.trash.ok", &[("bin", &bin)])
+        } else {
+            t("file_pane.delete.ok")
+        };
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entries = entries.clone();
             dialog
                 .title(title.clone())
                 .width(px(380.))
-                .child(if any_dir {
-                    "Folders and everything in them will be deleted. This cannot be undone."
-                } else {
-                    "This cannot be undone."
-                })
+                .child(body.clone())
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text.clone())
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .on_ok(move |_, window, cx| {
                     let entries = entries.clone();
                     pane.update(cx, |this, cx| {
-                        let provider = this.provider.clone();
+                        let Some(provider) = this.provider().cloned() else { return };
                         this.spawn_op(
                             async move {
                                 for entry in entries {
-                                    provider.delete(&entry.path, entry.is_dir).await?;
+                                    if to_trash {
+                                        provider.trash(&entry.path).await?;
+                                    } else {
+                                        provider.delete(&entry.path, entry.is_dir).await?;
+                                    }
                                 }
                                 Ok(())
                             },
@@ -1756,7 +1960,7 @@ impl FilePane {
         if to == entry.path {
             return;
         }
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let from = entry.path.clone();
         self.spawn_op(async move { provider.rename(&from, &to).await }, window, cx);
     }
@@ -1779,7 +1983,7 @@ impl FilePane {
                     }
                     pane.update(cx, |this, cx| {
                         let path = format!("{}{name}/", this.path);
-                        let provider = this.provider.clone();
+                        let Some(provider) = this.provider().cloned() else { return };
                         this.spawn_op(async move { provider.create_dir(&path).await }, window, cx);
                     })
                     .ok();
@@ -1802,7 +2006,7 @@ impl FilePane {
         let count = entries.len();
         for entry in entries {
             queue.enqueue(NewJob {
-                src_site_id: self.provider.site_id,
+                src_site_id: self.site_id(),
                 dst_site_id: crate::queue::LOCAL_SITE_ID,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
@@ -1811,7 +2015,7 @@ impl FilePane {
                 move_source: false,
             });
         }
-        window.push_notification(format!("Queued {count} download(s)."), cx);
+        window.push_notification(queued_message(count), cx);
     }
 
     /// Download into the platform Downloads folder (falls back to the
@@ -1887,7 +2091,7 @@ impl FilePane {
     fn duplicate_entry(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
         let new_name = duplicate_name(&entry.name, &self.all_entries);
         let to = format!("{}{new_name}", parent_of(&entry.path));
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let from = entry.path.clone();
         self.spawn_op(async move { provider.copy(&from, &to).await }, window, cx);
     }
@@ -1900,7 +2104,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let task = cx
             .global::<AppState>()
@@ -1918,7 +2122,7 @@ impl FilePane {
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "presign failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1934,7 +2138,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let task = cx
             .global::<AppState>()
@@ -1949,7 +2153,7 @@ impl FilePane {
                 Ok(url) => crate::ui::open_path_or_url(&url),
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "presign failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1960,7 +2164,7 @@ impl FilePane {
     /// Recursively sum a folder and show the result right in the listing's
     /// Size column (the entry keeps it until the next reload).
     fn calc_folder_size(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let name = entry.name.clone();
         let seq = self.load_seq;
@@ -1990,7 +2194,7 @@ impl FilePane {
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "folder size failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -2001,7 +2205,7 @@ impl FilePane {
     /// Download to temp, open in the default app, and re-upload on save
     /// (see `crate::edit`).
     fn edit_external(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let queue = cx.global::<AppState>().queue.clone();
         let path = entry.path.clone();
         let name = entry.name.to_string();
@@ -2018,7 +2222,7 @@ impl FilePane {
             if let Err(error) = result {
                 tracing::error!(error = %format!("{error:#}"), "external edit failed");
                 this.update_in(cx, |_, window, cx| {
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 })
                 .ok();
             }
@@ -2033,7 +2237,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         self.spawn_op(
             async move { provider.set_storage_class(&path, class).await },
@@ -2049,7 +2253,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         self.spawn_op(async move { provider.set_acl(&path, acl).await }, window, cx);
     }
@@ -2057,7 +2261,7 @@ impl FilePane {
     /// chmod dialog: stat the current mode first so the input starts from
     /// what's actually on the server.
     fn permissions_dialog(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let known = entry.permissions;
         let task = cx
@@ -2106,7 +2310,7 @@ impl FilePane {
                         return false;
                     }
                     pane.update(cx, |this, cx| {
-                        let provider = this.provider.clone();
+                        let Some(provider) = this.provider().cloned() else { return };
                         let path = entry.path.clone();
                         this.spawn_op(
                             async move { provider.chmod(&path, mode).await },
@@ -2129,7 +2333,7 @@ impl FilePane {
     pub fn navigate_linked(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.linked_seq += 1;
         let seq = self.linked_seq;
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let target = path.clone();
         let task = cx.global::<AppState>().runtime.spawn(async move {
             if target.is_empty() {
@@ -2175,6 +2379,7 @@ impl FilePane {
     }
 
     pub fn navigate_to(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.path_error = None;
         if path != self.path {
             self.back_stack.push(std::mem::replace(&mut self.path, path));
             self.forward_stack.clear();
@@ -2237,6 +2442,7 @@ impl FilePane {
 
     fn begin_edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_path = true;
+        self.path_error = None;
         let display = self.display_url();
         let focus = self.path_input.focus_handle(cx);
         self.path_input.update(cx, |input, cx| {
@@ -2249,6 +2455,7 @@ impl FilePane {
     fn cancel_edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_path {
             self.editing_path = false;
+            self.path_error = None;
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
@@ -2330,7 +2537,13 @@ impl FilePane {
     }
 
     /// Reload the listing but keep the current selection (matched by name).
+    /// On a failed connection this retries connecting instead.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.connection {
+            Connection::Ready(_) => {}
+            Connection::Failed(_) => return self.connect(window, cx),
+            Connection::Connecting => return,
+        }
         self.pending_selection = Some(
             self.selected_entries()
                 .into_iter()
@@ -2350,12 +2563,12 @@ impl FilePane {
     }
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider().cloned() else { return };
         self.update_watch();
         self.linked_navigation = false;
         self.linked_seq += 1;
         self.load_seq += 1;
         let seq = self.load_seq;
-        let provider = self.provider.clone();
         let path = self.path.clone();
 
         let state = cx.global::<AppState>();
@@ -2378,11 +2591,29 @@ impl FilePane {
             });
         }
         self.loading = true;
+        self.slow_loading = false;
+        self.error = None;
+        self.details_open = false;
         self.selection.clear();
         self.cursor = None;
         self.anchor = None;
         self.rubber = None;
         cx.notify();
+
+        // Fast listings never show the spinner.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.load_seq == seq && this.loading {
+                    this.slow_loading = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
 
         cx.spawn_in(window, async move |this, cx| {
             let result = match list_task.await {
@@ -2394,6 +2625,7 @@ impl FilePane {
                     return;
                 }
                 this.loading = false;
+                this.slow_loading = false;
                 let pending = this.pending_selection.take();
                 match result {
                     Ok(mut entries) => {
@@ -2417,8 +2649,8 @@ impl FilePane {
                             );
                         }
                         this.all_entries = entries;
+                        this.loaded_path = Some(this.path.clone());
                         this.apply_sort();
-                        this.error = None;
                         cx.emit(PaneEvent::DirectoryLoaded { linked: this.linked_navigation });
                         this.fetch_details(cx);
                         // Selection-preserving refresh: re-select by name.
@@ -2435,10 +2667,11 @@ impl FilePane {
                         }
                     }
                     Err(error) => {
-                        tracing::error!(path = %this.path, %error, "listing failed");
+                        tracing::error!(path = %this.path, error = %format!("{error:#}"), "listing failed");
                         this.all_entries = Vec::new();
                         this.entries = Vec::new();
-                        this.error = Some(format!("{error:#}").into());
+                        this.loaded_path = None;
+                        this.error = Some(humanize(&error));
                         cx.emit(PaneEvent::LinkedNavigationFailed);
                     }
                 }
@@ -2601,21 +2834,24 @@ impl FilePane {
         } else {
             vec![entry.clone()]
         };
-        let ghost_label: SharedString = if let [single] = drag_entries.as_slice() {
+        let ghost_what: SharedString = if let [single] = drag_entries.as_slice() {
             single.name.clone()
         } else {
-            format!("{} items", drag_entries.len()).into()
+            items_label(drag_entries.len())
         };
         let payload = DraggedEntries {
-            site_id: self.provider.site_id,
+            site_id: self.site_id(),
             entries: drag_entries,
         };
-        let is_drag_source = !payload.entries.is_empty();
+        // Rows of a directory that is being replaced are inert.
+        // They dim only once the load is slow, so fast navigation doesn't
+        // flash.
+        let stale = self.is_stale();
+        let dimmed = stale && self.slow_loading;
+        let is_drag_source = !payload.entries.is_empty() && !stale;
 
         // Dirs (and the `..` row) accept drops into themselves.
-        let drop_dir = entry
-            .is_dir
-            .then(|| entry.path.clone());
+        let drop_dir = (entry.is_dir && !stale).then(|| entry.path.clone());
 
         let weak = cx.entity().downgrade();
         let entry_clone = entry.clone();
@@ -2627,9 +2863,10 @@ impl FilePane {
             .px_2()
             .gap_2()
             .text_sm()
-            .cursor_pointer()
+            .when(!stale, |el| el.cursor_pointer())
             .overflow_hidden()
-            .when(entry.is_hidden, |style| style.opacity(0.55))
+            .when(entry.is_hidden && !dimmed, |style| style.opacity(0.55))
+            .when(dimmed, |style| style.opacity(0.4))
             // A constant left border keeps content from shifting when the
             // selection accent appears.
             .border_l_2()
@@ -2655,8 +2892,8 @@ impl FilePane {
             .when(is_drag_source, |el| {
                 el.on_drag(payload, move |payload, grab_offset, _window, cx| {
                     cx.set_global(PendingDragOut(Some(payload.clone())));
-                    let label = ghost_label.clone();
-                    cx.new(|_| DragGhost { label, grab_offset })
+                    let what = ghost_what.clone();
+                    cx.new(|_| DragGhost { what, grab_offset })
                 })
             })
             .when_some(drop_dir, |el, dir| {
@@ -2701,6 +2938,179 @@ impl FilePane {
                         column.text_for(entry)
                     })
             }))
+    }
+
+    /// The centered state over the file list: connecting, a failed connect
+    /// or listing, a slow first load, an empty folder, or a filter with no
+    /// matches. `None` while rows tell the story themselves.
+    fn render_list_state(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let spinner = |cx: &mut Context<Self>| {
+            Spinner::new()
+                .color(cx.theme().muted_foreground)
+                .into_any_element()
+        };
+        let failure = |human: &Humanized| {
+            (human.title.clone().into(), human.hint.clone().map(SharedString::from), Some(human.details.clone()))
+        };
+        match &self.connection {
+            Connection::Connecting => {
+                let title = tf("file_pane.connecting", &[("site", &self.profile.name)]);
+                return Some(self.render_state(Some(spinner(cx)), title, None, None, Vec::new(), cx));
+            }
+            Connection::Failed(human) => {
+                let (title, hint, details) = failure(human);
+                let mut actions = vec![Button::new("connect-retry")
+                    .label(t("file_pane.retry"))
+                    .small()
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))];
+                if self.profile.id != crate::queue::LOCAL_SITE_ID {
+                    let site_id = self.profile.id;
+                    actions.push(
+                        Button::new("connect-edit-site")
+                            .label(t("file_pane.edit_site"))
+                            .small()
+                            .outline()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(PaneEvent::EditSite(site_id))
+                            })),
+                    );
+                }
+                let icon = Icon::new(IconName::CircleX)
+                    .text_color(cx.theme().danger)
+                    .into_any_element();
+                return Some(self.render_state(Some(icon), title, hint, details, actions, cx));
+            }
+            Connection::Ready(_) => {}
+        }
+        if let Some(human) = &self.error {
+            let (title, hint, details) = failure(human);
+            let actions = vec![
+                Button::new("list-retry")
+                    .label(t("file_pane.retry"))
+                    .small()
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                Button::new("list-go-up")
+                    .label(t("file_pane.go_up"))
+                    .small()
+                    .outline()
+                    .disabled(self.path.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
+            ];
+            let icon = Icon::new(IconName::TriangleAlert)
+                .text_color(cx.theme().danger)
+                .into_any_element();
+            return Some(self.render_state(Some(icon), title, hint, details, actions, cx));
+        }
+        if self.loading {
+            if !(self.slow_loading && self.entries.is_empty()) {
+                return None;
+            }
+            let title = t("file_pane.loading");
+            return Some(self.render_state(Some(spinner(cx)), title, None, None, Vec::new(), cx));
+        }
+        if self.entries.iter().any(|entry| !entry.is_parent) {
+            return None;
+        }
+        let query = self.search_query.trim();
+        if self.search_active && !query.is_empty() {
+            let title = tf("file_pane.no_matches", &[("query", query)]);
+            let actions = vec![Button::new("clear-filter")
+                .label(t("file_pane.clear_filter"))
+                .small()
+                .outline()
+                .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx)))];
+            let icon = Icon::new(IconName::Search)
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element();
+            return Some(self.render_state(Some(icon), title, None, None, actions, cx));
+        }
+        let icon = Icon::new(IconName::FolderOpen)
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element();
+        let hint = Some(t("file_pane.empty_hint"));
+        Some(self.render_state(Some(icon), t("file_pane.empty"), hint, None, Vec::new(), cx))
+    }
+
+    /// One centered list state: icon, title, hint, an optional "Details"
+    /// disclosure for the raw error chain, and actions.
+    fn render_state(
+        &self,
+        icon: Option<gpui::AnyElement>,
+        title: SharedString,
+        hint: Option<SharedString>,
+        details: Option<String>,
+        actions: Vec<Button>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let details_open = self.details_open;
+        v_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .text_sm()
+            .text_center()
+            .children(icon)
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(cx.theme().foreground)
+                    .child(title),
+            )
+            .children(hint.map(|hint| {
+                div()
+                    .max_w(px(420.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint)
+            }))
+            .when(!actions.is_empty(), |el| {
+                el.child(h_flex().pt_1().gap_2().children(actions))
+            })
+            .children(details.map(|details| {
+                v_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("toggle-details")
+                            .label(if details_open {
+                                t("file_pane.hide_details")
+                            } else {
+                                t("file_pane.show_details")
+                            })
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.details_open = !this.details_open;
+                                cx.notify();
+                            })),
+                    )
+                    .when(details_open, |el| {
+                        el.child(
+                            div()
+                                .id("error-details")
+                                .max_w(px(420.))
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .text_left()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(details),
+                        )
+                    })
+            }))
+            .into_any_element()
     }
 
     /// The translucent rubber-band rectangle, converted back from content to
@@ -2766,9 +3176,15 @@ fn build_context_menu(
     }
     let (selected, caps, scheme, is_local) = {
         let pane = pane.read(cx);
+        let Some(caps) = pane.provider().map(|provider| provider.caps) else {
+            return menu;
+        };
+        if pane.is_stale() {
+            return menu;
+        }
         (
             pane.selected_entries(),
-            pane.provider.caps,
+            caps,
             pane.profile.scheme.clone(),
             pane.site_id() == crate::queue::LOCAL_SITE_ID,
         )
@@ -2827,30 +3243,39 @@ fn build_context_menu(
                 .ok();
             }
         }));
-    } else {
-        menu = menu.item(PopupMenuItem::new(plural("Upload")).on_click({
-            let pane = weak.clone();
-            let selected = selected.clone();
-            move |_, _, cx| {
-                pane.update(cx, |_, cx| {
-                    cx.emit(PaneEvent::CopyRequested(selected.clone()))
-                })
-                .ok();
-            }
-        }));
     }
-    // Transfer to the other pane with move semantics (sources are deleted
-    // after each file arrives safely).
-    menu = menu.item(PopupMenuItem::new("Move to Other Pane…").on_click({
-        let pane = weak.clone();
-        let selected = selected.clone();
-        move |_, _, cx| {
-            pane.update(cx, |_, cx| {
-                cx.emit(PaneEvent::MoveRequested(selected.clone()))
-            })
-            .ok();
-        }
-    }));
+    // Pane-to-pane transfers; a move deletes each source once it arrived
+    // safely. The actions only label the shortcuts, the click handlers act
+    // on the selection captured here.
+    menu = menu
+        .item(
+            PopupMenuItem::new(t("file_pane.menu.copy_to_other"))
+                .action(Box::new(CopyToOtherPane))
+                .on_click({
+                    let pane = weak.clone();
+                    let selected = selected.clone();
+                    move |_, _, cx| {
+                        pane.update(cx, |_, cx| {
+                            cx.emit(PaneEvent::CopyRequested(selected.clone()))
+                        })
+                        .ok();
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(t("file_pane.menu.move_to_other"))
+                .action(Box::new(MoveToOtherPane))
+                .on_click({
+                    let pane = weak.clone();
+                    let selected = selected.clone();
+                    move |_, _, cx| {
+                        pane.update(cx, |_, cx| {
+                            cx.emit(PaneEvent::MoveRequested(selected.clone()))
+                        })
+                        .ok();
+                    }
+                }),
+        );
     if row_entry.is_dir {
         menu = menu.item(PopupMenuItem::new("Open in new tab").on_click({
             let pane = weak.clone();
@@ -3070,6 +3495,8 @@ impl Render for FilePane {
         let pane_dir = self.path.clone();
         let pane_dir_ext = pane_dir.clone();
         let tree_panel = self.render_tree_panel(cx);
+        let list_state = self.render_list_state(cx);
+        let connected = self.provider().is_some();
 
         v_flex()
             .size_full()
@@ -3100,6 +3527,8 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::search_action))
             .on_action(cx.listener(Self::toggle_tree))
             .on_action(cx.listener(Self::edit_path))
+            .on_action(cx.listener(Self::copy_to_other_pane))
+            .on_action(cx.listener(Self::move_to_other_pane))
             // Typing a printable character starts type-to-search.
             .on_key_down(cx.listener(Self::on_pane_key_down))
             // Column resize: the header handle sets `resizing`; the pane
@@ -3211,12 +3640,20 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
                     )
                     .child(div().flex_1().min_w_0().child(self.render_path_bar(cx)))
+                    .when(self.slow_loading, |el| {
+                        el.child(
+                            Spinner::new()
+                                .small()
+                                .color(cx.theme().muted_foreground),
+                        )
+                    })
                     .child(
                         Button::new("upload")
                             .icon(Icon::new(IconName::ArrowUp))
                             .label("Upload…")
                             .ghost()
                             .small()
+                            .disabled(!connected)
                             .tooltip("Upload files or full folders into this directory")
                             .on_click(cx.listener(|this, _, window, cx| this.upload(window, cx))),
                     )
@@ -3225,6 +3662,7 @@ impl Render for FilePane {
                             .icon(Icon::default().path("icons/folder-plus.svg"))
                             .ghost()
                             .small()
+                            .disabled(!connected)
                             .tooltip("New folder")
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
@@ -3240,6 +3678,16 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
             )
+            .children(self.path_error.clone().map(|message| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(message)
+            }))
             // Folder tree + header/list/status column. Side-by-side (narrow)
             // panes stack the tree above the list (v_flex); otherwise it sits
             // to the left (h_flex).
@@ -3417,17 +3865,7 @@ impl Render for FilePane {
                     )
                     .child(bounds_probe)
                     .children(self.render_rubber_band(cx))
-                    .when(self.loading && self.entries.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_2()
-                                .left_2()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Loading…"),
-                        )
-                    }),
+                    .children(list_state),
             )
             .when(self.search_active, |el| {
                 let matches = self
@@ -3483,16 +3921,6 @@ impl Render for FilePane {
                         ),
                 )
             })
-            .children(self.error.clone().map(|error| {
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .text_color(gpui::rgb(0xdc2626))
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(error)
-            }))
             )
             })
     }
@@ -3614,20 +4042,117 @@ fn parent_of(path: &str) -> String {
     }
 }
 
-/// Path-bar input → OpenDAL dir path. Accepts both plain paths and the
-/// URL form the bar displays (`scheme://site/path`) — the authority part is
-/// informational; only the path after it navigates.
-fn parse_path_input(input: &str) -> String {
+/// What the path bar's text points at.
+#[derive(Debug, PartialEq)]
+enum PathInput {
+    /// A directory on this pane's site (OpenDAL dir path).
+    Here(String),
+    /// A URL on another site or server, as `scheme://authority`.
+    Elsewhere(String),
+}
+
+/// Path-bar input → target. Plain paths browse this site. URLs browse it
+/// only when their authority is this site: the name the bar displays
+/// (`scheme://site/path`), the server host, or (S3) the bucket.
+fn parse_path_input(input: &str, profile: &SiteProfile) -> PathInput {
     let input = input.trim();
-    if let Some(ix) = input.find("://") {
-        let rest = &input[ix + 3..];
-        match rest.find('/') {
-            Some(slash) => normalize_path(&rest[slash + 1..]),
-            None => String::new(),
-        }
-    } else {
-        normalize_path(input)
+    let Some((scheme, rest)) = input.split_once("://") else {
+        return PathInput::Here(normalize_path(input));
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let elsewhere = || PathInput::Elsewhere(format!("{scheme}://{authority}"));
+    let is_fs = profile.scheme == "fs";
+    if is_fs && scheme.eq_ignore_ascii_case("file") {
+        return if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+            PathInput::Here(normalize_path(path))
+        } else {
+            elsewhere()
+        };
     }
+    if !scheme.eq_ignore_ascii_case(&profile.scheme) {
+        return elsewhere();
+    }
+    // Exact, as the bar displays it; a case-insensitive match could shadow
+    // an S3 bucket of the same name.
+    if authority == profile.name {
+        return PathInput::Here(normalize_path(path));
+    }
+    if profile.scheme == "s3" {
+        let root = profile
+            .options
+            .get("root")
+            .map(|root| root.trim_matches('/'))
+            .unwrap_or("");
+        return match profile.options.get("bucket").filter(|bucket| !bucket.is_empty()) {
+            // Bucket-root site: the bucket is the first browse segment.
+            None => PathInput::Here(normalize_path(&format!("{authority}/{path}"))),
+            Some(bucket) if bucket == authority => {
+                let path = path.trim_start_matches('/');
+                if root.is_empty() {
+                    PathInput::Here(normalize_path(path))
+                } else if let Some(rest) = path.strip_prefix(root).filter(|rest| {
+                    rest.is_empty() || rest.starts_with('/')
+                }) {
+                    PathInput::Here(normalize_path(rest))
+                } else {
+                    elsewhere()
+                }
+            }
+            Some(_) => elsewhere(),
+        };
+    }
+    let site_host = profile.options.get("endpoint").map(|endpoint| url_host(endpoint));
+    if site_host.is_some_and(|host| !host.is_empty() && host.eq_ignore_ascii_case(url_host(authority))) {
+        PathInput::Here(normalize_path(path))
+    } else {
+        elsewhere()
+    }
+}
+
+/// Host part of a URL or authority: `ssh://user@host:22/x` → `host`.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    host.split(':').next().unwrap_or(host)
+}
+
+/// Indices of the non-`..` rows whose paths are in `paths`.
+fn select_paths(entries: &[FsEntry], paths: &HashSet<String>) -> BTreeSet<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_parent && paths.contains(&entry.path))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// "1 item" / "N items".
+fn items_label(count: usize) -> SharedString {
+    if count == 1 {
+        t("file_pane.items.one")
+    } else {
+        tf("file_pane.items.other", &[("count", &count.to_string())])
+    }
+}
+
+fn queued_message(count: usize) -> SharedString {
+    if count == 1 {
+        t("file_pane.queued.one")
+    } else {
+        tf("file_pane.queued.other", &[("count", &count.to_string())])
+    }
+}
+
+/// Show a failed operation in plain words: the humanized title, with the
+/// next step as the message when there is one.
+fn notify_error(error: &anyhow::Error, window: &mut Window, cx: &mut App) {
+    let human = humanize(error);
+    let note = match human.hint {
+        Some(hint) => Notification::error(hint).title(human.title),
+        None => Notification::error(human.title),
+    };
+    window.push_notification(note, cx);
 }
 
 /// User input → OpenDAL dir path: no leading `/`, trailing `/` unless root.
@@ -3698,5 +4223,53 @@ mod tests {
         entries.sort_by(|a, b| sort.compare(a, b));
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, ["zdir", "big", "small"]);
+    }
+
+    fn site(scheme: &str, name: &str, options: &[(&str, &str)]) -> SiteProfile {
+        SiteProfile {
+            id: 7,
+            name: name.to_string(),
+            scheme: scheme.to_string(),
+            options: options
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn path_input_only_browses_its_own_site() {
+        let prod = site("sftp", "Prod", &[("endpoint", "ssh://prod.example.com:22")]);
+        let here = |path: &str| PathInput::Here(path.to_string());
+        assert_eq!(parse_path_input("/var/www", &prod), here("var/www/"));
+        assert_eq!(parse_path_input("sftp://Prod/var/", &prod), here("var/"));
+        assert_eq!(parse_path_input("sftp://me@prod.example.com/srv", &prod), here("srv/"));
+        assert_eq!(
+            parse_path_input("sftp://staging.example.com/srv", &prod),
+            PathInput::Elsewhere("sftp://staging.example.com".to_string())
+        );
+        assert_eq!(
+            parse_path_input("s3://Prod/x", &prod),
+            PathInput::Elsewhere("s3://Prod".to_string())
+        );
+
+        let bucket = site("s3", "Assets", &[("bucket", "assets"), ("root", "/public/")]);
+        assert_eq!(parse_path_input("s3://assets/public/img", &bucket), here("img/"));
+        assert!(matches!(parse_path_input("s3://assets/private", &bucket), PathInput::Elsewhere(_)));
+        let account = site("s3", "AWS", &[]);
+        assert_eq!(parse_path_input("s3://logs/2026/", &account), here("logs/2026/"));
+
+        let local = site("fs", "Local", &[]);
+        assert_eq!(parse_path_input("file:///Users/ada", &local), here("Users/ada/"));
+    }
+
+    #[test]
+    fn selection_follows_paths_across_rebuilds() {
+        let mut parent = entry("..");
+        parent.is_parent = true;
+        let entries = vec![parent, entry("b"), entry("a"), entry("c")];
+        let paths: HashSet<String> = ["a", "c", "..", "gone"].map(String::from).into();
+        assert_eq!(select_paths(&entries, &paths), BTreeSet::from([2, 3]));
     }
 }
