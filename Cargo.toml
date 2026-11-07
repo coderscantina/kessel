@@ -92,6 +92,9 @@ futures = "0.3"
 # set mtime, so the fs backend gets a native escape hatch.
 filetime = "0.2"
 
+# Local deletes from the file pane go to the OS trash / Recycle Bin.
+trash = "5.3"
+
 # Secrets — OS keychain only, never SQLite. keyring 4's default `v1` feature
 # wires up each platform's native store (macOS Keychain, Windows Credential
 # Manager, Linux Secret Service) with the right backend sub-features.

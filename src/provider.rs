@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use opendal::layers::{
     ConcurrentLimitLayer, LoggingLayer, RetryLayer, ThrottleLayer, TimeoutLayer, TracingLayer,
 };
@@ -275,11 +276,40 @@ impl Provider {
         Ok(())
     }
 
+    /// Move one local entry to the OS trash (fs sites only). Remote deletes
+    /// have no trash and go through [`Provider::delete`].
+    pub async fn trash(&self, path: &str) -> Result<()> {
+        anyhow::ensure!(self.scheme == "fs", "only local files can go to the trash");
+        let full = self.fs_path(path.trim_end_matches('/'));
+        tokio::task::spawn_blocking(move || {
+            trash::delete(&full).with_context(|| format!("moving `{}` to the trash", full.display()))
+        })
+        .await
+        .context("trash task panicked")?
+    }
+
     /// Rename within one operator: server-side where the backend supports
-    /// it, otherwise a copy + delete fallback (files only).
+    /// it, otherwise a copy + delete fallback (files only). Refuses to
+    /// replace an existing destination.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let (op, from_rel) = self.op_for(from)?;
         let (_, to_rel) = self.op_for(to)?;
+        // A case-only rename stats the source itself on case-insensitive
+        // filesystems, so it skips the existence check.
+        if from_rel.to_lowercase() != to_rel.to_lowercase() {
+            match op.stat(&to_rel).await {
+                Ok(_) => {
+                    let name = to_rel.trim_end_matches('/').rsplit('/').next().unwrap_or(&to_rel);
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::AlreadyExists,
+                        format!("`{name}` already exists"),
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if self.caps.rename {
             op.rename(&from_rel, &to_rel).await?;
         } else if self.caps.copy {
@@ -603,6 +633,9 @@ impl Provider {
     }
 }
 
+/// Stats in flight at once while filling metadata for a listing.
+const STAT_CONCURRENCY: usize = 16;
+
 /// List one operator path, mapping entries to browse paths under `prefix`
 /// (`""` for single-operator sites, `"bucket/"` in bucket-root mode).
 ///
@@ -619,7 +652,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
     let fs_root = (info.scheme() == "fs").then(|| info.root().to_string());
 
     let mut entries = Vec::new();
-    let mut stats = tokio::task::JoinSet::new();
+    let mut needs_stat = Vec::new();
     for entry in raw {
         if entry.path() == path {
             continue;
@@ -627,10 +660,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
         let meta = entry.metadata();
         let is_symlink = meta.mode() == opendal::EntryMode::Unknown;
         if meta.last_modified().is_none() || is_symlink {
-            let op = op.clone();
-            let rel = entry.path().to_string();
-            let ix = entries.len();
-            stats.spawn(async move { (ix, op.stat(&rel).await.ok()) });
+            needs_stat.push((entries.len(), entry.path().to_string()));
         }
         let permissions = fs_root.as_deref().and_then(|root| {
             let full = crate::localfs::full_path(root, entry.path());
@@ -648,9 +678,17 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
             storage_class: None,
         });
     }
-    while let Some(joined) = stats.join_next().await {
+    // Bounded so a folder with thousands of entries doesn't fire thousands
+    // of stats at once.
+    let mut stats = futures::stream::iter(needs_stat)
+        .map(|(ix, rel)| {
+            let op = op.clone();
+            async move { (ix, op.stat(&rel).await.ok()) }
+        })
+        .buffer_unordered(STAT_CONCURRENCY);
+    while let Some((ix, meta)) = stats.next().await {
         // A failed stat (e.g. dangling symlink) keeps the bare list entry.
-        let Ok((ix, Some(meta))) = joined else { continue };
+        let Some(meta) = meta else { continue };
         let entry = &mut entries[ix];
         entry.size = meta.content_length();
         entry.modified = meta.last_modified().and_then(to_datetime);
