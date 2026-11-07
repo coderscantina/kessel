@@ -35,7 +35,7 @@ mod zed;
 
 use anyhow::Result;
 use gpui::{
-    px, size, App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds,
+    px, size, App, AppContext as _, Bounds, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
 use gpui_component::Root;
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
         "kessel state loaded"
     );
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         app::init(cx);
         // Graceful queue shutdown: running workers checkpoint their offsets
         // and settle partial writes before the process exits (bounded so a

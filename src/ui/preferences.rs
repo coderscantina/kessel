@@ -364,7 +364,7 @@ impl PreferencesPanel {
                 .default_value(cfg.transfers.max_parallel as f32)
         });
         cx.subscribe(&parallel, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             save(
                 cx,
                 "transfers",
@@ -384,7 +384,7 @@ impl PreferencesPanel {
                 .default_value(cfg.transfers.bandwidth_limit as f32 / MB)
         });
         cx.subscribe(&bandwidth, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             save(
                 cx,
                 "transfers",

@@ -8,9 +8,19 @@ homepage = "https://www.coderscantina.com"
 license = "MIT"
 
 [dependencies]
-# GUI — both published on crates.io; gpui-component 0.5 depends on gpui ^0.2.2
-gpui = "0.2"
-gpui-component = "0.5"
+# GUI — both published on crates.io. gpui-component 0.6 pins `gpui-pre` (a
+# crates.io snapshot of zed's gpui newer than the 0.2 release), so kessel
+# imports the same crate under the `gpui` name to keep one gpui in the tree.
+gpui = { package = "gpui-pre", version = "0.3.6" }
+gpui-component = "0.6"
+# The native platform backends moved out of gpui into gpui_platform; its
+# `application()` picks the right one for the target. Features mirror the
+# defaults gpui itself had before the split.
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.6", features = [
+  "font-kit",
+  "wayland",
+  "x11",
+] }
 
 # Async runtime (OpenDAL + sqlx are async). gpui has its own executor; kessel
 # owns a dedicated tokio runtime (held in AppState) for all I/O work.
@@ -165,7 +175,7 @@ block2 = "0.6"
 # feature unification adds no compile weight — only the Com_Marshal module is
 # new here.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Storage_FileSystem",
@@ -181,7 +191,7 @@ windows = { version = "0.61", features = [
 ] }
 # `#[implement]` expands to `::windows_core::…` paths, so the COM data object
 # needs windows-core named directly (gpui pins the same version).
-windows-core = "0.61"
+windows-core = "0.62"
 
 # Windows resource section: the app icon Explorer and the taskbar show, plus
 # the version/company strings the file properties dialog reads. Compiled into

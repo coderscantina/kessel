@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, div, px, AnyElement, App, Context, Corner, DispatchPhase, Entity, EntityId,
+    actions, canvas, div, px, AnyElement, App, Context, Anchor, DispatchPhase, Entity, EntityId,
     FocusHandle, Focusable as _, Global, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::DialogFooter;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::popover::Popover;
@@ -366,7 +367,7 @@ impl KesselApp {
                 .default_value(queue_snap.max_parallel as f32)
         });
         cx.subscribe(&parallel_slider, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             cx.global::<AppState>()
                 .queue
                 .set_max_parallel(value.start() as usize);
@@ -381,7 +382,7 @@ impl KesselApp {
                 .default_value(queue_snap.bandwidth_limit as f32 / MB)
         });
         cx.subscribe(&throttle_slider, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             cx.global::<AppState>()
                 .queue
                 .set_bandwidth((value.start() * MB) as u64);
@@ -905,7 +906,7 @@ impl KesselApp {
             }
             workspace.active = 1 - workspace.active;
             let focus = workspace.panes[workspace.active].focus_handle(cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
             cx.notify();
         }
     }
@@ -1146,27 +1147,30 @@ impl KesselApp {
                 .w(px(420.))
                 .overlay_closable(!installing)
                 .child(body)
-                .footer(move |_ok, _cancel, _window, _cx| {
+                .footer({
                     let install_app = footer_app.clone();
                     let install_info = footer_info.clone();
-                    vec![
-                        Button::new("update-later")
-                            .label(t("update.dialog.later"))
-                            .ghost()
-                            .disabled(installing)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                        Button::new("update-install")
-                            .label(t("update.dialog.install"))
-                            .primary()
-                            .loading(installing)
-                            .disabled(installing)
-                            .on_click(move |_, _, cx| {
-                                let info = install_info.clone();
-                                install_app
-                                    .update(cx, |this, cx| this.start_install(info, cx))
-                                    .ok();
-                            }),
-                    ]
+                    DialogFooter::new()
+                        .child(
+                            Button::new("update-later")
+                                .label(t("update.dialog.later"))
+                                .ghost()
+                                .disabled(installing)
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("update-install")
+                                .label(t("update.dialog.install"))
+                                .primary()
+                                .loading(installing)
+                                .disabled(installing)
+                                .on_click(move |_, _, cx| {
+                                    let info = install_info.clone();
+                                    install_app
+                                        .update(cx, |this, cx| this.start_install(info, cx))
+                                        .ok();
+                                }),
+                        )
                 })
         });
     }
@@ -1231,7 +1235,7 @@ impl KesselApp {
         cx.subscribe_in(&bar, window, Self::on_command_bar_event)
             .detach();
         let focus = bar.read(cx).focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         self.command_bar = Some(bar);
         cx.notify();
     }
@@ -1263,7 +1267,7 @@ impl KesselApp {
                         if let Some(tab) = self.active_tab() {
                             if let TabContent::Panes(workspace) = &tab.content {
                                 let focus = workspace.panes[workspace.active].focus_handle(cx);
-                                window.focus(&focus);
+                                window.focus(&focus, cx);
                             }
                         }
                         match cx.build_action(name, None) {
@@ -1349,7 +1353,7 @@ impl KesselApp {
     fn confirm_quit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.quit_dialog_open = true;
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
             let reset = move |cx: &mut App| {
                 app.update(cx, |this, _| this.quit_dialog_open = false).ok();
@@ -1357,7 +1361,7 @@ impl KesselApp {
             let on_cancel_reset = reset.clone();
             dialog
                 .title("Transfers are running")
-                .w(px(440.))
+                .width(px(440.))
                 .child(format!(
                     "Quitting pauses running transfers and resumes them the next \
                      time kessel starts. Keep holding {} to quit without asking.",
@@ -1880,11 +1884,11 @@ impl KesselApp {
             return;
         };
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
             dialog
                 .title(format!("Delete bookmark `{name}`?"))
-                .w(px(380.))
+                .width(px(380.))
                 .child("Its saved connection settings and secrets are removed for good.")
                 .confirm()
                 .on_ok(move |_, _, cx| {
@@ -1968,12 +1972,12 @@ impl KesselApp {
     fn new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("folder name"));
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
             let input = input.clone();
             dialog
                 .title("New folder")
-                .w(px(380.))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, _, cx| {
@@ -2190,7 +2194,7 @@ impl KesselApp {
         })
         .detach();
         let focus = input.focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         self.rename = Some((target, input));
         cx.notify();
     }
@@ -2870,7 +2874,7 @@ impl KesselApp {
         let app = cx.entity().downgrade();
         let name_input = self.space_name_input.clone();
         Popover::new("new-space")
-            .anchor(Corner::BottomRight)
+            .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("add-space")
                     .icon(Icon::new(IconName::Plus))
@@ -3165,7 +3169,7 @@ impl KesselApp {
         let parallel = self.parallel_slider.clone();
         let throttle = self.throttle_slider.clone();
         Popover::new("queue-limits")
-            .anchor(Corner::BottomRight)
+            .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("queue-limits-trigger")
                     .icon(Icon::default().path("icons/gauge.svg"))
@@ -3331,7 +3335,7 @@ impl KesselApp {
                         .child(
                             div()
                                 .w(px(120.))
-                                .child(Progress::new().value(stats.percent())),
+                                .child(Progress::new("status-progress").value(stats.percent())),
                         ),
                 )
             })
@@ -3583,7 +3587,7 @@ impl Render for KesselApp {
             if let Some(tab) = self.active_tab() {
                 if let TabContent::Panes(workspace) = &tab.content {
                     let focus = workspace.panes[workspace.active].focus_handle(cx);
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                 }
             }
         }
@@ -3591,7 +3595,7 @@ impl Render for KesselApp {
         // (empty space, freshly closed dialog), park it on the workspace so
         // Workspace-context bindings (quit, tabs, panels) keep firing.
         if window.focused(cx).is_none() && self.rename.is_none() {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
 
         // Where the OS draws no menu bar, kessel draws one in its title bar.
@@ -3600,7 +3604,7 @@ impl Render for KesselApp {
         if !cfg!(target_os = "macos") {
             let epoch = crate::menu::epoch();
             if self.menu_bar.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
-                let bar = gpui_component::menu::AppMenuBar::new(window, cx);
+                let bar = gpui_component::menu::AppMenuBar::new(cx);
                 self.menu_bar = Some((epoch, bar));
             }
         }
@@ -3853,7 +3857,7 @@ pub fn watch_config(cx: &mut App) {
                 .await;
             while rx.try_recv().is_ok() {}
 
-            let applied = cx.update(|cx| {
+            cx.update(|cx| {
                 let new = match crate::config::load() {
                     Ok(new) => new,
                     Err(error) => {
@@ -3908,9 +3912,6 @@ pub fn watch_config(cx: &mut App) {
                 state.config_epoch += 1;
                 cx.refresh_windows();
             });
-            if applied.is_err() {
-                break;
-            }
         }
     })
     .detach();

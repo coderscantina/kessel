@@ -541,7 +541,7 @@ impl TransfersPanel {
                     )
                     .child(controls),
             )
-            .child(Progress::new().value(percent))
+            .child(Progress::new("job-progress").value(percent))
             .child(
                 div()
                     .text_xs()
@@ -899,7 +899,7 @@ impl Render for TransfersPanel {
                         .child(
                             div()
                                 .w(px(160.))
-                                .child(Progress::new().value(stats.percent())),
+                                .child(Progress::new("queue-progress").value(stats.percent())),
                         )
                         .child(
                             div()

@@ -297,7 +297,7 @@ impl Render for CommandBar {
                                 .collect()
                         }),
                     )
-                    .track_scroll(self.scroll_handle.clone())
+                    .track_scroll(&self.scroll_handle)
                     .flex_1()
                     .min_h_0(),
                 )

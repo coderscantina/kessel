@@ -144,7 +144,7 @@ fn watch(ui: UiConfig, cx: &mut App) {
                 .await;
             while rx.try_recv().is_ok() {}
 
-            let reloaded = cx.update(|cx| {
+            cx.update(|cx| {
                 tracing::info!("reloading themes and icon themes");
                 // Read the live config so a hot-reloaded theme/icon-theme
                 // selection isn't overridden by the startup snapshot.
@@ -156,9 +156,6 @@ fn watch(ui: UiConfig, cx: &mut App) {
                 FileIcons::reload(&ui, cx);
                 cx.refresh_windows();
             });
-            if reloaded.is_err() {
-                break;
-            }
         }
     })
     .detach();

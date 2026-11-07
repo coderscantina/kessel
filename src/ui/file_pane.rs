@@ -665,7 +665,7 @@ impl FilePane {
         self.search_input.update(cx, |input, cx| {
             input.set_value(seed, window, cx);
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         self.rebuild_view();
         cx.notify();
     }
@@ -679,7 +679,7 @@ impl FilePane {
         self.search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.rebuild_view();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -687,7 +687,7 @@ impl FilePane {
         if self.search_active {
             // Already open: just refocus the input.
             let focus = self.search_input.focus_handle(cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         } else {
             self.start_search("", window, cx);
         }
@@ -1183,7 +1183,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.emit(PaneEvent::Focused);
         let Some(entry) = self.entries.get(ix).cloned() else {
             return;
@@ -1222,7 +1222,7 @@ impl FilePane {
     /// Right-click on an unselected row moves the selection there before the
     /// context menu opens (Finder behavior).
     fn on_row_right_down(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if self.selectable(ix) && !self.selection.contains(&ix) {
             self.select_single(ix);
             cx.notify();
@@ -1438,7 +1438,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.emit(PaneEvent::Focused);
         let Some(point) = self.content_point(event.position) else {
             return;
@@ -1683,12 +1683,12 @@ impl FilePane {
             format!("Delete {} items?", entries.len()).into()
         };
         let any_dir = entries.iter().any(|entry| entry.is_dir);
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entries = entries.clone();
             dialog
                 .title(title.clone())
-                .w(px(380.))
+                .width(px(380.))
                 .child(if any_dir {
                     "Folders and everything in them will be deleted. This cannot be undone."
                 } else {
@@ -1719,13 +1719,13 @@ impl FilePane {
     fn rename_dialog(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(entry.name.clone()));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entry = entry.clone();
             let input = input.clone();
             dialog
                 .title("Rename")
-                .w(px(380.))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -1764,12 +1764,12 @@ impl FilePane {
     fn new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("folder name"));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let input = input.clone();
             dialog
                 .title("New folder")
-                .w(px(380.))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -2087,13 +2087,13 @@ impl FilePane {
         let initial = format!("{:03o}", mode.unwrap_or(0o644));
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entry = entry.clone();
             let input = input.clone();
             dialog
                 .title(format!("Permissions for `{}`", entry.name))
-                .w(px(380.))
+                .width(px(380.))
                 .child("Octal mode, e.g. 644 or 755.")
                 .child(Input::new(&input))
                 .confirm()
@@ -2242,14 +2242,14 @@ impl FilePane {
         self.path_input.update(cx, |input, cx| {
             input.set_value(display, window, cx);
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
     fn cancel_edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_path {
             self.editing_path = false;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -3412,7 +3412,7 @@ impl Render for FilePane {
                                 range.map(|ix| this.render_row(ix, cx)).collect()
                             }),
                         )
-                        .track_scroll(self.scroll_handle.clone())
+                        .track_scroll(&self.scroll_handle)
                         .size_full(),
                     )
                     .child(bounds_probe)
