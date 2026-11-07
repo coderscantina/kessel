@@ -430,6 +430,19 @@ pub enum DefaultConflictPolicy {
     ReplaceIfNewer,
 }
 
+impl DefaultConflictPolicy {
+    /// The value as written in config.json5.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Replace => "replace",
+            Self::Skip => "skip",
+            Self::KeepBoth => "keep_both",
+            Self::ReplaceIfNewer => "replace_if_newer",
+        }
+    }
+}
+
 impl From<DefaultConflictPolicy> for crate::queue::ConflictPolicy {
     fn from(policy: DefaultConflictPolicy) -> Self {
         match policy {
