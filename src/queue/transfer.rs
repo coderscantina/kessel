@@ -162,6 +162,12 @@ fn resumes_by_append(caps: &Capabilities) -> bool {
     caps.write_can_append && !caps.virtual_dirs
 }
 
+/// Part size for a streamed upload of `size` bytes: S3 allows 10,000 parts,
+/// and the last one may be short.
+fn part_size(size: u64) -> u64 {
+    CHUNK.max(size.div_ceil(9_999))
+}
+
 /// `path` with its file name replaced by `name`.
 fn sibling(path: &str, name: &str) -> String {
     format!("{}{name}", &path[..path.len() - file_name(path).len()])
@@ -447,7 +453,7 @@ async fn run_inner(
     } else {
         write_op
             .writer_with(dest.write_path())
-            .chunk(CHUNK as usize)
+            .chunk(part_size(size) as usize)
             .await
             .with_context(|| format!("open destination `{}`", task.dst))?
     };
@@ -995,6 +1001,15 @@ mod tests {
         assert!(store::task_failed(&pool, b, "denied", false, 0).await.unwrap());
         assert_eq!(name(c).await.unwrap(), "file (3).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_uploads_stay_within_the_part_limit() {
+        assert_eq!(part_size(0), CHUNK);
+        assert_eq!(part_size(CHUNK * 9_999), CHUNK);
+        for size in [CHUNK * 9_999 + 1, 100 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024 * 1024] {
+            assert!(size.div_ceil(part_size(size)) <= 10_000, "{size}");
+        }
     }
 
     #[test]
