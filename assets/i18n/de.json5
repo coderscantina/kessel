@@ -209,6 +209,39 @@
   "oauth.needed": "Vor dem Speichern mit dem Browser anmelden.",
   "oauth.redirect_hint": "http://localhost:53682/ als Redirect-URI der App registrieren.",
 
+  // Site-Formular: FTP-Sicherheit, Limits, OAuth-Einrichtung.
+  "connect.ftp.security": "Sicherheit",
+  "connect.ftp.tls": "FTP mit expliziter TLS-Verschlüsselung (empfohlen)",
+  "connect.ftp.plain": "Einfaches FTP (unverschlüsselt)",
+  "connect.ftp.plain_warning": "Einfaches FTP sendet Passwort und Dateien unverschlüsselt.",
+  "connect.ftp.no_scheme": "Host ohne ftp:// eingeben und unten die Sicherheit wählen.",
+  "site.advanced": "ERWEITERT",
+  "site.limits.connections": "Gleichzeitige Verbindungen",
+  "site.limits.connections_placeholder": "App-Standard",
+  "site.limits.connections_invalid": "Gleichzeitige Verbindungen müssen eine ganze Zahl von 1 bis {max} sein.",
+  "site.limits.speed": "Geschwindigkeitslimit (KiB/s)",
+  "site.limits.speed_placeholder": "Unbegrenzt",
+  "site.limits.speed_invalid": "Das Geschwindigkeitslimit muss eine ganze Zahl von 1 bis {max} KiB/s sein.",
+  "site.limits.hint": "Ein leeres Feld verwendet den App-Standard.",
+  "oauth.client_needed": "OAuth-Client-ID eingeben, um die Anmeldung freizuschalten.",
+  "oauth.setup_steps": "So legst du einen OAuth-Client an",
+
+  // Sites, die noch von Übertragungen genutzt werden.
+  "site.busy.title": "Site wird noch verwendet",
+  "site.busy.delete": "Übertragungen nutzen diese Site noch (offen: {jobs}). Löschen würde sie entfernen. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
+  "site.busy.edit": "Übertragungen nutzen diese Site noch (offen: {jobs}), deshalb lassen sich Protokoll, Endpunkt, Stammpfad, Bucket und Container jetzt nicht ändern. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
+
+  // Import aus anderen Clients.
+  "site.import.button": "Importieren…",
+  "site.import.empty": "In dieser Datei wurden keine Sites gefunden.",
+  "site.import.summary": "{count} von {total} Sites lassen sich aus FileZilla oder Cyberduck importieren.",
+  "site.import.confirm": "{count} Sites importieren",
+  "site.import.unsupported": "Nicht importierbar: {protocol}",
+  "site.import.folder": "Ordner: {folder}",
+  "site.import.needs_credentials": "Passwort beim ersten Verbinden nötig",
+  "site.import.enter_credentials": "Passwort eingeben, speichern, dann verbinden.",
+  "site.import.passwords_note": "Passwörter werden nie importiert. Gib sie beim ersten Verbinden ein.",
+
   // AWS IAM Identity Center (SSO) interaktive Anmeldung.
   "sso.sign_in": "Mit AWS SSO anmelden",
   "sso.waiting": "Warte auf die AWS-Anmeldung im Browser…",

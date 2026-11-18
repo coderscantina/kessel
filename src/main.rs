@@ -13,6 +13,7 @@ mod dragout;
 mod edit;
 mod errors;
 mod i18n;
+mod import;
 mod keymap;
 mod localfs;
 mod logs;

@@ -178,22 +178,25 @@ pub async fn insert_site(
     Ok(id)
 }
 
-/// Layers are deliberately untouched — the bookmark form doesn't edit them.
+/// Saving through the form also settles an imported site's "needs
+/// credentials" flag: the user has been through the form.
 pub async fn update_site(
     pool: &SqlitePool,
     site_id: i64,
     name: &str,
     scheme: &str,
     options: &HashMap<String, String>,
+    layers: &LayerConfig,
     meta: &BookmarkMeta,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE sites SET name = ?, scheme = ?, options = ?, icon = ?, color = ?, tags = ?, \
-         folder_id = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE sites SET name = ?, scheme = ?, options = ?, layers = ?, icon = ?, color = ?, \
+         tags = ?, folder_id = ?, needs_credentials = 0, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(name)
     .bind(scheme)
     .bind(serde_json::to_string(options)?)
+    .bind(serde_json::to_string(layers)?)
     .bind(&meta.icon)
     .bind(&meta.color)
     .bind(serde_json::to_string(&meta.tags)?)
@@ -437,11 +440,152 @@ pub async fn set_tag_color(pool: &SqlitePool, name: &str, color: Option<&str>) -
     Ok(())
 }
 
+/// Transfer jobs the user can still act on: everything except a clean `done`
+/// job. Deleting a site cascades to its jobs, and a job resolves its site by
+/// id whenever it runs, so these are the jobs a site change could hurt.
+const OPEN_JOB: &str = "NOT (state = 'done' AND files_failed = 0)";
+
+/// Why a site can't be deleted or retargeted right now: `jobs` open transfer
+/// jobs still reference it.
+#[derive(Debug, thiserror::Error)]
+pub enum SiteBusy {
+    #[error("{}", crate::i18n::tf("site.busy.delete", &[("jobs", &.0.to_string())]))]
+    Delete(i64),
+    #[error("{}", crate::i18n::tf("site.busy.edit", &[("jobs", &.0.to_string())]))]
+    Edit(i64),
+}
+
+pub async fn open_job_count(pool: &SqlitePool, site_id: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM transfer_jobs \
+         WHERE (src_site_id = ?1 OR dst_site_id = ?1) AND {OPEN_JOB}"
+    );
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(site_id)
+        .fetch_one(pool)
+        .await?)
+}
+
+/// Delete a site unless open transfer jobs reference it (the check and the
+/// delete are one statement, so a job can't slip in between).
 pub async fn delete_site(pool: &SqlitePool, site_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM sites WHERE id = ? AND id != 0")
+    let sql = format!(
+        "DELETE FROM sites WHERE id = ?1 AND id != 0 AND NOT EXISTS ( \
+           SELECT 1 FROM transfer_jobs \
+           WHERE (src_site_id = ?1 OR dst_site_id = ?1) AND {OPEN_JOB})"
+    );
+    let deleted = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(site_id)
         .execute(pool)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        let jobs = open_job_count(pool, site_id).await?;
+        if jobs > 0 {
+            return Err(SiteBusy::Delete(jobs).into());
+        }
+    }
+    Ok(())
+}
+
+/// What a job aims at when it resolves the site: protocol and where on the
+/// server. Credentials, names and limits don't redirect anything.
+fn connection_target<'a>(scheme: &'a str, options: &'a HashMap<String, String>) -> Vec<&'a str> {
+    std::iter::once(scheme)
+        .chain(
+            ["endpoint", "root", "bucket", "container"]
+                .map(|key| options.get(key).map_or("", String::as_str)),
+        )
+        .collect()
+}
+
+/// Refuse a change of protocol, endpoint, root, bucket or container while
+/// open transfer jobs reference the site: a paused job would otherwise resume
+/// against the new location.
+pub async fn ensure_site_retargetable(
+    pool: &SqlitePool,
+    site_id: i64,
+    scheme: &str,
+    options: &HashMap<String, String>,
+) -> Result<()> {
+    let row = sqlx::query("SELECT scheme, options FROM sites WHERE id = ?")
+        .bind(site_id)
+        .fetch_optional(pool)
         .await?;
+    let Some(row) = row else { return Ok(()) };
+    let old_scheme: String = row.get("scheme");
+    let old_options: HashMap<String, String> =
+        serde_json::from_str(row.get::<String, _>("options").as_str())?;
+    if connection_target(&old_scheme, &old_options) == connection_target(scheme, options) {
+        return Ok(());
+    }
+    let jobs = open_job_count(pool, site_id).await?;
+    if jobs > 0 {
+        return Err(SiteBusy::Edit(jobs).into());
+    }
+    Ok(())
+}
+
+/// Ids of imported sites still waiting for their first credentials review.
+pub async fn sites_needing_credentials(pool: &SqlitePool) -> Result<std::collections::HashSet<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM sites WHERE needs_credentials = 1")
+        .fetch_all(pool)
+        .await?;
+    Ok(ids.into_iter().collect())
+}
+
+/// A site parsed from another client's export, ready to be saved.
+pub struct ImportSite {
+    pub name: String,
+    pub scheme: String,
+    pub options: HashMap<String, String>,
+    /// Folder the source kept it in; created in the space when missing.
+    pub folder: Option<String>,
+    pub needs_credentials: bool,
+}
+
+/// Save imported sites into `space_id` in one transaction, reusing folders
+/// of the same name. Nothing is stored if any row fails.
+pub async fn import_sites(pool: &SqlitePool, space_id: i64, sites: &[ImportSite]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let mut folders: HashMap<String, i64> =
+        sqlx::query_as::<_, (String, i64)>("SELECT name, id FROM bookmark_folders WHERE space_id = ?")
+            .bind(space_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
+    for site in sites {
+        let folder_id = match &site.folder {
+            Some(name) => match folders.get(name) {
+                Some(id) => Some(*id),
+                None => {
+                    let id = sqlx::query("INSERT INTO bookmark_folders (name, space_id) VALUES (?, ?)")
+                        .bind(name)
+                        .bind(space_id)
+                        .execute(&mut *tx)
+                        .await?
+                        .last_insert_rowid();
+                    folders.insert(name.clone(), id);
+                    Some(id)
+                }
+            },
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO sites (name, scheme, options, folder_id, space_id, needs_credentials) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&site.name)
+        .bind(&site.scheme)
+        .bind(serde_json::to_string(&site.options)?)
+        .bind(folder_id)
+        .bind(space_id)
+        .bind(site.needs_credentials)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -509,5 +653,66 @@ mod tests {
             pool.close().await;
         });
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A scratch database in its own temp dir, with one site and (optionally)
+    /// one transfer job from the local site to it in `state`.
+    async fn site_with_job(name: &str, state: Option<&str>) -> (SqlitePool, i64, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kessel-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = connect(&dir).await.unwrap();
+        let options = HashMap::from([("endpoint".to_string(), "ssh://old.example.com".to_string())]);
+        let site = insert_site(&pool, "x", "sftp", &options, &LayerConfig::default(), &BookmarkMeta::default())
+            .await
+            .unwrap();
+        if let Some(state) = state {
+            sqlx::query(
+                "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, state) VALUES (0, ?, 'a', '', ?)",
+            )
+            .bind(site)
+            .bind(state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        (pool, site, dir)
+    }
+
+    #[test]
+    fn delete_is_refused_while_open_jobs_reference_the_site() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (pool, site, dir) = site_with_job("delete-busy", Some("paused")).await;
+            let error = delete_site(&pool, site).await.unwrap_err();
+            assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Delete(1))));
+            assert_eq!(list_sites(&pool).await.unwrap().len(), 1);
+
+            sqlx::query("UPDATE transfer_jobs SET state = 'done', files_failed = 0")
+                .execute(&pool)
+                .await
+                .unwrap();
+            delete_site(&pool, site).await.unwrap();
+            assert!(list_sites(&pool).await.unwrap().is_empty());
+            pool.close().await;
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn retargeting_is_refused_while_open_jobs_reference_the_site() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (pool, site, dir) = site_with_job("retarget-busy", Some("queued")).await;
+            let mut options = HashMap::from([("endpoint".to_string(), "ssh://old.example.com".to_string())]);
+            options.insert("user".to_string(), "anna".to_string());
+            ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap();
+
+            options.insert("endpoint".to_string(), "ssh://new.example.com".to_string());
+            let error = ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap_err();
+            assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Edit(1))));
+
+            sqlx::query("DELETE FROM transfer_jobs").execute(&pool).await.unwrap();
+            ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap();
+            pool.close().await;
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
     }
 }

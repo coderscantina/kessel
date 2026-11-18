@@ -2181,8 +2181,9 @@ impl KesselApp {
         self.sync_sites(task, cx);
     }
 
-    /// Context menu "Delete…": confirm, close its pinned tabs, then remove
-    /// the site row and its keychain secrets.
+    /// Context menu "Delete…": refuse while open transfer jobs use the site
+    /// (deleting it would cascade them away), otherwise confirm, close its
+    /// pinned tabs, then remove the site row and its keychain secrets.
     fn confirm_delete_bookmark(
         &mut self,
         site_id: i64,
@@ -2198,20 +2199,44 @@ impl KesselApp {
         else {
             return;
         };
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let jobs = state
+            .runtime
+            .spawn(async move { db::open_job_count(&pool, site_id).await });
         let app = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let app = app.clone();
-            dialog
-                .title(format!("Delete bookmark `{name}`?"))
-                .width(px(380.))
-                .child("Its saved connection settings and secrets are removed for good.")
-                .confirm()
-                .on_ok(move |_, _, cx| {
-                    app.update(cx, |this, cx| this.delete_bookmark(site_id, cx))
-                        .ok();
-                    true
-                })
-        });
+        cx.spawn_in(window, async move |this, cx| {
+            let jobs = match jobs.await {
+                Ok(Ok(jobs)) => jobs,
+                _ => 0,
+            };
+            this.update_in(cx, |_, window, cx| {
+                if jobs > 0 {
+                    window.open_alert_dialog(cx, move |dialog, _, _| {
+                        dialog
+                            .title(t("site.busy.title"))
+                            .width(px(420.))
+                            .child(db::SiteBusy::Delete(jobs).to_string())
+                    });
+                    return;
+                }
+                window.open_alert_dialog(cx, move |dialog, _, _| {
+                    let app = app.clone();
+                    dialog
+                        .title(format!("Delete bookmark `{name}`?"))
+                        .width(px(380.))
+                        .child("Its saved connection settings and secrets are removed for good.")
+                        .confirm()
+                        .on_ok(move |_, _, cx| {
+                            app.update(cx, |this, cx| this.delete_bookmark(site_id, cx))
+                                .ok();
+                            true
+                        })
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn delete_bookmark(&mut self, site_id: i64, cx: &mut Context<Self>) {
@@ -2228,10 +2253,10 @@ impl KesselApp {
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
         let task = state.runtime.spawn(async move {
+            db::delete_site(&pool, site_id).await?;
             let _ = crate::secrets::SecretStore::delete(
                 &crate::secrets::SecretStore::handle_for_site(site_id),
             );
-            db::delete_site(&pool, site_id).await?;
             db::list_sites(&pool).await
         });
         self.sync_sites(task, cx);
