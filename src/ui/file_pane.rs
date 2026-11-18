@@ -601,7 +601,7 @@ impl FilePane {
                     if this.tree_scope && !searched {
                         this.run_tree_search(window, cx);
                     } else {
-                        this.activate(&Activate, window, cx);
+                        this.activate(window, cx);
                     }
                 }
                 _ => {}
@@ -1765,9 +1765,17 @@ impl FilePane {
         }
     }
 
+    /// The Enter binding. It also fires for Enter pressed inside the path bar
+    /// or search bar, which act on their own text instead.
+    fn activate_action(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.text_input_focused(window, cx) {
+            self.activate(window, cx);
+        }
+    }
+
     /// Enter / double-click: a single folder is entered;
     /// files open in their default app, extra folders in new tabs.
-    fn activate(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
+    fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_stale() {
             return;
         }
@@ -1851,7 +1859,8 @@ impl FilePane {
             [file] => tf("file_pane.launch.title_one", &[("name", &file.name)]),
             _ => tf("file_pane.launch.title_other", &[("count", &files.len().to_string())]),
         };
-        let names = name_list(&files);
+        // The title already names a single file.
+        let names = (files.len() > 1).then(|| name_list(&files));
         window.open_dialog(cx, move |dialog, _, cx| {
             let download = {
                 let pane = pane.clone();
@@ -1884,7 +1893,9 @@ impl FilePane {
                 v_flex()
                     .gap_3()
                     .child(t("file_pane.launch.body"))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(names.clone()))
+                    .children(names.clone().map(|names| {
+                        div().text_sm().text_color(cx.theme().muted_foreground).child(names)
+                    }))
                     .child(
                         h_flex().gap_2().child(download).child(open).child(
                             Button::new("launch-cancel")
@@ -4295,7 +4306,7 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
-            .on_action(cx.listener(Self::activate))
+            .on_action(cx.listener(Self::activate_action))
             .on_action(cx.listener(Self::enter_folder))
             .on_action(cx.listener(Self::go_up_action))
             .on_action(cx.listener(Self::go_back_action))
