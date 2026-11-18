@@ -98,6 +98,9 @@ pub struct Capabilities {
     pub write_can_append: bool,
     /// S3-style backends have no real directories; paths are prefixes.
     pub virtual_dirs: bool,
+    /// A fresh write goes to a temporary name that closing the writer renames
+    /// onto the target, whatever was written. Only appends write in place.
+    pub write_renames_on_close: bool,
 }
 
 /// One entry as seen by the browser UI: a name plus its full browse path.
@@ -137,6 +140,8 @@ pub struct Provider {
     /// for the side channels OpenDAL can't express (ListBuckets, storage
     /// class, ACL, sftp chmod).
     options: Arc<HashMap<String, String>>,
+    /// Bounds the side channels OpenDAL's timeout layer doesn't cover.
+    side_channel_timeout: Duration,
     backend: Backend,
 }
 
@@ -176,6 +181,7 @@ impl Provider {
         }
 
         let layers = profile.layers.merged_over(default_layers);
+        let side_channel_timeout = Duration::from_secs(layers.timeout_secs.unwrap_or(DEFAULT_SIDE_CHANNEL_TIMEOUT_SECS));
 
         // No bucket on an S3 site means "browse the whole account": defer
         // per-bucket operators until navigation. Capabilities are per-scheme,
@@ -191,6 +197,7 @@ impl Provider {
                 caps: Self::capabilities(&probe_op),
                 scheme: scheme.to_string(),
                 options: Arc::new(options.clone()),
+                side_channel_timeout,
                 backend: Backend::S3Root {
                     options,
                     layers,
@@ -213,6 +220,7 @@ impl Provider {
             caps,
             scheme: scheme.to_string(),
             options: resolved,
+            side_channel_timeout,
             backend: Backend::Single(op),
         })
     }
@@ -316,7 +324,7 @@ impl Provider {
             Err(error) => return Err(error.into()),
         }
         if self.caps.rename {
-            op.rename(&from_rel, &to_rel).await?;
+            self.rename_on_server(&op, &from_rel, &to_rel).await?;
         } else if self.caps.copy {
             anyhow::ensure!(
                 !from_rel.ends_with('/'),
@@ -327,6 +335,27 @@ impl Provider {
         } else {
             anyhow::bail!("this backend supports neither rename nor copy");
         }
+        Ok(())
+    }
+
+    /// One server-side rename of operator paths (guarded by `caps.rename`).
+    /// OpenDAL has no FTP rename, so that goes through [`crate::ftp`].
+    pub(crate) async fn rename_on_server(&self, op: &Operator, from: &str, to: &str) -> opendal::Result<()> {
+        if self.scheme == "ftp" {
+            crate::ftp::rename(&self.options, from, to, self.side_channel_timeout).await
+        } else {
+            op.rename(from, to).await
+        }
+    }
+
+    /// Create an empty FTP file, which OpenDAL's writer can't do: it only
+    /// reaches the server once it has bytes to send.
+    pub(crate) async fn create_empty_ftp_file(&self, path: &str) -> Result<()> {
+        let (op, rel) = self.op_for(path)?;
+        if let Some((parent, _)) = rel.rsplit_once('/') {
+            op.create_dir(&format!("{parent}/")).await?;
+        }
+        crate::ftp::create_empty(&self.options, &rel, self.side_channel_timeout).await?;
         Ok(())
     }
 
@@ -662,8 +691,10 @@ impl Provider {
     fn capabilities(op: &Operator) -> Capabilities {
         let info = op.info();
         let cap = info.capability();
+        let ftp = info.scheme() == "ftp";
         Capabilities {
-            rename: cap.rename,
+            // OpenDAL can't rename on FTP; `rename_on_server` can.
+            rename: cap.rename || ftp,
             copy: cap.copy,
             presign: cap.presign,
             write_can_append: cap.write_can_append,
@@ -672,9 +703,13 @@ impl Provider {
                 info.scheme(),
                 "s3" | "gcs" | "azblob"
             ),
+            write_renames_on_close: ftp,
         }
     }
 }
+
+/// Side-channel limit for sites without a configured timeout.
+const DEFAULT_SIDE_CHANNEL_TIMEOUT_SECS: u64 = 60;
 
 /// Stats in flight at once while filling metadata for a listing.
 const STAT_CONCURRENCY: usize = 16;
@@ -777,6 +812,22 @@ mod rename_tests {
         assert!(!contains_exact_name(["Report.txt"], "report.txt"));
         // Directory entries carry a trailing slash.
         assert!(contains_exact_name(["Photos/"], "Photos"));
+    }
+
+    #[tokio::test]
+    async fn an_ftp_site_renames_through_its_capability_flag() {
+        let server = crate::ftp::test_server::FakeFtp::start();
+        server.put("report.txt", b"content");
+        let profile = super::SiteProfile {
+            scheme: "ftp".into(),
+            options: [("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))].into(),
+            ..Default::default()
+        };
+        let provider = super::Provider::connect(&profile, &Default::default()).unwrap();
+
+        assert!(provider.caps.rename);
+        provider.rename("report.txt", "final.txt").await.unwrap();
+        assert_eq!(server.names(), ["final.txt"]);
     }
 }
 

@@ -2,8 +2,8 @@
 //!
 //! Safe overwrite: on backends that can rename (local fs, sftp, ftp, …) a
 //! task writes into its own partial file next to the destination
-//! (`.<name>.<task id>.kessel-part`) and renames it onto the real name only
-//! after the copy finished and verified. The old file stays intact until
+//! (`.<name>.<task id>.kessel-part`, on FTP without the leading dot) and
+//! renames it onto the real name only after the copy finished and verified. The old file stays intact until
 //! then. The task records the partial it owns, so cancel and removal can
 //! delete it later. Object stores write the destination directly: their
 //! uploads only become visible on a successful close, so an interrupted
@@ -163,11 +163,13 @@ fn resumes_by_append(caps: &Capabilities) -> bool {
 }
 
 /// The partial file next to `path` (an operator or browse path) that task
-/// `task_id` writes before committing.
-pub(crate) fn partial_path(path: &str, task_id: i64) -> String {
+/// `task_id` writes before committing. FTP partials stay visible: many
+/// servers hide dotfiles from `LIST`, the only way OpenDAL stats a file there.
+pub(crate) fn partial_path(dst: &Provider, path: &str, task_id: i64) -> String {
     let name = file_name(path);
     let parent = &path[..path.len() - name.len()];
-    format!("{parent}.{name}.{task_id}{PARTIAL_SUFFIX}")
+    let dot = if dst.scheme == "ftp" { "" } else { "." };
+    format!("{parent}{dot}{name}.{task_id}{PARTIAL_SUFFIX}")
 }
 
 /// Run one claimed task. Also returns the bytes the worker still counts in
@@ -251,7 +253,7 @@ async fn run_inner(
         let written = if task.in_place || !stages(&dst.caps) {
             dst_path.clone()
         } else {
-            partial_path(&dst_path, task.id)
+            partial_path(dst, &dst_path, task.id)
         };
         if can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref()) {
             offset = resume_offset(&dst_op, &written, size).await;
@@ -317,8 +319,8 @@ async fn run_inner(
     let in_place = append_to_existing || (offset > 0 && task.in_place);
     let partial = (stages(&dst.caps) && !in_place).then(|| {
         (
-            partial_path(&dst_path, task.id),
-            partial_path(&dst_browse, task.id),
+            partial_path(dst, &dst_path, task.id),
+            partial_path(dst, &dst_browse, task.id),
         )
     });
     let dest = Dest {
@@ -368,12 +370,30 @@ async fn run_inner(
         }
     }
 
+    // OpenDAL's FTP writer only reaches the server once it has bytes.
+    if size == 0 && dst.caps.write_renames_on_close {
+        dst.create_empty_ftp_file(dest.write_browse())
+            .await
+            .with_context(|| format!("create `{}`", task.dst))?;
+        return finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await;
+    }
+
+    // A writer that renames on close would publish whatever an interrupted
+    // upload holds, so those bytes go straight into the partial instead.
+    let append = offset > 0 || dst.caps.write_renames_on_close;
+    if offset == 0 && append && dest.partial.is_some() {
+        dest.op
+            .delete(dest.write_path())
+            .await
+            .with_context(|| format!("clearing the partial of `{}`", task.dst))?;
+    }
+
     // Only the streaming writer draws from the global bandwidth budget.
     let write_op = match &opts.throttle {
         Some(throttle) => dest.op.clone().layer(throttle.clone()),
         None => dest.op.clone(),
     };
-    let mut writer = if offset > 0 {
+    let mut writer = if append {
         write_op
             .writer_with(dest.write_path())
             .append(true)
@@ -512,7 +532,7 @@ async fn finish_transfer(
         if let Some(outcome) = reviewed_state_changed(task, &dest.op, &dest.path).await? {
             return Ok(outcome);
         }
-        commit_partial(&dest.op, partial, &dest.path).await?;
+        commit_partial(dst, &dest.op, partial, &dest.path).await?;
         store::set_task_partial(pool, task.id, None).await?;
     }
 
@@ -576,8 +596,8 @@ async fn reviewed_state_changed(task: &ClaimedTask, op: &Operator, path: &str) -
 /// aside to a backup name first, the partial renamed into place, and the
 /// backup deleted. A failure in between moves the old file back, so it is
 /// never lost.
-async fn commit_partial(op: &Operator, partial: &str, path: &str) -> Result<()> {
-    let Err(error) = op.rename(partial, path).await else {
+async fn commit_partial(dst: &Provider, op: &Operator, partial: &str, path: &str) -> Result<()> {
+    let Err(error) = dst.rename_on_server(op, partial, path).await else {
         return Ok(());
     };
     let context = || format!("moving the finished file to `{path}`");
@@ -594,10 +614,10 @@ async fn commit_partial(op: &Operator, partial: &str, path: &str) -> Result<()> 
         "{}.old{PARTIAL_SUFFIX}",
         partial.strip_suffix(PARTIAL_SUFFIX).unwrap_or(partial)
     );
-    if op.rename(path, &backup).await.is_err() {
+    if dst.rename_on_server(op, path, &backup).await.is_err() {
         return Err(error).with_context(context);
     }
-    match op.rename(partial, path).await {
+    match dst.rename_on_server(op, partial, path).await {
         Ok(()) => {
             if let Err(error) = op.delete(&backup).await {
                 tracing::warn!(%backup, %error, "removing the replaced file's backup failed");
@@ -605,7 +625,7 @@ async fn commit_partial(op: &Operator, partial: &str, path: &str) -> Result<()> 
             Ok(())
         }
         Err(error) => {
-            if let Err(restore) = op.rename(&backup, path).await {
+            if let Err(restore) = dst.rename_on_server(op, &backup, path).await {
                 tracing::error!(%backup, %path, error = %restore, "restoring the replaced file failed; it is kept under the backup name");
             }
             Err(error).with_context(context)
@@ -815,10 +835,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("file.txt"), b"OLD").unwrap();
-        let op = Operator::via_iter("fs", [("root".to_string(), dir.to_string_lossy().to_string())]).unwrap();
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), dir.to_string_lossy().to_string())].into(),
+            ..Default::default()
+        };
+        let dst = Provider::connect(&local, &Default::default()).unwrap();
+        let (op, _) = dst.op_for("").unwrap();
         // The partial is missing: the rename fails for a reason other than
         // the destination existing, so the destination must stay.
-        assert!(commit_partial(&op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
+        assert!(commit_partial(&dst, &op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
         assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"OLD");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -880,6 +906,7 @@ mod tests {
             presign: false,
             write_can_append,
             virtual_dirs,
+            write_renames_on_close: false,
         };
         assert!(resumes_by_append(&caps(true, false)));
         assert!(!resumes_by_append(&caps(true, true)));

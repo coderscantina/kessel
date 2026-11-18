@@ -2261,6 +2261,80 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"a newer save");
     }
 
+    /// An engine with an FTP site (id 2) backed by the in-memory test server.
+    /// Local sources stream to it; `up/` is the upload folder.
+    fn ftp_env(name: &str, bandwidth: u64) -> (TestEnv, crate::ftp::test_server::FakeFtp) {
+        let env = test_env_with(name, |cfg| cfg.bandwidth_limit = bandwidth);
+        let server = crate::ftp::test_server::FakeFtp::start();
+        let options = format!("{{\"endpoint\":\"ftp://127.0.0.1:{}\"}}", server.port);
+        env.rt
+            .block_on(
+                sqlx::query("INSERT INTO sites (id, name, scheme, options) VALUES (2, 'FTP', 'ftp', ?)")
+                    .bind(options)
+                    .execute(&env.pool),
+            )
+            .unwrap();
+        (env, server)
+    }
+
+    fn ftp_upload(src: &Path) -> NewJob {
+        NewJob {
+            dst_site_id: 2,
+            ..job(browse(src), "up/".to_string(), ConflictPolicy::Overwrite)
+        }
+    }
+
+    #[test]
+    fn an_ftp_upload_replaces_the_old_file_through_a_partial() {
+        let (env, server) = ftp_env("ftp-replace", 0);
+        server.put("up/file.txt", b"old");
+        let src = env.dir.join("file.txt");
+        std::fs::write(&src, b"new content").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/file.txt").unwrap(), b"new content");
+        assert_eq!(server.names(), ["up/file.txt"]);
+    }
+
+    #[test]
+    fn an_empty_file_reaches_the_ftp_server() {
+        let (env, server) = ftp_env("ftp-empty", 0);
+        let src = env.dir.join("empty.txt");
+        std::fs::write(&src, b"").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/empty.txt").unwrap(), b"");
+        assert_eq!(server.names(), ["up/empty.txt"]);
+    }
+
+    #[test]
+    fn an_interrupted_ftp_upload_never_shows_under_the_final_name() {
+        let (env, server) = ftp_env("ftp-interrupted", 8 * 1024 * 1024);
+        server.put("up/big.bin", b"old");
+        let src = env.dir.join("big.bin");
+        let content: Vec<u8> = (0..40 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &content).unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        pause_once_past(&env, id, 0);
+        assert_eq!(server.read("up/big.bin").unwrap(), b"old");
+        let names = server.names();
+        let partial = names.iter().find(|name| name.ends_with(transfer::PARTIAL_SUFFIX)).unwrap();
+        assert!(server.read(partial).unwrap().len() < content.len());
+
+        env.handle.resume(id);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert!(server.read("up/big.bin").unwrap() == content, "the resumed upload differs");
+        assert_eq!(server.names(), ["up/big.bin"]);
+    }
+
     #[test]
     fn a_site_limit_holds_across_jobs() {
         let (env, src_dir, dst_dir, _) = slow_env("site-limit");
@@ -2395,7 +2469,8 @@ mod tests {
 
     /// The deterministic partial file of task `id` writing `dst`.
     fn legacy_partial(dst: &Path, id: i64) -> PathBuf {
-        PathBuf::from(format!("/{}", transfer::partial_path(&browse(dst), id)))
+        let name = dst.file_name().unwrap().to_str().unwrap();
+        dst.with_file_name(format!(".{name}.{id}{}", transfer::PARTIAL_SUFFIX))
     }
 
     #[test]

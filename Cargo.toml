@@ -67,6 +67,12 @@ reqwest = { version = "0.13", default-features = false, features = [
 # `http` request parts are what reqsign 0.20 signs; same major as reqwest/reqsign use.
 http = "1"
 
+# FTP rename side channel (OpenDAL's FTP service has no rename). Same client
+# and TLS stack the service itself builds on, so nothing new is compiled.
+suppaftp = { version = "8", default-features = false, features = ["async-std-rustls-ring"] }
+futures-rustls = "0.26"
+rustls-native-certs = "0.8"
+
 # Local state
 sqlx = { version = "0.9", features = [
   "runtime-tokio",
