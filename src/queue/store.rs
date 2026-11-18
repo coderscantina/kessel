@@ -383,7 +383,9 @@ pub(crate) async fn complete_task(pool: &SqlitePool, task_id: i64, bytes: u64) -
 }
 
 /// Park a task awaiting a user decision, recording what the destination
-/// held so the prompt can show it.
+/// held so the prompt can show it. The offset resets: whatever the user
+/// decides, the next run has to pass the conflict check again instead of
+/// resuming into a commit.
 pub(crate) async fn park_task_conflict(
     pool: &SqlitePool,
     task_id: i64,
@@ -396,7 +398,7 @@ pub(crate) async fn park_task_conflict(
             "UPDATE transfer_tasks SET state = CASE WHEN {JOB_CANCELLED} THEN 'cancelled' \
              WHEN COALESCE(conflict_policy, \
              (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) = ? \
-             THEN 'conflict' ELSE 'queued' END, dst_size = ?, dst_modified = ?, \
+             THEN 'conflict' ELSE 'queued' END, byte_offset = 0, dst_size = ?, dst_modified = ?, \
              updated_at = datetime('now') WHERE id = ?"
         )),
     )
@@ -1190,6 +1192,16 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_parked_conflict_forgets_its_resume_offset() {
+        let (pool, id) = prepared_job().await;
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        update_task_offset(&pool, task.id, 2).await.unwrap();
+        park_task_conflict(&pool, task.id, task.conflict_policy, 3, None).await.unwrap();
+        resolve_job_conflicts(&pool, id, ConflictPolicy::Skip).await.unwrap();
+        assert_eq!(claim_task(&pool, &[id]).await.unwrap().unwrap().byte_offset, 0);
     }
 
     #[tokio::test]
