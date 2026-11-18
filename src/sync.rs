@@ -202,7 +202,7 @@ fn compare(src: &FileMeta, dst: &FileMeta, dst_keeps_mtime: bool) -> Option<Plan
 async fn location(provider: &Provider, dir: &str) -> String {
     let scheme = &provider.scheme;
     // Only the account root of a bucket-root S3 site has no operator.
-    let Ok((op, rel)) = provider.op_for(dir) else {
+    let Ok((op, rel)) = provider.route(dir).await else {
         return format!("{scheme}://");
     };
     let info = op.info();
@@ -410,7 +410,7 @@ impl SyncReport {
 /// Whether the destination file at `path` is still what the review saw
 /// (`None` = nothing there).
 async fn still_as_reviewed(dst: &Provider, path: &str, reviewed: Option<ReviewedFile>) -> Result<bool> {
-    let (op, rel) = dst.op_for(path)?;
+    let (op, rel) = dst.route(path).await?;
     match op.stat(&rel).await {
         Ok(meta) => {
             let modified = meta.last_modified().and_then(crate::provider::to_datetime);
@@ -452,7 +452,7 @@ async fn delete_reviewed(dst: &Provider, entry: &ReviewedDelete) -> Result<bool>
             return Ok(false);
         }
     } else {
-        let (op, rel) = dst.op_for(&entry.path)?;
+        let (op, rel) = dst.route(&entry.path).await?;
         match op.stat(&rel).await {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => return Ok(false),

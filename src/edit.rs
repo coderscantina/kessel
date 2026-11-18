@@ -270,7 +270,7 @@ struct SyncPoint {
 }
 
 async fn stat_remote(provider: &Provider, path: &str) -> Result<RemoteState> {
-    let (op, rel) = provider.op_for(path)?;
+    let (op, rel) = provider.route(path).await?;
     let meta = op.stat(&rel).await?;
     Ok(RemoteState {
         etag: meta.etag().map(str::to_string),

@@ -224,8 +224,8 @@ async fn run_inner(
     opts: &TransferOpts,
     live: &mut Live<'_>,
 ) -> Result<Outcome> {
-    let (src_op, src_path) = src.op_for(&task.src)?;
-    let (dst_op, mut dst_path) = dst.op_for(&task.dst)?;
+    let (src_op, src_path) = src.route(&task.src).await?;
+    let (dst_op, mut dst_path) = dst.route(&task.dst).await?;
     // Browse-level destination path for Provider side channels (server-side
     // copy, mtime); kept in sync with `dst_path` on rename.
     let mut dst_browse = task.dst.clone();
@@ -670,7 +670,7 @@ async fn move_into_place(dst: &Provider, op: &Operator, partial: &str, path: &st
 /// Delete a partial an earlier run of the task left under another name
 /// (its destination changed since). Best effort: it is only clutter.
 async fn discard_stale_partial(dst: &Provider, partial: &str) {
-    let result = match dst.op_for(partial) {
+    let result = match dst.route(partial).await {
         Ok((op, rel)) => op.delete(&rel).await.map_err(anyhow::Error::from),
         Err(error) => Err(error),
     };

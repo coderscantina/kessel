@@ -156,6 +156,8 @@ enum Backend {
         options: HashMap<String, String>,
         layers: LayerConfig,
         bucket_ops: Arc<Mutex<HashMap<String, Operator>>>,
+        /// Each bucket's own region once looked up; `None` when S3 didn't say.
+        regions: Arc<Mutex<HashMap<String, Option<String>>>>,
     },
 }
 
@@ -202,6 +204,7 @@ impl Provider {
                     options,
                     layers,
                     bucket_ops: Arc::default(),
+                    regions: Arc::default(),
                 },
             });
         }
@@ -275,10 +278,51 @@ impl Provider {
         }
     }
 
+    /// [`Self::op_for`] on the bucket's own region: account-root S3 sites look
+    /// it up the first time a path reaches a bucket.
+    pub async fn route(&self, path: &str) -> Result<(Operator, String)> {
+        self.resolve_bucket_region(path).await;
+        self.op_for(path)
+    }
+
+    /// Remember the region of the bucket `path` lies in. A failed lookup is
+    /// tried again next time; until then the site's own region applies.
+    async fn resolve_bucket_region(&self, path: &str) {
+        let Backend::S3Root { options, bucket_ops, regions, .. } = &self.backend else {
+            return;
+        };
+        let bucket = path.split('/').next().unwrap_or("");
+        if bucket.is_empty()
+            || !follows_bucket_region(options)
+            || regions.lock().unwrap().contains_key(bucket)
+        {
+            return;
+        }
+        match crate::s3::bucket_region(options, bucket).await {
+            Ok(region) => {
+                regions.lock().unwrap().insert(bucket.to_string(), region);
+                bucket_ops.lock().unwrap().remove(bucket);
+            }
+            Err(error) => tracing::debug!(%bucket, error = %format!("{error:#}"), "bucket region lookup failed"),
+        }
+    }
+
+    /// The options a side channel signs with for `bucket`.
+    async fn bucket_options(&self, bucket: &str) -> HashMap<String, String> {
+        self.resolve_bucket_region(bucket).await;
+        let mut options = self.options.as_ref().clone();
+        if let Backend::S3Root { regions, .. } = &self.backend {
+            if let Some(Some(region)) = regions.lock().unwrap().get(bucket) {
+                use_bucket_region(&mut options, region);
+            }
+        }
+        options
+    }
+
     /// Delete one entry: recursive delete for directories (works on
     /// virtual-dir backends too), plain delete for files.
     pub async fn delete(&self, path: &str, is_dir: bool) -> Result<()> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         if is_dir {
             op.delete_with(&rel).recursive(true).await?;
         } else {
@@ -303,8 +347,8 @@ impl Provider {
     /// it, otherwise a copy + delete fallback (files only). Refuses to
     /// replace an existing destination.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let (op, from_rel) = self.op_for(from)?;
-        let (_, to_rel) = self.op_for(to)?;
+        let (op, from_rel) = self.route(from).await?;
+        let (_, to_rel) = self.route(to).await?;
         match op.stat(&to_rel).await {
             Ok(_) => {
                 // On a case-insensitive filesystem a case-only rename stats
@@ -381,7 +425,7 @@ impl Provider {
     pub async fn read_to_file(&self, path: &str, dest: &std::path::Path) -> Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         let mut part = dest.as_os_str().to_owned();
         part.push(".part");
         let part = std::path::PathBuf::from(part);
@@ -413,7 +457,7 @@ impl Provider {
     /// Recursive (file count, total bytes) under a directory. Backends whose
     /// listings lack sizes (e.g. local fs) get a stat per file.
     pub async fn dir_size(&self, path: &str) -> Result<(u64, u64)> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         let entries = op.list_with(&rel).recursive(true).await?;
         let mut files = 0u64;
         let mut bytes = 0u64;
@@ -444,7 +488,7 @@ impl Provider {
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<()> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         op.create_dir(&rel).await?;
         Ok(())
     }
@@ -460,8 +504,8 @@ impl Provider {
                 "server-side copy cannot cross buckets"
             );
         }
-        let (op, from_rel) = self.op_for(from)?;
-        let (_, to_rel) = self.op_for(to)?;
+        let (op, from_rel) = self.route(from).await?;
+        let (_, to_rel) = self.route(to).await?;
         op.copy(&from_rel, &to_rel).await?;
         Ok(())
     }
@@ -491,7 +535,7 @@ impl Provider {
 
     /// Presigned GET URL (guarded by `caps.presign`).
     pub async fn presign_read(&self, path: &str, expire: Duration) -> Result<String> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         let presigned = op.presign_read(&rel, expire).await?;
         Ok(presigned.uri().to_string())
     }
@@ -533,7 +577,8 @@ impl Provider {
     /// Storage class per entry name for one S3 directory level.
     pub async fn storage_classes(&self, dir: &str) -> Result<HashMap<String, String>> {
         let (bucket, prefix) = self.s3_location(dir)?;
-        let classes = crate::s3::storage_classes(&self.options, &bucket, &prefix).await?;
+        let options = self.bucket_options(&bucket).await;
+        let classes = crate::s3::storage_classes(&options, &bucket, &prefix).await?;
         Ok(classes
             .into_iter()
             .filter_map(|(key, class)| {
@@ -546,13 +591,15 @@ impl Provider {
     /// Change one object's S3 storage class (copy-in-place).
     pub async fn set_storage_class(&self, path: &str, class: &str) -> Result<()> {
         let (bucket, key) = self.s3_location(path)?;
-        crate::s3::set_storage_class(&self.options, &bucket, &key, class).await
+        let options = self.bucket_options(&bucket).await;
+        crate::s3::set_storage_class(&options, &bucket, &key, class).await
     }
 
     /// Apply a canned ACL to one S3 object.
     pub async fn set_acl(&self, path: &str, acl: &str) -> Result<()> {
         let (bucket, key) = self.s3_location(path)?;
-        crate::s3::set_acl(&self.options, &bucket, &key, acl).await
+        let options = self.bucket_options(&bucket).await;
+        crate::s3::set_acl(&options, &bucket, &key, acl).await
     }
 
     /// Regions for the given buckets (bucket-root S3 sites), fetched
@@ -657,6 +704,7 @@ impl Provider {
                         .collect())
                 } else {
                     let (bucket, rest) = path.split_once('/').unwrap_or((path, ""));
+                    self.resolve_bucket_region(bucket).await;
                     let op = self.bucket_op(bucket)?;
                     list_operator(&op, rest, &format!("{bucket}/")).await
                 }
@@ -669,6 +717,7 @@ impl Provider {
             options,
             layers,
             bucket_ops,
+            regions,
         } = &self.backend
         else {
             unreachable!("bucket_op is only called in bucket-root mode");
@@ -679,6 +728,9 @@ impl Provider {
         }
         let mut options = options.clone();
         options.insert("bucket".to_string(), bucket.to_string());
+        if let Some(Some(region)) = regions.lock().unwrap().get(bucket) {
+            use_bucket_region(&mut options, region);
+        }
         let op = Self::apply_layers(
             Operator::via_iter("s3", options)
                 .with_context(|| format!("building operator for bucket `{bucket}`"))?,
@@ -706,6 +758,24 @@ impl Provider {
             write_renames_on_close: ftp,
         }
     }
+}
+
+/// Whether buckets of this account-root site can live in other regions: true
+/// on AWS, where the endpoint follows the region. A custom endpoint is one
+/// fixed server whatever a bucket says.
+fn follows_bucket_region(options: &HashMap<String, String>) -> bool {
+    options.get("endpoint").is_none_or(|endpoint| {
+        endpoint.is_empty()
+            || url::Url::parse(endpoint)
+                .is_ok_and(|url| url.host_str().is_some_and(|host| host.ends_with(".amazonaws.com")))
+    })
+}
+
+/// Point operator options at `region`. Without an endpoint OpenDAL and
+/// [`crate::s3`] derive the matching regional one.
+fn use_bucket_region(options: &mut HashMap<String, String>, region: &str) {
+    options.insert("region".to_string(), region.to_string());
+    options.remove("endpoint");
 }
 
 /// Side-channel limit for sites without a configured timeout.
@@ -798,6 +868,30 @@ fn contains_exact_name<'a>(names: impl IntoIterator<Item = &'a str>, name: &str)
     names
         .into_iter()
         .any(|candidate| candidate.trim_end_matches('/') == name)
+}
+
+#[cfg(test)]
+mod bucket_region_tests {
+    use super::*;
+
+    #[test]
+    fn only_aws_endpoints_follow_a_buckets_region() {
+        let with_endpoint = |endpoint: &str| HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+        assert!(follows_bucket_region(&HashMap::new()));
+        assert!(follows_bucket_region(&with_endpoint("https://s3.eu-central-1.amazonaws.com")));
+        assert!(!follows_bucket_region(&with_endpoint("https://minio.example.org")));
+    }
+
+    #[test]
+    fn a_bucket_operator_gets_the_regional_endpoint() {
+        let mut options = HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), "https://s3.us-east-1.amazonaws.com".to_string()),
+        ]);
+        use_bucket_region(&mut options, "eu-west-1");
+        assert_eq!(options["region"], "eu-west-1");
+        assert!(!options.contains_key("endpoint"));
+    }
 }
 
 #[cfg(test)]

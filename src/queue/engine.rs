@@ -915,7 +915,7 @@ async fn delete_orphans(pool: &SqlitePool, partials: Vec<(i64, String)>, default
 }
 
 async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
-    let (op, rel) = provider.op_for(path)?;
+    let (op, rel) = provider.route(path).await?;
     op.delete(&rel)
         .await
         .with_context(|| format!("deleting `{path}`"))
@@ -935,7 +935,7 @@ async fn expand_job(
     skip_hidden: bool,
     control: &JobControl,
 ) -> Result<bool> {
-    let (src_op, src_rel) = providers.src.op_for(&job.src)?;
+    let (src_op, src_rel) = providers.src.route(&job.src).await?;
     let name = job
         .dst_name
         .clone()
@@ -971,14 +971,14 @@ async fn expand_job(
         !providers.same_site || format!("{}{name}/", job.dst) != src_dir,
         "source and destination are the same folder"
     );
-    let (src_op, src_rel) = providers.src.op_for(&src_dir)?;
+    let (src_op, src_rel) = providers.src.route(&src_dir).await?;
     let base = format!("{}{name}/", job.dst);
 
     let mut walk = TreeWalk::new(src_op.clone(), src_rel.clone(), skip_hidden)
         .await
         .with_context(|| format!("listing `{src_dir}`"))?;
 
-    let (dst_op, dst_rel) = providers.dst.op_for(&base)?;
+    let (dst_op, dst_rel) = providers.dst.route(&base).await?;
     if dst_op.info().capability().create_dir {
         dst_op
             .create_dir(&dst_rel)
@@ -996,7 +996,7 @@ async fn expand_job(
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
         let meta = entry.metadata();
         if meta.is_dir() {
-            let (dst_op, dst_rel) = providers.dst.op_for(&format!("{base}{rel}"))?;
+            let (dst_op, dst_rel) = providers.dst.route(&format!("{base}{rel}")).await?;
             if dst_op.info().capability().create_dir {
                 dst_op
                     .create_dir(&dst_rel)
@@ -1151,7 +1151,7 @@ async fn cleanup_moved_source(provider: Provider, src: String) {
     use futures::TryStreamExt as _;
 
     let result: Result<()> = async {
-        let (op, rel) = provider.op_for(&src)?;
+        let (op, rel) = provider.route(&src).await?;
         let mut lister = op.lister_with(&rel).recursive(true).await?;
         let mut dirs = vec![rel.clone()];
         while let Some(entry) = lister.try_next().await? {
