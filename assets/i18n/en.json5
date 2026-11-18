@@ -258,6 +258,9 @@
   "sso.signed_in": "Signed in — a temporary session is cached for this profile.",
   "sso.hint": "Opens your Identity Center portal; approve the request, then connect.",
 
+  "startup.already_running": "kessel is already running. Switch to the open window, or quit it before starting kessel again.",
+  "startup.lock_failed": "kessel could not check whether it is already running.",
+
   // Auto-update.
   "update.footer": "Update {version} ready",
   "update.up_to_date": "You're up to date.",

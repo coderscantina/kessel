@@ -249,6 +249,9 @@
   "sso.hint": "Öffnet dein Identity-Center-Portal; Anfrage bestätigen, dann verbinden.",
 
   // Automatische Updates.
+  "startup.already_running": "kessel läuft bereits. Wechsle zum geöffneten Fenster oder beende kessel, bevor du es erneut startest.",
+  "startup.lock_failed": "kessel konnte nicht prüfen, ob es bereits läuft.",
+
   "update.footer": "Update {version} bereit",
   "update.up_to_date": "Du bist auf dem neuesten Stand.",
   "update.check_failed": "Update-Prüfung fehlgeschlagen — bitte später erneut versuchen.",

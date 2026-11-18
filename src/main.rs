@@ -15,6 +15,7 @@ mod errors;
 mod ftp;
 mod i18n;
 mod import;
+mod instance;
 mod keymap;
 mod localfs;
 mod logs;
@@ -65,6 +66,16 @@ fn main() -> Result<()> {
         ),
     };
     i18n::init(&config.ui.locale);
+
+    // Held until the process ends: two instances would share one queue.
+    let Some(_instance) = or_fatal(
+        instance::acquire(&data_dir, instance::UPDATE_PATIENCE),
+        &i18n::t("startup.lock_failed"),
+    )?
+    else {
+        show_fatal(&i18n::t("startup.already_running"));
+        return Ok(());
+    };
 
     // Reloadable filter so config.json5 edits to `logging.filter` apply
     // live (see app::watch_config); RUST_LOG still wins at startup.
