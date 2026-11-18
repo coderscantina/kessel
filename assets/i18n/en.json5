@@ -183,6 +183,7 @@
   "sync.confirm.start": "Delete {count} and start",
   "sync.confirm.back": "Back",
   "sync.report.skipped": "{count} item(s) were left alone because they changed after the review.",
+  "edit.unsafe_name": "“{name}” can't be edited because its name isn't a valid local file name.",
   "edit.saved": "Saved {name} to {site}.",
   "edit.failed": "Couldn't save {name} to {site}: {reason} Your local copy is kept.",
   "edit.retry": "Retry",

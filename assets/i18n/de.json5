@@ -175,6 +175,7 @@
   "sync.confirm.start": "{count} löschen und starten",
   "sync.confirm.back": "Zurück",
   "sync.report.skipped": "{count} Element(e) blieben unberührt, weil sie sich nach der Prüfung geändert haben.",
+  "edit.unsafe_name": "„{name}“ kann nicht bearbeitet werden, weil der Name kein gültiger lokaler Dateiname ist.",
   "edit.saved": "{name} auf {site} gespeichert.",
   "edit.failed": "{name} konnte nicht auf {site} gespeichert werden: {reason} Die lokale Kopie bleibt erhalten.",
   "edit.retry": "Erneut versuchen",
