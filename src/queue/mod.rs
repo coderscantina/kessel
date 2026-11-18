@@ -74,8 +74,9 @@ pub(crate) fn has_dot_segment(path: &str) -> bool {
     path.split('/').any(|segment| matches!(segment, "." | ".."))
 }
 
-/// Clock slack when comparing modified times across backends and between
-/// listings and stats (FAT, S3 and friends round or re-stamp timestamps).
+/// Clock slack when comparing modified times across backends (FAT, S3 and
+/// friends round or re-stamp timestamps). Never used to prove that a file on
+/// one backend is unchanged.
 pub(crate) const MTIME_SLACK_SECS: i64 = 2;
 
 /// What a destination must still hold for a reviewed write to go ahead. The
@@ -86,7 +87,7 @@ pub enum ExpectedDest {
     /// Nothing may exist at the destination.
     Absent,
     /// The file the user reviewed. An ETag known on both sides decides alone;
-    /// otherwise the modified time does, within [`MTIME_SLACK_SECS`].
+    /// otherwise the exact modified time does.
     File {
         size: u64,
         etag: Option<String>,
@@ -104,10 +105,10 @@ impl ExpectedDest {
             return false;
         }
         if let (Some(expected), Some(now)) = (etag.as_deref(), meta.etag()) {
-            return expected == now;
+            return normalize_etag(expected) == normalize_etag(now);
         }
         match (modified, meta.last_modified().and_then(crate::provider::to_datetime)) {
-            (Some(expected), Some(now)) => (*expected - now).num_seconds().abs() <= MTIME_SLACK_SECS,
+            (Some(expected), Some(now)) => *expected == now,
             _ => true,
         }
     }
@@ -502,5 +503,39 @@ impl QueueHandle {
 
     pub fn latest(&self) -> QueueSnapshot {
         self.snapshot.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+    use opendal::raw::Timestamp;
+    use opendal::{EntryMode, Metadata};
+
+    use super::*;
+
+    #[test]
+    fn a_reviewed_destination_must_be_the_exact_version() {
+        let current = |etag: Option<&str>| {
+            let mut meta = Metadata::new(EntryMode::FILE);
+            meta.set_content_length(3);
+            meta.set_last_modified(Timestamp::from_second(100).unwrap());
+            if let Some(etag) = etag {
+                meta.set_etag(etag);
+            }
+            meta
+        };
+        let reviewed = |secs, etag: Option<&str>| ExpectedDest::File {
+            size: 3,
+            etag: etag.map(str::to_string),
+            modified: Some(Utc.timestamp_opt(secs, 0).unwrap()),
+        };
+
+        assert!(reviewed(100, None).matches(Some(&current(None))));
+        // Within the old two second tolerance, but another version.
+        assert!(!reviewed(101, None).matches(Some(&current(None))));
+        // The reviewed ETag decides, however the server quotes it.
+        assert!(reviewed(90, Some("\"ABC\"")).matches(Some(&current(Some("abc")))));
+        assert!(!reviewed(100, Some("abc")).matches(Some(&current(Some("def")))));
     }
 }

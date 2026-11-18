@@ -81,15 +81,15 @@ pub struct ReviewedFile {
 
 impl ReviewedFile {
     /// Whether the file is still this version: an ETag known on both sides
-    /// decides, otherwise the time does. `None` when neither can tell.
-    /// Listings and stats can report a time at different precision, so
-    /// times get the same slack as the comparison itself.
+    /// decides, otherwise the exact time does. `None` when neither can tell.
+    /// A backend whose listings and stats disagree on precision reads as
+    /// changed, which leaves the file alone.
     fn same_version(&self, modified: Option<DateTime<Utc>>, etag: Option<&str>) -> Option<bool> {
         if let (Some(reviewed), Some(now)) = (self.etag.as_deref(), etag) {
             return Some(normalize_etag(reviewed) == normalize_etag(now));
         }
         let (reviewed, now) = (self.modified?, modified?);
-        Some((reviewed - now).num_seconds().abs() <= MTIME_SLACK_SECS)
+        Some(reviewed == now)
     }
 }
 
@@ -97,7 +97,7 @@ impl ReviewedFile {
 fn expected_dest(reviewed: Option<&ReviewedFile>) -> ExpectedDest {
     reviewed.map_or(ExpectedDest::Absent, |file| ExpectedDest::File {
         size: file.size,
-        etag: None,
+        etag: file.etag.clone(),
         modified: file.modified,
     })
 }
@@ -708,8 +708,8 @@ mod tests {
         assert_eq!(expected_dest(None), ExpectedDest::Absent);
         let modified = Some(Utc::now());
         assert_eq!(
-            expected_dest(Some(&ReviewedFile { size: 7, modified, etag: None })),
-            ExpectedDest::File { size: 7, etag: None, modified }
+            expected_dest(Some(&ReviewedFile { size: 7, modified, etag: Some("v1".into()) })),
+            ExpectedDest::File { size: 7, etag: Some("v1".into()), modified }
         );
     }
 
@@ -858,7 +858,7 @@ mod tests {
         let (rt, dir, provider) = local_fixture("proof");
         std::fs::write(dir.join("dst/old.txt"), b"same").unwrap();
         let path = browse_dir(&dir, "dst/old.txt");
-        let modified = std::fs::metadata(dir.join("dst/old.txt")).unwrap().modified().unwrap().into();
+        let modified: DateTime<Utc> = std::fs::metadata(dir.join("dst/old.txt")).unwrap().modified().unwrap().into();
         let delete = |reviewed: ReviewedFile| {
             let entry = ReviewedDelete { path: path.clone(), is_dir: false, reviewed: Some(reviewed) };
             rt.block_on(delete_reviewed(&provider, &entry)).unwrap()
@@ -870,6 +870,10 @@ mod tests {
         // A same-size replacement with another time stays too.
         let earlier = chrono::DateTime::<Utc>::UNIX_EPOCH;
         assert!(!delete(ReviewedFile { size: 4, modified: Some(earlier), etag: None }));
+        assert!(dir.join("dst/old.txt").exists());
+        // One second off is another version, however close.
+        let close: DateTime<Utc> = modified + chrono::Duration::seconds(1);
+        assert!(!delete(ReviewedFile { size: 4, modified: Some(close), etag: None }));
         assert!(dir.join("dst/old.txt").exists());
 
         assert!(delete(ReviewedFile { size: 4, modified: Some(modified), etag: None }));
