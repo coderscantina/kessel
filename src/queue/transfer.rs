@@ -273,6 +273,10 @@ async fn run_inner(
             return Err(error).with_context(|| format!("stat source `{}`", task.src));
         }
     };
+    // The source is still there, so an earlier commit record is out of date.
+    if task.dst_committed {
+        store::set_task_dst_committed(pool, task.id, false).await?;
+    }
     let size = meta.content_length();
     let etag = meta.etag().map(str::to_string);
     let modified = meta
@@ -357,12 +361,16 @@ async fn run_inner(
     // A same-site move is one rename on the server when the backend has it.
     // Anything it can't do (another volume, say) still works by copying.
     if opts.same_site && task.move_source && dst.caps.rename && offset == 0 && !append_to_existing {
+        store::set_task_dst_committed(pool, task.id, true).await?;
         match move_into_place(dst, &dst_op, &src_path, &dst_path).await {
             Ok(()) => return Ok(Outcome::Done { bytes: size }),
-            Err(error) => tracing::warn!(
-                src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
-                "server-side move failed; falling back to copying"
-            ),
+            Err(error) => {
+                store::set_task_dst_committed(pool, task.id, false).await?;
+                tracing::warn!(
+                    src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
+                    "server-side move failed; falling back to copying"
+                );
+            }
         }
     }
 
@@ -597,6 +605,7 @@ async fn finish_transfer(
     }
 
     if task.move_source {
+        store::set_task_dst_committed(pool, task.id, true).await?;
         // Only delete what was copied: a source that changed meanwhile stays.
         let now = src_op
             .stat(src_path)
@@ -642,10 +651,11 @@ async fn reviewed_state_changed(task: &ClaimedTask, op: &Operator, path: &str) -
 }
 
 /// Whether a move whose source is gone already finished: a crash can land
-/// between deleting the source and recording completion. The destination then
-/// holds the whole file. Returns its size.
+/// between deleting the source and recording completion. Only a destination
+/// the task recorded as complete counts, a file of the same size that happens
+/// to be there does not. Returns its size.
 async fn already_moved(task: &ClaimedTask, op: &Operator, path: &str) -> Result<Option<u64>> {
-    let Some(size) = task.total_bytes else {
+    let Some(size) = task.total_bytes.filter(|_| task.dst_committed) else {
         return Ok(None);
     };
     match op.stat(path).await {
@@ -892,6 +902,7 @@ mod tests {
             partial: None,
             in_place: false,
             expected: None,
+            dst_committed: false,
         }
     }
 
@@ -940,17 +951,22 @@ mod tests {
             preserve_timestamps: false,
             throttle: None,
         };
-        let moved = |total_bytes| ClaimedTask {
+        let moved = |total_bytes, dst_committed| ClaimedTask {
             total_bytes: Some(total_bytes),
             move_source: true,
+            dst_committed,
             ..task(None, None)
         };
 
-        let (done, _) = run_task(&pool, &provider, &provider, &moved(6), &control, opts.clone()).await;
+        let (done, _) = run_task(&pool, &provider, &provider, &moved(6, true), &control, opts.clone()).await;
         assert!(matches!(done, Outcome::Done { bytes: 6 }), "{done:?}");
         // A shorter destination is no finished move: the failure stays visible.
-        let (short, _) = run_task(&pool, &provider, &provider, &moved(9), &control, opts).await;
+        let (short, _) = run_task(&pool, &provider, &provider, &moved(9, true), &control, opts.clone()).await;
         assert!(matches!(short, Outcome::Failed(_)), "{short:?}");
+        // An unrelated file of the right size, with nothing recorded: the
+        // source vanished before this task moved anything.
+        let (unrelated, _) = run_task(&pool, &provider, &provider, &moved(6, false), &control, opts).await;
+        assert!(matches!(unrelated, Outcome::Failed(_)), "{unrelated:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

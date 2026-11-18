@@ -52,6 +52,8 @@ pub(crate) struct ClaimedTask {
     pub in_place: bool,
     /// What the destination must still hold when this task writes it.
     pub expected: Option<ExpectedDest>,
+    /// A move recorded its destination as complete before removing the source.
+    pub dst_committed: bool,
 }
 
 /// A file discovered during directory expansion.
@@ -286,7 +288,7 @@ fn claim_sql(ids: &str) -> String {
              WHERE j.state = 'active' AND j.id IN ({ids}) \
              ORDER BY j.priority DESC, head.id LIMIT 1) \
          RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, partial, in_place, \
-             expected_dest, \
+             expected_dest, dst_committed, \
              COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
              (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
     )
@@ -331,6 +333,7 @@ pub(crate) async fn claim_task(
         partial: row.get("partial"),
         in_place: row.get::<i64, _>("in_place") != 0,
         expected,
+        dst_committed: row.get::<i64, _>("dst_committed") != 0,
     }))
 }
 
@@ -456,6 +459,17 @@ pub(crate) async fn set_task_dst(pool: &SqlitePool, task_id: i64, dst: &str) -> 
 pub(crate) async fn set_task_partial(pool: &SqlitePool, task_id: i64, partial: Option<&str>) -> Result<()> {
     sqlx::query("UPDATE transfer_tasks SET partial = ? WHERE id = ?")
         .bind(partial)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record whether a move's destination is complete. Set before the source is
+/// removed, so a source found missing later proves the move finished.
+pub(crate) async fn set_task_dst_committed(pool: &SqlitePool, task_id: i64, committed: bool) -> Result<()> {
+    sqlx::query("UPDATE transfer_tasks SET dst_committed = ? WHERE id = ?")
+        .bind(committed)
         .bind(task_id)
         .execute(pool)
         .await?;
