@@ -49,6 +49,9 @@ use tracing_subscriber::EnvFilter;
 use app::{AppState, KesselApp};
 
 fn main() -> Result<()> {
+    // Dependencies link two rustls crypto backends, so rustls cannot choose one
+    // itself and FTPS would panic on connect.
+    let _ = futures_rustls::rustls::crypto::ring::default_provider().install_default();
     let data_dir = or_fatal(config::data_dir(), "kessel could not open its data directory.")?;
     // A damaged config.json5 must not keep the app from opening: fall back to
     // the defaults and tell the user in the window once it is up.
