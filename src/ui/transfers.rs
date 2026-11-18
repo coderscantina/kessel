@@ -441,6 +441,13 @@ fn is_local_download(job: &JobSnapshot) -> bool {
     job.state == JobState::Done && job.dst_site_id == LOCAL_SITE_ID
 }
 
+/// Whether "Open" may hand the download to the OS. Programs and scripts only
+/// offer reveal, so a downloaded file never runs from a queue row.
+fn can_open_download(job: &JobSnapshot) -> bool {
+    let target = job.dst_file.as_deref().unwrap_or(&job.src);
+    is_local_download(job) && !crate::ui::file_pane::can_run_code(file_name(target), None)
+}
+
 /// SQLite `datetime('now')` (UTC) in local time.
 fn history_time(raw: &str) -> String {
     chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
@@ -797,13 +804,15 @@ impl TransfersPanel {
             .when(local_download, |this| {
                 let open = local_target(job);
                 let shown = open.clone();
-                this.child(
-                    Button::new(("open", key))
-                        .label(t("transfers.open"))
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_, _, _| crate::ui::open_path_or_url(&open.to_string_lossy())),
-                )
+                this.when(can_open_download(job), |this| {
+                    this.child(
+                        Button::new(("open", key))
+                            .label(t("transfers.open"))
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, _| crate::ui::open_path_or_url(&open.to_string_lossy())),
+                    )
+                })
                 .child(
                     Button::new(("reveal", key))
                         .icon(Icon::new(IconName::FolderOpen))
@@ -1180,12 +1189,13 @@ fn build_job_menu(
     if is_local_download(job) {
         let open = local_target(job);
         let shown = open.clone();
-        menu = menu
-            .item(
+        if can_open_download(job) {
+            menu = menu.item(
                 PopupMenuItem::new(t("transfers.open"))
                     .on_click(move |_, _, _| crate::ui::open_path_or_url(&open.to_string_lossy())),
-            )
-            .item(PopupMenuItem::new(reveal_label()).on_click(move |_, _, _| reveal(&shown)));
+            );
+        }
+        menu = menu.item(PopupMenuItem::new(reveal_label()).on_click(move |_, _, _| reveal(&shown)));
     }
     if job.state == JobState::Done {
         let panel = panel.clone();

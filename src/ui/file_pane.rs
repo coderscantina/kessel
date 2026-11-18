@@ -1490,10 +1490,72 @@ impl FilePane {
                 crate::ui::open_path_or_url(&full.to_string_lossy());
             }
         } else {
-            for file in files {
-                self.edit_external(file, window, cx);
+            let (risky, safe): (Vec<FsEntry>, Vec<FsEntry>) = files
+                .into_iter()
+                .partition(|file| can_run_code(&file.name, file.permissions));
+            for file in safe {
+                self.start_external_edit(file, window, cx);
+            }
+            if !risky.is_empty() {
+                self.confirm_launch(risky, window, cx);
             }
         }
+    }
+
+    /// A remote file that the OS would execute never opens on a plain Enter
+    /// or double-click: the dialog names it, leads with downloading it, and
+    /// has no default button, so a stray Enter does nothing.
+    fn confirm_launch(&mut self, files: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.entity().downgrade();
+        let title = match files.as_slice() {
+            [file] => tf("file_pane.launch.title_one", &[("name", &file.name)]),
+            _ => tf("file_pane.launch.title_other", &[("count", &files.len().to_string())]),
+        };
+        let names = name_list(&files);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let download = {
+                let pane = pane.clone();
+                let files = files.clone();
+                Button::new("launch-download")
+                    .label(t("file_pane.launch.download"))
+                    .small()
+                    .primary()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let files = files.clone();
+                        pane.update(cx, |this, cx| this.download(files, window, cx)).ok();
+                    })
+            };
+            let open = {
+                let pane = pane.clone();
+                let files = files.clone();
+                Button::new("launch-open")
+                    .label(t("file_pane.launch.open_anyway"))
+                    .small()
+                    .danger()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        for file in files.clone() {
+                            pane.update(cx, |this, cx| this.start_external_edit(file, window, cx)).ok();
+                        }
+                    })
+            };
+            dialog.title(title.clone()).w(px(440.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(t("file_pane.launch.body"))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(names.clone()))
+                    .child(
+                        h_flex().gap_2().child(download).child(open).child(
+                            Button::new("launch-cancel")
+                                .label(t("file_pane.launch.cancel"))
+                                .small()
+                                .ghost()
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                    ),
+            )
+        });
     }
 
     /// Filesystem root of a local (fs) site.
@@ -1627,6 +1689,14 @@ impl FilePane {
         let files: Vec<FsEntry> = entries.into_iter().filter(|entry| !entry.is_dir).collect();
         if files.is_empty() {
             window.push_notification("Quick Look works on remote files, not folders.", cx);
+            return;
+        }
+        // Only macOS has a real previewer; elsewhere a preview is the OS
+        // default handler, which would execute these.
+        if !cfg!(target_os = "macos")
+            && files.iter().any(|file| can_run_code(&file.name, file.permissions))
+        {
+            window.push_notification(t("file_pane.launch.no_preview"), cx);
             return;
         }
         let Some(provider) = self.provider().cloned() else { return };
@@ -2324,8 +2394,9 @@ impl FilePane {
     }
 
     /// Download to temp, open in the default app, and re-upload on save
-    /// (see `crate::edit`).
-    fn edit_external(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
+    /// (see `crate::edit`). Callers go through [`Self::open_files`], which
+    /// asks first for files the OS would execute.
+    fn start_external_edit(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
         let Some(provider) = self.provider().cloned() else { return };
         let queue = cx.global::<AppState>().queue.clone();
         let path = entry.path.clone();
@@ -3488,7 +3559,7 @@ fn build_context_menu(
                 let pane = weak.clone();
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
-                        this.edit_external(entry.clone(), window, cx)
+                        this.open_files(vec![entry.clone()], window, cx)
                     })
                     .ok();
                 }
@@ -4075,6 +4146,44 @@ impl Render for FilePane {
     }
 }
 
+/// File types the OS runs, installs or hands to an interpreter when "opened".
+const RUNNABLE_EXTENSIONS: &[&str] = &[
+    // Windows.
+    "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "mst", "cpl", "hta", "jar", "ps1",
+    "psm1", "vb", "vbs", "vbe", "js", "jse", "ws", "wsf", "wsc", "wsh", "lnk", "inf", "reg",
+    "scf", "url", "application", "appref-ms", "gadget", "msc",
+    // macOS.
+    "command", "tool", "app", "pkg", "mpkg", "dmg", "terminal", "scpt", "scptd", "applescript",
+    "workflow", "action", "osax", "prefpane", "webloc", "inetloc", "fileloc",
+    // Linux and scripts.
+    "sh", "bash", "zsh", "csh", "ksh", "fish", "run", "bin", "appimage", "desktop", "deb", "rpm",
+    "py", "pyw", "pl", "rb", "php", "lua",
+];
+
+/// Whether opening this file with the OS handler could run code. Windows
+/// ignores trailing dots and spaces and `:stream` suffixes, so they are
+/// stripped first. An executable file without an extension also counts.
+pub(crate) fn can_run_code(name: &str, mode: Option<u32>) -> bool {
+    let name = name.split(':').next().unwrap_or(name).trim_end_matches(['.', ' ']);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            RUNNABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        _ => mode.is_some_and(|mode| mode & 0o111 != 0),
+    }
+}
+
+/// Up to five quoted names, then how many more there are.
+fn name_list(files: &[FsEntry]) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<String> = files.iter().take(SHOWN).map(|file| format!("“{}”", file.name)).collect();
+    let names = names.join(", ");
+    match files.len().saturating_sub(SHOWN) {
+        0 => names,
+        more => tf("file_pane.names_more", &[("names", &names), ("count", &more.to_string())]).to_string(),
+    }
+}
+
 /// Case-insensitive fuzzy (subsequence) match: every query character must
 /// appear in `name`, in order — "rlib" hits "railib.rs".
 fn fuzzy_match(name: &str, query: &str) -> bool {
@@ -4430,6 +4539,20 @@ mod tests {
             storage_class: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn files_the_os_would_execute_are_recognized() {
+        for name in ["setup.EXE", "run.command", "a.pdf.bat", "evil.bat. ", "x.cmd:stream", "go.sh"] {
+            assert!(can_run_code(name, None), "{name}");
+        }
+        for name in ["report.pdf", "notes.txt", ".bashrc", "README", "archive.tar.gz"] {
+            assert!(!can_run_code(name, None), "{name}");
+        }
+        // The mode only decides for names without an extension.
+        assert!(can_run_code("deploy", Some(0o755)));
+        assert!(!can_run_code("deploy", Some(0o644)));
+        assert!(!can_run_code("notes.txt", Some(0o755)));
     }
 
     #[test]

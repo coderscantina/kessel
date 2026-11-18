@@ -398,4 +398,14 @@
   "file_pane.open_many.title": "{count} Objekte öffnen?",
   "file_pane.open_many.body": "Jede Datei öffnet sich in ihrer Standard-App, jeder Ordner in einem neuen Tab.",
   "file_pane.open_many.ok": "Öffnen",
+
+  // Files that can run code.
+  "file_pane.launch.title_one": "„{name}“ öffnen?",
+  "file_pane.launch.title_other": "{count} Dateien öffnen, die Programme ausführen können?",
+  "file_pane.launch.body": "Dieser Dateityp kann Programme auf deinem Computer ausführen. Lade die Datei zuerst zur Prüfung herunter und öffne sie nur, wenn du der Quelle vertraust.",
+  "file_pane.launch.download": "Herunterladen",
+  "file_pane.launch.open_anyway": "Trotzdem öffnen",
+  "file_pane.launch.cancel": "Abbrechen",
+  "file_pane.launch.no_preview": "Dieser Dateityp kann Programme ausführen und deshalb nicht in der Vorschau angezeigt werden. Lade ihn stattdessen herunter.",
+  "file_pane.names_more": "{names} und {count} weitere",
 }

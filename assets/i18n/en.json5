@@ -408,4 +408,14 @@
   "file_pane.open_many.title": "Open {count} items?",
   "file_pane.open_many.body": "Each file opens in its default app and each folder in a new tab.",
   "file_pane.open_many.ok": "Open",
+
+  // Files that can run code.
+  "file_pane.launch.title_one": "Open “{name}”?",
+  "file_pane.launch.title_other": "Open {count} files that can run programs?",
+  "file_pane.launch.body": "This file type can run programs on your computer. Download it to inspect it first, and only open it if you trust where it came from.",
+  "file_pane.launch.download": "Download",
+  "file_pane.launch.open_anyway": "Open anyway",
+  "file_pane.launch.cancel": "Cancel",
+  "file_pane.launch.no_preview": "This file type can run programs, so it can't be previewed. Download it instead.",
+  "file_pane.names_more": "{names} and {count} more",
 }
