@@ -92,6 +92,7 @@ fn main() -> Result<()> {
         });
     tracing_subscriber::registry()
         .with(filter)
+        .with(logs::credential_guard())
         .with(tracing_subscriber::fmt::layer())
         .with(log_file)
         // In-app capture for the bottom log panel.
