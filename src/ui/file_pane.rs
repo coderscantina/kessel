@@ -179,14 +179,14 @@ impl Column {
         }
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Column::Size => "Size",
-            Column::Modified => "Modified",
-            Column::Permissions => "Permissions",
-            Column::StorageClass => "Class",
-            Column::Region => "Region",
-        }
+    fn title(self) -> SharedString {
+        t(match self {
+            Column::Size => "file_pane.column.size",
+            Column::Modified => "file_pane.column.modified",
+            Column::Permissions => "file_pane.column.permissions",
+            Column::StorageClass => "file_pane.column.class",
+            Column::Region => "file_pane.column.region",
+        })
     }
 
     fn default_width(self) -> f32 {
@@ -585,7 +585,7 @@ impl FilePane {
         )
         .detach();
 
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(t("file_pane.search.placeholder")));
 
         cx.subscribe_in(
             &search_input,
@@ -1397,7 +1397,7 @@ impl FilePane {
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Loading…")
+                    .child(t("file_pane.loading"))
                     .into_any_element(),
             );
         }
@@ -1600,14 +1600,18 @@ impl FilePane {
         };
         let selected_count = selected().count();
         if selected_count == 0 {
-            return format!("{item_count} items");
+            return items_label(item_count).to_string();
         }
         // Folder sizes aren't known from a listing; sum files only.
         let bytes: u64 = selected()
             .filter(|entry| !entry.is_dir)
             .map(|entry| entry.size)
             .sum();
-        let mut status = format!("{item_count} items · {selected_count} selected");
+        let mut status = tf(
+            "file_pane.summary.selected",
+            &[("items", &items_label(item_count)), ("count", &selected_count.to_string())],
+        )
+        .to_string();
         if bytes > 0 {
             status.push_str(&format!(" · {}", human_size(bytes)));
         }
@@ -2062,7 +2066,7 @@ impl FilePane {
 
         let files: Vec<FsEntry> = entries.into_iter().filter(|entry| !entry.is_dir).collect();
         if files.is_empty() {
-            window.push_notification("Quick Look works on remote files, not folders.", cx);
+            window.push_notification(t("file_pane.quick_look.files_only"), cx);
             return;
         }
         // Only macOS has a real previewer; elsewhere a preview is the OS
@@ -2085,7 +2089,7 @@ impl FilePane {
             }
             anyhow::Ok(paths)
         });
-        window.push_notification("Preparing Quick Look…", cx);
+        window.push_notification(t("file_pane.quick_look.preparing"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -2269,7 +2273,7 @@ impl FilePane {
             files: true,
             directories: true,
             multiple: true,
-            prompt: Some("Upload files or folders".into()),
+            prompt: Some(t("file_pane.upload.prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picker.await else {
@@ -2532,7 +2536,7 @@ impl FilePane {
             let entry = entry.clone();
             let input = input.clone();
             dialog
-                .title("Rename")
+                .title(t("file_pane.rename.title"))
                 .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
@@ -2570,13 +2574,13 @@ impl FilePane {
     }
 
     fn new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("folder name"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t("file_pane.new_folder.placeholder")));
         let pane = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let input = input.clone();
             dialog
-                .title("New folder")
+                .title(t("file_pane.new_folder.title"))
                 .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
@@ -2648,7 +2652,7 @@ impl FilePane {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Download".into()),
+            prompt: Some(t("file_pane.download.prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
@@ -2728,7 +2732,7 @@ impl FilePane {
             this.update_in(cx, |_, window, cx| match result {
                 Ok(url) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
-                    window.push_notification("Presigned URL copied to clipboard.", cx);
+                    window.push_notification(t("file_pane.presign.copied"), cx);
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "presign failed");
@@ -2782,7 +2786,7 @@ impl FilePane {
             .global::<AppState>()
             .runtime
             .spawn(async move { provider.dir_size(&path).await });
-        window.push_notification(format!("Calculating size of `{name}`…"), cx);
+        window.push_notification(tf("file_pane.folder_size.calculating", &[("name", &name)]), cx);
         let path = entry.path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
@@ -2823,7 +2827,7 @@ impl FilePane {
             .global::<AppState>()
             .runtime
             .spawn(async move { crate::edit::start(provider, path, name, queue).await });
-        window.push_notification("Opening in external editor — saves upload back automatically.", cx);
+        window.push_notification(t("file_pane.edit.opening"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -2906,9 +2910,9 @@ impl FilePane {
             let entry = entry.clone();
             let input = input.clone();
             dialog
-                .title(format!("Permissions for `{}`", entry.name))
+                .title(tf("file_pane.permissions.title", &[("name", &entry.name)]))
                 .width(px(380.))
-                .child("Octal mode, e.g. 644 or 755.")
+                .child(t("file_pane.permissions.hint"))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -2976,7 +2980,7 @@ impl FilePane {
                     }
                     _ => {
                         window.push_notification(
-                            format!("Linked browsing stopped: cannot open matching folder /{path}"),
+                            tf("file_pane.linked_stopped", &[("path", &path)]),
                             cx,
                         );
                         cx.emit(PaneEvent::LinkedNavigationFailed);
@@ -3913,10 +3917,10 @@ const S3_ACLS: [&str; 4] = [
 
 /// Presigned-URL lifetimes offered in the context menu.
 const PRESIGN_EXPIRIES: [(&str, u64); 4] = [
-    ("15 minutes", 900),
-    ("1 hour", 3600),
-    ("1 day", 86400),
-    ("1 week", 604800),
+    ("file_pane.presign.15_minutes", 900),
+    ("file_pane.presign.1_hour", 3600),
+    ("file_pane.presign.1_day", 86400),
+    ("file_pane.presign.1_week", 604800),
 ];
 
 /// Right-click menu, acting on the pane's current selection.
@@ -3952,11 +3956,12 @@ fn build_context_menu(
     };
     let count = selected.len();
     let single = (count == 1).then(|| selected[0].clone());
+    let count_text = count.to_string();
     let plural = |verb: &str| {
         if count == 1 {
-            format!("{verb} “{}”", selected[0].name)
+            tf(&format!("file_pane.menu.{verb}_one"), &[("name", &selected[0].name)])
         } else {
-            format!("{verb} {count} Items")
+            tf(&format!("file_pane.menu.{verb}_other"), &[("count", &count_text)])
         }
     };
     let weak = pane.downgrade();
@@ -3983,7 +3988,7 @@ fn build_context_menu(
     }
     if !is_local {
         menu = menu
-            .item(PopupMenuItem::new(plural("Download")).on_click({
+            .item(PopupMenuItem::new(plural("download")).on_click({
                 let pane = weak.clone();
                 let selected = selected.clone();
                 move |_, window, cx| {
@@ -3994,7 +3999,7 @@ fn build_context_menu(
                 }
             }));
         if let Some(entry) = single.clone() {
-            menu = menu.item(PopupMenuItem::new("Download As…").on_click({
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.download_as")).on_click({
                 let pane = weak.clone();
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
@@ -4004,7 +4009,7 @@ fn build_context_menu(
                 }
             }));
         }
-        menu = menu.item(PopupMenuItem::new("Download To…").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.download_to")).on_click({
             let pane = weak.clone();
             let selected = selected.clone();
             move |_, window, cx| {
@@ -4048,7 +4053,7 @@ fn build_context_menu(
                 }),
         );
     if row_entry.is_dir {
-        menu = menu.item(PopupMenuItem::new("Open in new tab").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.open_new_tab")).on_click({
             let pane = weak.clone();
             let path = row_entry.path.clone();
             move |_, _, cx| {
@@ -4075,7 +4080,7 @@ fn build_context_menu(
     menu = menu
         .separator()
         .item(
-            PopupMenuItem::new("Rename…")
+            PopupMenuItem::new(t("file_pane.menu.rename"))
                 .disabled(!can_rename)
                 .on_click({
                     let pane = weak.clone();
@@ -4089,7 +4094,7 @@ fn build_context_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("Duplicate")
+            PopupMenuItem::new(t("file_pane.menu.duplicate"))
                 .disabled(!can_duplicate)
                 .on_click({
                     let pane = weak.clone();
@@ -4107,7 +4112,7 @@ fn build_context_menu(
             .clone()
             .filter(|entry| !entry.is_dir && !entry.is_bucket)
         {
-            menu = menu.item(PopupMenuItem::new("Edit in External Editor").on_click({
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.edit_external")).on_click({
                 let pane = weak.clone();
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
@@ -4119,7 +4124,7 @@ fn build_context_menu(
         }
     }
     if let Some(entry) = single.clone().filter(|entry| entry.is_dir && !entry.is_bucket) {
-        menu = menu.item(PopupMenuItem::new("Calculate Folder Size").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.folder_size")).on_click({
             let pane = weak.clone();
             move |_, window, cx| {
                 pane.update(cx, |this, cx| {
@@ -4141,7 +4146,7 @@ fn build_context_menu(
         {
             let pane = weak.clone();
             let entry = entry.clone();
-            menu = menu.item(PopupMenuItem::new("Open Presigned URL").on_click(
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.open_presigned")).on_click(
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.open_presigned(
@@ -4156,11 +4161,11 @@ fn build_context_menu(
             ));
         }
         let pane = weak.clone();
-        menu = menu.submenu("Copy Presigned URL", window, cx, move |menu, _, _| {
+        menu = menu.submenu(t("file_pane.menu.copy_presigned"), window, cx, move |menu, _, _| {
             PRESIGN_EXPIRIES.into_iter().fold(menu, |menu, (label, secs)| {
                 let pane = pane.clone();
                 let entry = entry.clone();
-                menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(t(label)).on_click(move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.copy_presigned(
                             entry.clone(),
@@ -4186,7 +4191,7 @@ fn build_context_menu(
             let current = entry.storage_class.clone();
             let pane = weak.clone();
             let class_entry = entry.clone();
-            menu = menu.submenu("Storage Class", window, cx, move |menu, _, _| {
+            menu = menu.submenu(t("file_pane.menu.storage_class"), window, cx, move |menu, _, _| {
                 S3_STORAGE_CLASSES.into_iter().fold(menu, |menu, class| {
                     let pane = pane.clone();
                     let entry = class_entry.clone();
@@ -4203,7 +4208,7 @@ fn build_context_menu(
                 })
             });
             let pane = weak.clone();
-            menu = menu.submenu("ACL", window, cx, move |menu, _, _| {
+            menu = menu.submenu(t("file_pane.menu.acl"), window, cx, move |menu, _, _| {
                 S3_ACLS.into_iter().fold(menu, |menu, acl| {
                     let pane = pane.clone();
                     let entry = entry.clone();
@@ -4219,7 +4224,7 @@ fn build_context_menu(
     if supports_permissions(&scheme) {
         if let Some(entry) = single.clone() {
             let pane = weak.clone();
-            menu = menu.separator().item(PopupMenuItem::new("Permissions…").on_click(
+            menu = menu.separator().item(PopupMenuItem::new(t("file_pane.menu.permissions")).on_click(
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.permissions_dialog(entry.clone(), window, cx)
@@ -4231,7 +4236,7 @@ fn build_context_menu(
     }
 
     menu.separator()
-        .item(PopupMenuItem::new(format!("{}…", plural("Delete"))).on_click({
+        .item(PopupMenuItem::new(plural("delete")).on_click({
             let pane = weak;
             move |_, window, cx| {
                 pane.update(cx, |this, cx| {
@@ -4386,11 +4391,11 @@ impl Render for FilePane {
                             .small()
                             .ghost()
                             .selected(self.tree_visible)
-                            .tooltip(if self.tree_visible {
-                                "Hide folder tree"
+                            .tooltip(t(if self.tree_visible {
+                                "file_pane.tooltip.hide_tree"
                             } else {
-                                "Show folder tree"
-                            })
+                                "file_pane.tooltip.show_tree"
+                            }))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_tree(&ToggleTree, window, cx);
                             }))
@@ -4401,7 +4406,7 @@ impl Render for FilePane {
                             .ghost()
                             .small()
                             .disabled(self.back_stack.is_empty())
-                            .tooltip("Back")
+                            .tooltip(t("file_pane.tooltip.back"))
                             .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
                     )
                     .child(
@@ -4410,7 +4415,7 @@ impl Render for FilePane {
                             .ghost()
                             .small()
                             .disabled(self.forward_stack.is_empty())
-                            .tooltip("Forward")
+                            .tooltip(t("file_pane.tooltip.forward"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.go_forward(window, cx)),
                             ),
@@ -4433,11 +4438,11 @@ impl Render for FilePane {
                     .child(
                         Button::new("upload")
                             .icon(Icon::new(IconName::ArrowUp))
-                            .label("Upload…")
+                            .label(t("file_pane.upload.label"))
                             .ghost()
                             .small()
                             .disabled(!connected)
-                            .tooltip("Upload files or full folders into this directory")
+                            .tooltip(t("file_pane.upload.tooltip"))
                             .on_click(cx.listener(|this, _, window, cx| this.upload(window, cx))),
                     )
                     .child(
@@ -4446,7 +4451,7 @@ impl Render for FilePane {
                             .ghost()
                             .small()
                             .disabled(!connected)
-                            .tooltip("New folder")
+                            .tooltip(t("file_pane.new_folder.title"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.new_folder_dialog(window, cx)
@@ -4528,7 +4533,7 @@ impl Render for FilePane {
                                 });
                             let weak = weak.clone();
                             menu.separator().item(
-                                PopupMenuItem::new("Show hidden files")
+                                PopupMenuItem::new(t("file_pane.menu.show_hidden"))
                                     .checked(show_hidden)
                                     .on_click(move |_, window, cx| {
                                         weak.update(cx, |this, cx| {
@@ -4548,7 +4553,7 @@ impl Render for FilePane {
                             .truncate()
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| this.set_sort(None, cx)))
-                            .child(format!("Name{}", self.sort_marker(None))),
+                            .child(format!("{}{}", t("file_pane.column.name"), self.sort_marker(None))),
                     )
                     .when(self.tree_search.is_some(), |el| {
                         el.child(
@@ -4946,10 +4951,7 @@ fn supports_permissions(scheme: &str) -> bool {
 }
 
 fn unreachable_volume_message(count: usize) -> String {
-    format!(
-        "{count} item(s) are on a drive without a Local filesystem bookmark. \
-         Add one rooted at that drive to use it."
-    )
+    tf("file_pane.unreachable_volume", &[("count", &count.to_string())]).to_string()
 }
 
 /// `report.pdf` → `report copy.pdf`, then `report copy 2.pdf`, … — first
