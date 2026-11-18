@@ -1850,12 +1850,18 @@ impl FilePane {
     ) {
         let dst_site = self.site_id();
         let conflict_policy = default_conflict_policy(cx);
+        let sites = &cx.global::<AppState>().sites;
+        let mut unreachable = 0;
         let jobs = paths
             .iter()
-            .map(|path| crate::localfs::browse_path(path, path.is_dir()))
-            .filter(|src| dst_site != crate::queue::LOCAL_SITE_ID || parent_of(src) != dst_dir)
-            .map(|src| NewJob {
-                src_site_id: crate::queue::LOCAL_SITE_ID,
+            .filter_map(|path| {
+                let located = crate::localfs::locate(sites, path, path.is_dir());
+                unreachable += usize::from(located.is_none());
+                located
+            })
+            .filter(|(site, src)| dst_site != *site || parent_of(src) != dst_dir)
+            .map(|(src_site_id, src)| NewJob {
+                src_site_id,
                 dst_site_id: dst_site,
                 src,
                 dst_dir: dst_dir.clone(),
@@ -1864,6 +1870,9 @@ impl FilePane {
                 move_source: false,
             })
             .collect();
+        if unreachable > 0 {
+            window.push_notification(unreachable_volume_message(unreachable), cx);
+        }
         self.submit_jobs(jobs, window, cx);
     }
 
@@ -2103,17 +2112,23 @@ impl FilePane {
     fn enqueue_downloads(
         &mut self,
         entries: Vec<FsEntry>,
-        dst_dir: String,
+        dst_dir: &Path,
         dst_name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some((dst_site_id, dst_dir)) =
+            crate::localfs::locate(&cx.global::<AppState>().sites, dst_dir, true)
+        else {
+            window.push_notification(unreachable_volume_message(1), cx);
+            return;
+        };
         let conflict_policy = default_conflict_policy(cx);
         let jobs = entries
             .into_iter()
             .map(|entry| NewJob {
                 src_site_id: self.site_id(),
-                dst_site_id: crate::queue::LOCAL_SITE_ID,
+                dst_site_id,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
                 dst_name: dst_name.clone(),
@@ -2128,7 +2143,7 @@ impl FilePane {
     /// folder picker when the platform has none).
     fn download(&mut self, entries: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
         match dirs::download_dir() {
-            Some(dir) => self.enqueue_downloads(entries, local_dir_path(&dir), None, window, cx),
+            Some(dir) => self.enqueue_downloads(entries, &dir, None, window, cx),
             None => self.download_to(entries, window, cx),
         }
     }
@@ -2154,7 +2169,7 @@ impl FilePane {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.enqueue_downloads(entries, local_dir_path(&dir), None, window, cx);
+                this.enqueue_downloads(entries, &dir, None, window, cx);
             })
             .ok();
         })
@@ -2180,7 +2195,7 @@ impl FilePane {
             this.update_in(cx, |this, window, cx| {
                 this.enqueue_downloads(
                     vec![entry],
-                    local_dir_path(&dir),
+                    &dir,
                     Some(name),
                     window,
                     cx,
@@ -4145,6 +4160,13 @@ fn preview_files(paths: Vec<PathBuf>) {
 /// a unix build (see `sftp_unsupported.rs`).
 fn supports_permissions(scheme: &str) -> bool {
     scheme == "sftp" || (cfg!(unix) && scheme == "fs")
+}
+
+fn unreachable_volume_message(count: usize) -> String {
+    format!(
+        "{count} item(s) are on a drive without a Local filesystem bookmark. \
+         Add one rooted at that drive to use it."
+    )
 }
 
 /// Local directory → browse path on the reserved local site (root-relative,
