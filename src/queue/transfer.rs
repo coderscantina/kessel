@@ -1,11 +1,11 @@
 //! One task = one file, streamed source → destination in ranged chunks.
 //!
 //! Safe overwrite: on backends that can rename (local fs, sftp, ftp, …) a
-//! task writes into its own partial file next to the destination
-//! (`.<name>.<task id>.kessel-part`, on FTP a fresh random name, see
-//! [`fresh_ftp_partial`]) and renames it onto the real name only after the
-//! copy finished and verified. The old file stays intact until then. The task
-//! records the partial it owns, so cancel and removal can delete it later. Object stores write the destination directly: their
+//! task writes into its own partial file next to the destination (a fresh
+//! random name, see [`fresh_partial`]) and renames it onto the real name only
+//! after the copy finished and verified. The old file stays intact until then.
+//! The task records the partial it owns, so a resume, cancel and removal only
+//! ever touch that file. Object stores write the destination directly: their
 //! uploads only become visible on a successful close, so an interrupted
 //! upload is always aborted and restarts from zero.
 //!
@@ -173,26 +173,17 @@ fn sibling(path: &str, name: &str) -> String {
     format!("{}{name}", &path[..path.len() - file_name(path).len()])
 }
 
-/// The partial file next to `path` (an operator or browse path) that task
-/// `task_id` writes before committing, on backends other than FTP.
-fn partial_name(path: &str, task_id: i64) -> String {
-    format!(".{}.{task_id}{PARTIAL_SUFFIX}", file_name(path))
+/// The file an earlier run of the task left its bytes in. Only the task's
+/// record knows it: a file that merely looks like a partial isn't ours.
+fn earlier_partial(path: &str, task: &ClaimedTask) -> Option<String> {
+    task.partial.as_deref().map(|partial| sibling(path, file_name(partial)))
 }
 
-/// The file an earlier run of the task left its bytes in. FTP partials have
-/// random names, so only the task's record knows them.
-fn earlier_partial(dst: &Provider, path: &str, task: &ClaimedTask) -> Option<String> {
-    if dst.scheme == "ftp" {
-        return task.partial.as_deref().map(|partial| sibling(path, file_name(partial)));
-    }
-    Some(sibling(path, &partial_name(path, task.id)))
-}
-
-/// A partial name next to `path` that nothing on the FTP server uses yet. FTP
-/// can't create a file exclusively and appends to what it finds, so the name
-/// is random and probed first. It never starts with a dot: many servers hide
-/// dotfiles from `LIST`.
-async fn fresh_ftp_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
+/// A partial name next to `path` that nothing at the destination uses yet.
+/// Not every backend can create a file exclusively, and FTP appends to what it
+/// finds, so the name is random and probed first. It never starts with a dot:
+/// many FTP servers hide dotfiles from `LIST`.
+async fn fresh_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
     for _ in 0..8 {
         let name = format!("kessel-{task_id}-{:016x}{PARTIAL_SUFFIX}", rand::random::<u64>());
         match op.stat(&sibling(path, &name)).await {
@@ -296,7 +287,7 @@ async fn run_inner(
         let written = if task.in_place || !stages(&dst.caps) {
             Some(dst_path.clone())
         } else {
-            earlier_partial(dst, &dst_path, task)
+            earlier_partial(&dst_path, task)
         };
         if let Some(written) = written.filter(|_| {
             can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref())
@@ -380,9 +371,8 @@ async fn run_inner(
     let in_place = append_to_existing || (offset > 0 && task.in_place);
     let partial = if stages(&dst.caps) && !in_place {
         let name = match task.partial.as_deref() {
-            _ if dst.scheme != "ftp" => partial_name(&dst_path, task.id),
             Some(recorded) if offset > 0 => file_name(recorded).to_string(),
-            _ => fresh_ftp_partial(&dst_op, &dst_path, task.id).await?,
+            _ => fresh_partial(&dst_op, &dst_path, task.id).await?,
         };
         Some((sibling(&dst_path, &name), sibling(&dst_browse, &name)))
     } else {
@@ -966,6 +956,61 @@ mod tests {
         // source vanished before this task moved anything.
         let (unrelated, _) = run_task(&pool, &provider, &provider, &moved(6, false), &control, opts).await;
         assert!(matches!(unrelated, Outcome::Failed(_)), "{unrelated:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_the_recorded_partial_is_ever_touched() {
+        const OLD_STYLE: &str = ".b.1.kessel-part";
+        let dir = std::env::temp_dir().join(format!("kessel-partial-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"0123456789").unwrap();
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), dir.to_string_lossy().to_string())].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&local, &Default::default()).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let control = JobControl::default();
+        let opts = TransferOpts {
+            same_site: false,
+            verify: false,
+            preserve_timestamps: false,
+            limiters: Vec::new(),
+        };
+        let (op, _) = provider.op_for("").unwrap();
+        let modified = op.stat("a").await.unwrap().last_modified().and_then(crate::provider::to_datetime);
+        let modified = modified.map(|time| time.to_rfc3339());
+
+        // A user's file at the old predictable name, on a fresh start and on a
+        // legacy task that resumes without a recorded partial.
+        std::fs::write(dir.join(OLD_STYLE), b"mine").unwrap();
+        for byte_offset in [0, 4] {
+            let fresh = ClaimedTask { byte_offset, ..task(None, modified.as_deref()) };
+            let (done, _) = run_task(&pool, &provider, &provider, &fresh, &control, opts.clone()).await;
+            assert!(matches!(done, Outcome::Done { bytes: 10 }), "{done:?}");
+            assert_eq!(std::fs::read(dir.join("b")).unwrap(), b"0123456789");
+            assert_eq!(std::fs::read(dir.join(OLD_STYLE)).unwrap(), b"mine");
+            std::fs::remove_file(dir.join("b")).unwrap();
+        }
+
+        // A recorded partial is ours, whatever its name: the resume continues it.
+        std::fs::write(dir.join(OLD_STYLE), b"XXXX").unwrap();
+        let resumed = ClaimedTask {
+            partial: Some(OLD_STYLE.to_string()),
+            ..task(None, modified.as_deref())
+        };
+        let (done, _) = run_task(&pool, &provider, &provider, &resumed, &control, opts).await;
+        assert!(matches!(done, Outcome::Done { bytes: 10 }), "{done:?}");
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), b"XXXX456789");
+        assert!(!dir.join(OLD_STYLE).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2691,6 +2691,14 @@ mod tests {
         // Marked bytes prove the copy appended to the partial instead of
         // starting over.
         std::fs::write(legacy_partial(&dst, task), [b'X'; 16]).unwrap();
+        // This row was inserted after migrating; real databases recorded the
+        // partial through this backfill.
+        env.rt
+            .block_on(
+                sqlx::raw_sql(include_str!("../../migrations/0014_legacy_task_partials.sql"))
+                    .execute(&env.pool),
+            )
+            .unwrap();
 
         env.handle.resume(job);
         let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
@@ -2723,7 +2731,10 @@ mod tests {
         env.handle.resume(job);
         pause_once_past(&env, job, offset);
         assert_eq!(std::fs::read(&dst).unwrap(), b"OLD");
-        assert_eq!(partials(&dst_dir), vec![legacy_partial(&dst, task)]);
+        // With no recorded partial, the old predictable name isn't assumed to be ours.
+        let staged = partials(&dst_dir);
+        assert_eq!(staged.len(), 1);
+        assert_ne!(staged[0], legacy_partial(&dst, task));
 
         env.handle.resume(job);
         let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
