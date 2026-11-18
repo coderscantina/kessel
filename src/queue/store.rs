@@ -64,6 +64,10 @@ pub(crate) struct NewTask {
 }
 
 pub(crate) async fn get_site(pool: &SqlitePool, site_id: i64) -> Result<SiteProfile> {
+    // The seeded row says `/`; the pane's root is the system drive on Windows.
+    if site_id == super::LOCAL_SITE_ID {
+        return Ok(crate::app::local_profile());
+    }
     let row = sqlx::query(
         "SELECT id, name, scheme, options, layers, secret_handle FROM sites WHERE id = ?",
     )
@@ -1192,6 +1196,17 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_local_site_uses_the_panes_profile_whatever_its_row_says() {
+        let (pool, _) = prepared_job().await;
+        sqlx::query("UPDATE sites SET options = '{\"root\":\"/elsewhere\"}' WHERE id = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let local = get_site(&pool, super::super::LOCAL_SITE_ID).await.unwrap();
+        assert_eq!(local.options, crate::app::local_profile().options);
     }
 
     #[tokio::test]
