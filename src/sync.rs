@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 
 use crate::queue::{
-    normalize_etag, BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState, NewBatch,
-    QueueHandle, MTIME_SLACK_SECS,
+    has_dot_segment, normalize_etag, BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState,
+    NewBatch, QueueHandle, MTIME_SLACK_SECS,
 };
 use crate::provider::Provider;
 
@@ -47,17 +47,21 @@ pub enum PlanKind {
     /// The two sides hold different kinds of entry at this path (file,
     /// folder or folder link). Shown for the user to resolve, never applied.
     Conflict,
+    /// A listed path with a `.` or `..` segment, which could point outside
+    /// the compared folders. Shown as skipped, never applied.
+    UnsafePath,
 }
 
 impl PlanKind {
     /// Review order.
-    pub const ALL: [PlanKind; 6] = [
+    pub const ALL: [PlanKind; 7] = [
         PlanKind::Copy,
         PlanKind::Update,
         PlanKind::DestNewer,
         PlanKind::Unsure,
         PlanKind::Delete,
         PlanKind::Conflict,
+        PlanKind::UnsafePath,
     ];
 
     /// Whether the review ticks this kind until the user says otherwise.
@@ -145,9 +149,11 @@ impl FileMeta {
 /// Uses the provider's own per-directory listing so bucket-root S3 sites and
 /// stat-completed fs listings behave exactly like the browser pane. The
 /// queue's own partial files are not part of either tree. Folder links are
-/// not followed, so a scan stays inside `root` and always ends.
-async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMeta>> {
+/// not followed, so a scan stays inside `root` and always ends. Paths with a
+/// `.` or `..` segment stay out of the tree and come back separately.
+async fn walk(provider: &Provider, root: &str) -> Result<(BTreeMap<String, FileMeta>, Vec<String>)> {
     let mut out = BTreeMap::new();
+    let mut unsafe_paths = Vec::new();
     let mut pending = vec![root.to_string()];
     while let Some(dir) = pending.pop() {
         for entry in provider.list(&dir).await? {
@@ -155,6 +161,10 @@ async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMe
                 continue;
             };
             if rel.is_empty() || (!entry.is_dir && rel.ends_with(crate::queue::PARTIAL_SUFFIX)) {
+                continue;
+            }
+            if has_dot_segment(rel) {
+                unsafe_paths.push(rel.to_string());
                 continue;
             }
             let dir_link = entry.is_dir && entry.is_symlink;
@@ -173,7 +183,7 @@ async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMe
             }
         }
     }
-    Ok(out)
+    Ok((out, unsafe_paths))
 }
 
 /// Whether copies to `provider` can carry the source's modified time (see
@@ -292,10 +302,18 @@ pub async fn plan(
     let (src_root, dst_root) = tokio::join!(location(src, src_dir), location(dst, dst_dir));
     anyhow::ensure!(!overlapping(&src_root, &dst_root), "{}", crate::i18n::t("sync.overlap"));
 
-    let (src_tree, dst_tree) = tokio::try_join!(walk(src, src_dir), walk(dst, dst_dir))?;
+    let ((src_tree, src_unsafe), (dst_tree, dst_unsafe)) =
+        tokio::try_join!(walk(src, src_dir), walk(dst, dst_dir))?;
     let dst_keeps_mtime = keeps_source_mtime(dst);
 
     let (mut items, blocked) = conflicts(&src_tree, &dst_tree);
+    items.extend(src_unsafe.into_iter().chain(dst_unsafe).map(|rel| PlanItem {
+        rel,
+        is_dir: false,
+        kind: PlanKind::UnsafePath,
+        size: 0,
+        reviewed: None,
+    }));
     let mut entries = src_tree.iter().peekable();
     while let Some((rel, src_meta)) = entries.next() {
         // Path order puts a folder's contents right after the folder.
@@ -378,13 +396,13 @@ pub struct SyncWork {
 
 impl SyncWork {
     /// The items whose `selected` flag is set, rooted at both directories.
-    /// Conflicts are never work, whatever their flag says.
+    /// Conflicts and unsafe paths are never work, whatever their flag says.
     pub fn from_plan(plan: &SyncPlan, selected: &[bool], src_dir: &str, dst_dir: &str) -> Self {
         let mut work = Self::default();
         for (item, _) in plan.items.iter().zip(selected).filter(|(_, on)| **on) {
             let dst = format!("{dst_dir}{}", item.rel);
             match item.kind {
-                PlanKind::Conflict => {}
+                PlanKind::Conflict | PlanKind::UnsafePath => {}
                 PlanKind::Delete => work.deletes.push(ReviewedDelete {
                     path: dst,
                     is_dir: item.is_dir,
@@ -711,7 +729,7 @@ mod tests {
         };
         let provider = Provider::connect(&local, &Default::default()).unwrap();
         let root = format!("{}/", dir.to_str().unwrap().trim_start_matches('/'));
-        let tree = rt.block_on(walk(&provider, &root)).unwrap();
+        let (tree, _) = rt.block_on(walk(&provider, &root)).unwrap();
         assert_eq!(tree.keys().map(String::as_str).collect::<Vec<_>>(), ["a.txt", "sub/"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -774,7 +792,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("outside"), dir.join("src/away")).unwrap();
         std::os::unix::fs::symlink(dir.join("src"), dir.join("src/loop")).unwrap();
 
-        let tree = rt.block_on(walk(&provider, &browse_dir(&dir, "src/"))).unwrap();
+        let (tree, _) = rt.block_on(walk(&provider, &browse_dir(&dir, "src/"))).unwrap();
         assert_eq!(tree.keys().map(String::as_str).collect::<Vec<_>>(), ["a.txt", "away/", "loop/"]);
         assert!(tree["away/"].dir_link && tree["loop/"].dir_link);
 
@@ -783,6 +801,33 @@ mod tests {
             .block_on(plan(&provider, &browse_dir(&dir, "src/"), &provider, &browse_dir(&dir, "dst/"), SyncMode::Mirror))
             .unwrap();
         assert_eq!(plan.items.iter().map(|item| item.rel.as_str()).collect::<Vec<_>>(), ["a.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listed_path_that_climbs_out_of_the_roots_is_reported_and_never_applied() {
+        let (rt, dir, local) = local_fixture("dot-segments");
+        let server = crate::ftp::test_server::FakeFtp::start();
+        server.put("pub/ok.txt", b"fine");
+        server.list_raw("pub", "../../escape.txt");
+        let profile = crate::provider::SiteProfile {
+            id: 2,
+            scheme: "ftp".into(),
+            options: [("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))].into(),
+            ..Default::default()
+        };
+        let ftp = Provider::connect(&profile, &Default::default()).unwrap();
+        let dst_dir = browse_dir(&dir, "dst/");
+
+        let reviewed = rt.block_on(plan(&ftp, "pub/", &local, &dst_dir, SyncMode::Mirror)).unwrap();
+        let row = |kind| reviewed.items.iter().find(|item| item.kind == kind).map(|item| item.rel.as_str());
+        assert_eq!(row(PlanKind::UnsafePath), Some("../../escape.txt"));
+        assert_eq!(row(PlanKind::Copy), Some("ok.txt"));
+        assert!(!PlanKind::UnsafePath.selected_by_default());
+
+        let work = SyncWork::from_plan(&reviewed, &vec![true; reviewed.items.len()], "pub/", &dst_dir);
+        assert_eq!(work.copies.len(), 1);
+        assert!(work.copies[0].file.dst.ends_with("dst/ok.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

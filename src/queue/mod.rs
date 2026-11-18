@@ -67,6 +67,12 @@ pub struct BatchFile {
     pub size: Option<u64>,
 }
 
+/// Whether a listed path has a `.` or `..` segment. Object keys can hold them,
+/// and a destination built from one would land outside the chosen folder.
+pub(crate) fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| matches!(segment, "." | ".."))
+}
+
 /// Clock slack when comparing modified times across backends and between
 /// listings and stats (FAT, S3 and friends round or re-stamp timestamps).
 pub(crate) const MTIME_SLACK_SECS: i64 = 2;

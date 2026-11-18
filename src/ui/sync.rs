@@ -313,7 +313,7 @@ impl SyncDialog {
                     .child(
                         Checkbox::new(("sync-kind", kind as usize))
                             .checked(on == total)
-                            .disabled(kind == PlanKind::Conflict)
+                            .disabled(matches!(kind, PlanKind::Conflict | PlanKind::UnsafePath))
                             .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                                 if let State::Planned(review) = &mut this.state {
                                     review.set_kind(kind, *checked);
@@ -393,7 +393,7 @@ fn render_row(review: &Review, ix: usize, cx: &mut Context<SyncDialog>) -> AnyEl
         .child(
             Checkbox::new(("sync-item", ix))
                 .checked(review.selected[ix])
-                .disabled(item.kind == PlanKind::Conflict)
+                .disabled(matches!(item.kind, PlanKind::Conflict | PlanKind::UnsafePath))
                 .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                     if let State::Planned(review) = &mut this.state {
                         review.selected[ix] = *checked;
@@ -415,7 +415,7 @@ fn render_row(review: &Review, ix: usize, cx: &mut Context<SyncDialog>) -> AnyEl
                 .truncate()
                 .child(SharedString::from(item.rel.clone())),
         )
-        .when(!item.is_dir && !matches!(item.kind, PlanKind::Delete | PlanKind::Conflict), |el| {
+        .when(!item.is_dir && !matches!(item.kind, PlanKind::Delete | PlanKind::Conflict | PlanKind::UnsafePath), |el| {
             el.child(div().text_color(muted).child(human_size(item.size)))
         })
         .into_any_element()
@@ -428,7 +428,7 @@ fn kind_color(kind: PlanKind, theme: &Theme) -> Hsla {
         PlanKind::DestNewer => theme.warning,
         PlanKind::Unsure => theme.muted_foreground,
         PlanKind::Delete => theme.danger,
-        PlanKind::Conflict => theme.warning,
+        PlanKind::Conflict | PlanKind::UnsafePath => theme.warning,
     }
 }
 
@@ -440,6 +440,7 @@ fn kind_label(kind: PlanKind) -> SharedString {
         PlanKind::Unsure => "sync.kind.unsure",
         PlanKind::Delete => "sync.kind.delete",
         PlanKind::Conflict => "sync.kind.conflict",
+        PlanKind::UnsafePath => "sync.kind.unsafe_path",
     })
 }
 
@@ -451,6 +452,7 @@ fn row_tag(kind: PlanKind) -> SharedString {
         PlanKind::Unsure => "sync.plan.unsure",
         PlanKind::Delete => "sync.plan.delete",
         PlanKind::Conflict => "sync.plan.conflict",
+        PlanKind::UnsafePath => "sync.plan.unsafe_path",
     })
 }
 

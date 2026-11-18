@@ -161,6 +161,8 @@ pub(crate) mod test_server {
     struct Tree {
         files: BTreeMap<String, Vec<u8>>,
         dirs: BTreeSet<String>,
+        /// `(folder, name)` pairs `LIST` reports without any file behind them.
+        listed: Vec<(String, String)>,
     }
 
     #[derive(Clone)]
@@ -186,6 +188,11 @@ pub(crate) mod test_server {
 
         pub fn put(&self, path: &str, content: &[u8]) {
             self.tree.lock().unwrap().files.insert(path.to_string(), content.to_vec());
+        }
+
+        /// Make `LIST` of `dir` report `name` verbatim, as a hostile server would.
+        pub fn list_raw(&self, dir: &str, name: &str) {
+            self.tree.lock().unwrap().listed.push((dir.to_string(), name.to_string()));
         }
 
         pub fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -287,7 +294,12 @@ pub(crate) mod test_server {
                 .dirs
                 .iter()
                 .filter_map(|path| child(path).map(|name| format!("drwxr-xr-x 1 o g 0 Jan 01 12:00 {name}\r\n")));
-            files.chain(dirs).collect()
+            let raw = tree
+                .listed
+                .iter()
+                .filter(|(listed, _)| listed == dir)
+                .map(|(_, name)| format!("-rw-r--r-- 1 o g 1 Jan 01 12:00 {name}\r\n"));
+            files.chain(dirs).chain(raw).collect()
         }
     }
 }

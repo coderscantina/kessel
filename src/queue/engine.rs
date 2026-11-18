@@ -27,6 +27,7 @@ use crate::config::TransferConfig;
 use crate::provider::{LayerConfig, Provider};
 
 use super::store::{self, JobRow, NewTask};
+use super::has_dot_segment;
 use super::transfer::{self, JobControl, Outcome, TransferOpts};
 use super::{Command, JobOutcome, JobState, QueueHandle, QueueSnapshot};
 
@@ -926,8 +927,8 @@ async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
 /// while the walk runs, so arbitrarily large trees never sit in memory.
 /// Subdirectories are pre-created at the destination (so empty dirs
 /// survive). Links to files are copied as files; links to folders (which
-/// could form cycles), broken links and special files are recorded as
-/// skipped. Returns false when a pause or cancel stopped the walk early.
+/// could form cycles), broken links, special files and paths with `.` or `..`
+/// segments are recorded as skipped. Returns false when a pause or cancel stopped the walk early.
 async fn expand_job(
     pool: &SqlitePool,
     providers: &JobProviders,
@@ -994,6 +995,11 @@ async fn expand_job(
             return Ok(false);
         }
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
+        if has_dot_segment(rel) {
+            let reason = crate::i18n::t("transfers.skipped.unsafe_path");
+            store::insert_skipped(pool, job.id, &format!("{src_dir}{rel}"), &base, &reason).await?;
+            continue;
+        }
         let meta = entry.metadata();
         if meta.is_dir() {
             let (dst_op, dst_rel) = providers.dst.route(&format!("{base}{rel}")).await?;
@@ -1133,7 +1139,7 @@ impl TreeWalk {
                 continue;
             }
             if let TreeWalk::Folders { pending, .. } = self {
-                if entry.metadata().is_dir() {
+                if entry.metadata().is_dir() && !has_dot_segment(rel) {
                     pending.push(entry.path().to_string());
                 }
             }
@@ -2282,6 +2288,30 @@ mod tests {
             dst_site_id: 2,
             ..job(browse(src), "up/".to_string(), ConflictPolicy::Overwrite)
         }
+    }
+
+    #[test]
+    fn a_listed_path_that_climbs_out_of_the_destination_is_skipped() {
+        let (env, server) = ftp_env("dot-segments", 0);
+        server.put("pub/ok.txt", b"fine");
+        server.list_raw("pub", "../../escape.txt");
+        let out = env.dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let new_job = NewJob {
+            src_site_id: 2,
+            ..job("pub/".to_string(), format!("{}/", browse(&out)), ConflictPolicy::Overwrite)
+        };
+        let id = env.rt.block_on(env.handle.submit(new_job)).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done, outcome.files_skipped), (JobState::Done, 1, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(out.join("pub/ok.txt")).unwrap(), b"fine");
+        assert!(!env.dir.join("escape.txt").exists());
+        let tasks = env.rt.block_on(store::job_tasks(&env.pool, id, 10)).unwrap();
+        let skipped = tasks.iter().find(|task| task.state == "skipped").unwrap();
+        assert!(skipped.src.ends_with("../../escape.txt"));
+        assert_eq!(skipped.error.as_deref(), Some(crate::i18n::t("transfers.skipped.unsafe_path").as_ref()));
     }
 
     #[test]
