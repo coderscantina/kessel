@@ -1194,7 +1194,8 @@ async fn cleanup_moved_source(provider: Provider, src: String) {
         let mut lister = op.lister_with(&rel).recursive(true).await?;
         let mut dirs = vec![rel.clone()];
         while let Some(entry) = lister.try_next().await? {
-            if !entry.metadata().is_dir() {
+            let inner = entry.path().strip_prefix(rel.as_str()).unwrap_or(entry.path());
+            if !entry.metadata().is_dir() || has_dot_segment(inner) {
                 tracing::debug!(%src, "move: files remain at the source; leaving it in place");
                 return Ok(());
             }
