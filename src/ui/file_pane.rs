@@ -17,11 +17,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::Watcher as _;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, div, px, uniform_list, App, Bounds, ClickEvent, Context, Entity,
@@ -96,6 +98,14 @@ const ROW_HEIGHT: f32 = 26.0;
 const OPEN_CONFIRM_THRESHOLD: usize = 20;
 /// Suffix of the queue's in-progress partial files, kept out of listings.
 use crate::queue::PARTIAL_SUFFIX;
+/// Listings at least this long sort and filter off the UI thread.
+const BACKGROUND_ROWS: usize = 5_000;
+/// Quiet time after a keystroke before filtering a long listing.
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(40);
+/// How long a new folder may take to list before its first rows show.
+const PREVIEW_DELAY: Duration = Duration::from_millis(400);
+/// Rows shown from a slow listing until the complete one arrives.
+const PREVIEW_ROWS: usize = 1_000;
 /// Width of the "Folder" column while showing recursive search results.
 const LOCATION_WIDTH: f32 = 220.0;
 
@@ -256,6 +266,20 @@ impl Default for Sort {
 
 impl Sort {
     fn compare(&self, a: &FsEntry, b: &FsEntry) -> std::cmp::Ordering {
+        self.compare_keyed(a, &a.name.to_lowercase(), b, &b.name.to_lowercase())
+    }
+
+    /// Sort rows in place, lowercasing each name once instead of per compare.
+    fn sort_rows(&self, rows: &mut Vec<FsEntry>) {
+        let mut keyed: Vec<(String, FsEntry)> = rows
+            .drain(..)
+            .map(|entry| (entry.name.to_lowercase(), entry))
+            .collect();
+        keyed.sort_by(|a, b| self.compare_keyed(&a.1, &a.0, &b.1, &b.0));
+        rows.extend(keyed.into_iter().map(|(_, entry)| entry));
+    }
+
+    fn compare_keyed(&self, a: &FsEntry, a_name: &str, b: &FsEntry, b_name: &str) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let group = b
             .is_parent
@@ -272,8 +296,7 @@ impl Sort {
             Some(Column::StorageClass) => a.storage_class.cmp(&b.storage_class),
             Some(Column::Region) => a.region.cmp(&b.region),
         };
-        let name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-        let keyed = keyed.then(name);
+        let keyed = keyed.then_with(|| a_name.cmp(b_name));
         if self.ascending {
             keyed
         } else {
@@ -313,7 +336,7 @@ impl EventEmitter<PaneEvent> for FilePane {}
 #[derive(Clone)]
 pub struct DraggedEntries {
     pub site_id: i64,
-    pub entries: Vec<FsEntry>,
+    pub entries: Arc<[FsEntry]>,
 }
 
 /// The row drag currently in flight, if any. Set when a row drag starts and
@@ -424,11 +447,16 @@ pub struct FilePane {
     /// Why the last path-bar entry was rejected (a URL for another site).
     path_error: Option<SharedString>,
     /// Rendered listing — `all_entries` narrowed by the type-to-search
-    /// filter (or a plain copy when no search is active). All row/selection
-    /// indices refer to this view.
-    entries: Vec<FsEntry>,
+    /// filter (the same allocation when no filter is active). All
+    /// row/selection indices refer to this view.
+    entries: Arc<Vec<FsEntry>>,
     /// Full listing for the current directory, in sort order.
-    all_entries: Vec<FsEntry>,
+    all_entries: Arc<Vec<FsEntry>>,
+    /// Bumped per view change, so a late background sort or filter is dropped.
+    view_seq: usize,
+    /// The selection as drag payload, rebuilt when the selection changes so
+    /// a big selection isn't copied for every visible row on every frame.
+    drag_selection: Option<(BTreeSet<usize>, Arc<[FsEntry]>)>,
     /// Type-to-search: the filter bar input, shown while `search_active`.
     search_input: Entity<InputState>,
     search_active: bool,
@@ -565,8 +593,7 @@ impl FilePane {
             |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change { .. } => {
                     this.search_query = input.read(cx).value().to_string();
-                    this.rebuild_view();
-                    cx.notify();
+                    this.schedule_filter(cx);
                 }
                 InputEvent::PressEnter { .. } => {
                     let query = this.search_query.trim();
@@ -606,8 +633,10 @@ impl FilePane {
             path_input,
             editing_path: false,
             path_error: None,
-            entries: Vec::new(),
-            all_entries: Vec::new(),
+            entries: Arc::default(),
+            all_entries: Arc::default(),
+            view_seq: 0,
+            drag_selection: None,
             search_input,
             search_active: false,
             search_query: String::new(),
@@ -781,43 +810,137 @@ impl FilePane {
                 ascending: true,
             };
         }
-        self.apply_sort();
+        self.apply_sort(cx);
         cx.notify();
     }
 
-    fn apply_sort(&mut self) {
+    /// Re-sort the listing; long ones sort off the UI thread and swap in when
+    /// done, so clicking a column header never freezes the window.
+    fn apply_sort(&mut self, cx: &mut Context<Self>) {
         let sort = self.sort;
-        self.all_entries.sort_by(|a, b| sort.compare(a, b));
-        self.rebuild_view();
+        if self.all_entries.len() < BACKGROUND_ROWS {
+            let mut rows = (*self.all_entries).clone();
+            sort.sort_rows(&mut rows);
+            self.all_entries = Arc::new(rows);
+            self.rebuild_view(cx);
+            return;
+        }
+        self.view_seq += 1;
+        let seq = self.view_seq;
+        let rows = self.all_entries.clone();
+        cx.spawn(async move |this, cx| {
+            let sorted = cx
+                .background_spawn(async move {
+                    let mut rows = (*rows).clone();
+                    sort.sort_rows(&mut rows);
+                    rows
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.view_seq == seq {
+                    this.all_entries = Arc::new(sorted);
+                    this.rebuild_view(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Change rows in the listing and the rendered view alike.
+    fn update_rows(&mut self, update: impl Fn(&mut FsEntry)) {
+        let shared = Arc::ptr_eq(&self.entries, &self.all_entries);
+        if shared {
+            // Drop the view's reference so the rows are edited in place.
+            self.entries = Arc::default();
+        } else {
+            Arc::make_mut(&mut self.entries).iter_mut().for_each(&update);
+        }
+        Arc::make_mut(&mut self.all_entries).iter_mut().for_each(&update);
+        if shared {
+            self.entries = self.all_entries.clone();
+        }
     }
 
     // --- type-to-search ---
 
+    /// The fuzzy filter currently narrowing the rows, if any.
+    fn active_filter(&self) -> Option<String> {
+        let query = self.search_query.trim();
+        (self.search_active && !query.is_empty() && self.tree_search.is_none())
+            .then(|| query.to_string())
+    }
+
     /// Rebuild the rendered `entries` view from `all_entries` and the fuzzy
-    /// query. Row indices change, so selection and cursor are carried over
-    /// by path; entries the filter hides drop out of the selection.
-    fn rebuild_view(&mut self) {
+    /// query, right away.
+    fn rebuild_view(&mut self, cx: &mut Context<Self>) {
+        self.view_seq += 1;
+        let view = match self.active_filter() {
+            Some(query) => Arc::new(filter_rows(&self.all_entries, &query)),
+            None => self.all_entries.clone(),
+        };
+        self.install_view(view, cx);
+    }
+
+    /// Apply the search bar's text after a keystroke. Long listings filter
+    /// off the UI thread once typing pauses, so input stays responsive.
+    fn schedule_filter(&mut self, cx: &mut Context<Self>) {
+        if self.all_entries.len() < BACKGROUND_ROWS {
+            self.rebuild_view(cx);
+            cx.notify();
+            return;
+        }
+        self.view_seq += 1;
+        let seq = self.view_seq;
+        let rows = self.all_entries.clone();
+        let query = self.active_filter();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FILTER_DEBOUNCE).await;
+            let current = this.read_with(cx, |this, _| this.view_seq == seq).unwrap_or(false);
+            if !current {
+                return;
+            }
+            let view = cx
+                .background_spawn(async move {
+                    match query {
+                        Some(query) => Arc::new(filter_rows(&rows, &query)),
+                        None => rows,
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.view_seq == seq {
+                    this.install_view(view, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show `view`. Row indices change, so selection and cursor are carried
+    /// over by path; entries the filter hides drop out of the selection.
+    fn install_view(&mut self, view: Arc<Vec<FsEntry>>, cx: &mut Context<Self>) {
         let selected: HashSet<String> = self
-            .selected_entries()
-            .into_iter()
-            .map(|entry| entry.path)
+            .selection
+            .iter()
+            .filter_map(|&ix| self.entries.get(ix))
+            .filter(|entry| !entry.is_parent)
+            .map(|entry| entry.path.clone())
             .collect();
         let cursor_path = self
             .cursor
             .and_then(|ix| self.entries.get(ix))
             .map(|entry| entry.path.clone());
         self.rubber = None;
-        let query = self.search_query.trim();
-        let filtering = self.search_active && !query.is_empty() && self.tree_search.is_none();
-        self.entries = if !filtering {
-            self.all_entries.clone()
-        } else {
-            self.all_entries
-                .iter()
-                .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
-                .cloned()
-                .collect()
-        };
+        let filtering = self.active_filter().is_some();
+        let previous = std::mem::replace(&mut self.entries, view);
+        // Freeing a long listing takes milliseconds; do it elsewhere.
+        if previous.len() >= BACKGROUND_ROWS {
+            cx.background_spawn(async move { drop(previous) }).detach();
+        }
         self.selection = select_paths(&self.entries, &selected);
         self.cursor = cursor_path
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path));
@@ -841,7 +964,7 @@ impl FilePane {
             input.set_value(seed, window, cx);
         });
         window.focus(&focus, cx);
-        self.rebuild_view();
+        self.rebuild_view(cx);
         cx.notify();
     }
 
@@ -858,7 +981,7 @@ impl FilePane {
             // The rows were search hits: bring the folder's listing back.
             self.reload(window, cx);
         } else {
-            self.rebuild_view();
+            self.rebuild_view(cx);
         }
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -916,8 +1039,8 @@ impl FilePane {
             unreadable: 0,
             task,
         });
-        self.all_entries.clear();
-        self.rebuild_view();
+        self.all_entries = Arc::default();
+        self.rebuild_view(cx);
         cx.notify();
 
         let task_id = self.tree_search.as_ref().map(|search| search.task.id());
@@ -945,8 +1068,8 @@ impl FilePane {
             SearchEvent::Batch { hits, scanned } => {
                 search.scanned = scanned;
                 if !hits.is_empty() {
-                    self.all_entries.extend(hits.into_iter().map(hit_entry));
-                    self.apply_sort();
+                    Arc::make_mut(&mut self.all_entries).extend(hits.into_iter().map(hit_entry));
+                    self.apply_sort(cx);
                 }
             }
             SearchEvent::Finished(SearchEnd { scanned, capped, unreadable, error }) => {
@@ -1401,9 +1524,7 @@ impl FilePane {
                         Detail::StorageClasses(_) => Column::StorageClass,
                         Detail::Regions(_) => Column::Region,
                     };
-                    // `entries` holds clones of `all_entries`, so merge into
-                    // both the source listing and the rendered view.
-                    for entry in this.all_entries.iter_mut().chain(this.entries.iter_mut()) {
+                    this.update_rows(|entry| {
                         let name = entry.name.as_ref();
                         match &detail {
                             Detail::Permissions(modes) => {
@@ -1422,9 +1543,9 @@ impl FilePane {
                                 }
                             }
                         }
-                    }
+                    });
                     if this.sort.column == Some(sorted_by) {
-                        this.apply_sort();
+                        this.apply_sort(cx);
                     }
                     cx.notify();
                 })
@@ -1470,17 +1591,23 @@ impl FilePane {
             .iter()
             .filter(|entry| !entry.is_parent)
             .count();
-        let selected = self.selected_entries();
-        if selected.is_empty() {
+        // Runs on every render, so it reads the selection without copying it.
+        let selected = || {
+            self.selection
+                .iter()
+                .filter_map(|&ix| self.entries.get(ix))
+                .filter(|entry| !entry.is_parent)
+        };
+        let selected_count = selected().count();
+        if selected_count == 0 {
             return format!("{item_count} items");
         }
         // Folder sizes aren't known from a listing; sum files only.
-        let bytes: u64 = selected
-            .iter()
+        let bytes: u64 = selected()
             .filter(|entry| !entry.is_dir)
             .map(|entry| entry.size)
             .sum();
-        let mut status = format!("{item_count} items · {} selected", selected.len());
+        let mut status = format!("{item_count} items · {selected_count} selected");
         if bytes > 0 {
             status.push_str(&format!(" · {}", human_size(bytes)));
         }
@@ -2667,12 +2794,11 @@ impl FilePane {
                     if this.load_seq != seq {
                         return;
                     }
-                    // `entries` holds clones of `all_entries`; write both.
-                    for entry in this.all_entries.iter_mut().chain(this.entries.iter_mut()) {
+                    this.update_rows(|entry| {
                         if entry.path == path {
                             entry.size = bytes;
                         }
-                    }
+                    });
                     cx.notify();
                 }
                 Err(error) => {
@@ -3063,9 +3189,14 @@ impl FilePane {
 
         let state = cx.global::<AppState>();
         let show_hidden = self.show_hidden;
-        let list_task = state
-            .runtime
-            .spawn(async move { list_dir(provider, path, show_hidden).await });
+        let sort = self.sort;
+        let preview_source = (self.loaded_path.as_deref() != Some(path.as_str()))
+            .then(|| (provider.clone(), path.clone()));
+        let list_task = state.runtime.spawn(async move {
+            let mut rows = list_dir(provider, path, show_hidden).await?;
+            sort.sort_rows(&mut rows);
+            anyhow::Ok(rows)
+        });
 
         // Only rewrite the path bar when it actually changed, and never while
         // the user is editing it: a background refresh (fs watch, details
@@ -3105,6 +3236,30 @@ impl FilePane {
         })
         .detach();
 
+        // A new folder that takes a while shows its first rows meanwhile.
+        if let Some((provider, path)) = preview_source {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PREVIEW_DELAY).await;
+                let waiting = this.read_with(cx, |this, _| this.load_seq == seq && this.loading);
+                if !matches!(waiting, Ok(true)) {
+                    return;
+                }
+                let runtime = this.read_with(cx, |_, cx| cx.global::<AppState>().runtime.handle().clone());
+                let Ok(runtime) = runtime else { return };
+                let Ok(Ok(rows)) = runtime.spawn(preview_rows(provider, path, show_hidden, sort)).await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    if this.load_seq == seq && this.loading {
+                        this.install_view(Arc::new(rows), cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+
         cx.spawn_in(window, async move |this, cx| {
             let result = match list_task.await {
                 Ok(result) => result,
@@ -3139,9 +3294,15 @@ impl FilePane {
                             );
                         }
                         this.connection_lost = None;
-                        this.all_entries = entries;
+                        this.all_entries = Arc::new(entries);
                         this.loaded_path = Some(this.path.clone());
-                        this.apply_sort();
+                        // Sorted on the runtime already, unless the user
+                        // picked another column while it was listing.
+                        if this.sort == sort {
+                            this.rebuild_view(cx);
+                        } else {
+                            this.apply_sort(cx);
+                        }
                         cx.emit(PaneEvent::DirectoryLoaded { linked: this.linked_navigation });
                         this.fetch_details(cx);
                         // Selection-preserving refresh: re-select by name.
@@ -3167,8 +3328,8 @@ impl FilePane {
                         if is_connection_loss(&error) && this.loaded_path.is_some() {
                             this.connection_lost = Some(humanize(&error));
                         } else {
-                            this.all_entries = Vec::new();
-                            this.entries = Vec::new();
+                            this.all_entries = Arc::default();
+                            this.entries = Arc::default();
                             this.loaded_path = None;
                             this.connection_lost = None;
                             this.error = Some(humanize(&error));
@@ -3328,14 +3489,12 @@ impl FilePane {
         };
 
         // Dragging a selected row carries the whole selection.
-        let drag_entries = if is_selected && !entry.is_parent {
-            self.selected_entries()
-        } else if entry.is_parent {
-            Vec::new()
-        } else {
-            vec![entry.clone()]
+        let drag_entries: Arc<[FsEntry]> = match &self.drag_selection {
+            Some((_, selection)) if is_selected && !entry.is_parent => selection.clone(),
+            _ if entry.is_parent => Arc::new([]),
+            _ => Arc::new([entry.clone()]),
         };
-        let ghost_what: SharedString = if let [single] = drag_entries.as_slice() {
+        let ghost_what: SharedString = if let [single] = &*drag_entries {
             single.name.clone()
         } else {
             items_label(drag_entries.len())
@@ -4093,6 +4252,11 @@ impl Render for FilePane {
         }
 
         let entry_rows = self.entries.len();
+        if self.selection.is_empty() {
+            self.drag_selection = None;
+        } else if self.drag_selection.as_ref().is_none_or(|(known, _)| *known != self.selection) {
+            self.drag_selection = Some((self.selection.clone(), self.selected_entries().into()));
+        }
 
         let weak = cx.entity().downgrade();
         let bounds_probe = canvas(
@@ -4642,6 +4806,14 @@ fn name_list(files: &[FsEntry]) -> String {
     }
 }
 
+/// The rows the fuzzy filter keeps (`..` always stays).
+fn filter_rows(rows: &[FsEntry], query: &str) -> Vec<FsEntry> {
+    rows.iter()
+        .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
+        .cloned()
+        .collect()
+}
+
 /// Case-insensitive fuzzy (subsequence) match: every query character must
 /// appear in `name`, in order — "rlib" hits "railib.rs".
 fn fuzzy_match(name: &str, query: &str) -> bool {
@@ -4686,6 +4858,50 @@ async fn list_dir(
         .collect();
     // Ordering is the pane's job (`apply_sort`), not the loader's.
     Ok(entries)
+}
+
+/// The first rows of a folder, sorted among themselves, while its complete
+/// listing is still on the way. Stops reading after [`PREVIEW_ROWS`].
+async fn preview_rows(
+    provider: Provider,
+    path: String,
+    show_hidden: bool,
+    sort: Sort,
+) -> anyhow::Result<Vec<FsEntry>> {
+    let (op, rel) = provider.op_for(&path)?;
+    let prefix = path.strip_suffix(rel.as_str()).unwrap_or_default().to_string();
+    let mut lister = op.lister(&rel).await?;
+    let mut rows = Vec::new();
+    while rows.len() < PREVIEW_ROWS {
+        let Some(entry) = lister.next().await else { break };
+        let entry = entry?;
+        let name = entry.name().trim_end_matches('/');
+        let is_hidden = name.starts_with('.');
+        if entry.path().trim_matches('/') == rel.trim_matches('/')
+            || name.is_empty()
+            || (is_hidden && !show_hidden)
+            || name.ends_with(PARTIAL_SUFFIX)
+        {
+            continue;
+        }
+        let meta = entry.metadata();
+        rows.push(FsEntry {
+            name: name.to_string().into(),
+            path: format!("{prefix}{}", entry.path()),
+            is_dir: meta.is_dir(),
+            is_symlink: false,
+            is_bucket: false,
+            is_parent: false,
+            is_hidden,
+            size: meta.content_length(),
+            modified: meta.last_modified().and_then(crate::provider::to_datetime),
+            permissions: None,
+            storage_class: None,
+            region: None,
+        });
+    }
+    sort.sort_rows(&mut rows);
+    Ok(rows)
 }
 
 /// Temp folder that remote Quick Look previews download into, stable per
@@ -5039,6 +5255,37 @@ mod tests {
             storage_class: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn sorting_with_cached_keys_matches_the_comparator() {
+        let names = ["b", "A", "c", "B10", "a2"];
+        let mut rows: Vec<FsEntry> = names.iter().map(|name| entry(name)).collect();
+        let sort = Sort { column: None, ascending: false };
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| sort.compare(a, b));
+        sort.sort_rows(&mut rows);
+        let order = |rows: &[FsEntry]| rows.iter().map(|e| e.name.to_string()).collect::<Vec<_>>();
+        assert_eq!(order(&rows), order(&expected));
+    }
+
+    #[tokio::test]
+    async fn a_preview_stops_early_and_skips_hidden_rows() {
+        let dir = std::env::temp_dir().join(format!("kessel-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for ix in 0..PREVIEW_ROWS + 5 {
+            std::fs::write(dir.join(format!("f{ix:05}.txt")), b"").unwrap();
+        }
+        std::fs::write(dir.join(".hidden"), b"").unwrap();
+        let mut profile = site("fs", "preview", &[]);
+        profile.options.insert("root".into(), dir.to_string_lossy().to_string());
+        let provider = Provider::connect(&profile, &Default::default()).unwrap();
+        let rows = preview_rows(provider, String::new(), false, Sort::default()).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rows.len(), PREVIEW_ROWS);
+        assert!(rows.iter().all(|row| !row.is_hidden));
+        assert!(rows.windows(2).all(|pair| pair[0].name <= pair[1].name));
     }
 
     #[test]
