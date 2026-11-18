@@ -207,7 +207,21 @@ pub fn save_values(section: &str, updates: &[(&str, String)]) -> Result<()> {
     let path = data_dir()?.join("config.json5");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let text = upsert_section_values(&text, section, updates);
-    std::fs::write(&path, text).with_context(|| format!("writing `{}`", path.display()))
+    write_atomic(&path, &text)
+}
+
+/// Write `text` to a temp file beside `path`, then rename it over `path`, so
+/// a crash or full disk can't leave a half-written config behind.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("writing `{}`", path.display()))
 }
 
 /// A JSON5 string literal.
@@ -493,6 +507,23 @@ mod tests {
     /// In-place UI-state writes must keep comments/formatting, update
     /// existing keys, and insert missing ones into the ui block.
     #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("kessel-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json5");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!dir.join("config.json5.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn defaults_parse() {
+        defaults();
+    }
+
+    #[test]
     fn upsert_preserves_comments_and_inserts() {
         let existing = "{\n  // my config\n  ui: {\n    theme: \"dark\",\n    sidebar_width: 200, // tuned by hand\n  },\n}\n";
         let out = upsert_section_values(
@@ -635,6 +666,15 @@ mod tests {
     }
 }
 
+/// The compiled-in defaults alone, ignoring the user's config.json5.
+pub fn defaults() -> KesselConfig {
+    config::Config::builder()
+        .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Json5))
+        .build()
+        .and_then(config::Config::try_deserialize)
+        .expect("compiled-in default config is valid")
+}
+
 pub fn load() -> Result<KesselConfig> {
     migrate_ui_state()?;
     migrate_dock_height()?;
@@ -704,7 +744,7 @@ fn migrate_dock_height() -> Result<()> {
     if dock.is_none() {
         out = upsert_section_values(&out, "ui", &[("dock_height", fmt_f32(height))]);
     }
-    std::fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))
+    write_atomic(&path, &out)
 }
 
 /// (`dock_height`, legacy height) as present in the user config text.
