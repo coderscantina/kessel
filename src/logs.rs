@@ -6,6 +6,9 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -85,5 +88,87 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BufferLayer {
         }
         buffer.push_back(entry);
         VERSION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Size at which `kessel.log` rotates to `kessel.log.1`; one generation is
+/// kept, so the log directory stays under twice this.
+const LOG_FILE_LIMIT: u64 = 5 * 1024 * 1024;
+
+/// A size-capped log file for the fmt layer, e.g.
+/// `fmt::layer().with_ansi(false).with_writer(Mutex::new(file))`. Needed
+/// because Windows release builds have no console to read.
+pub struct RotatingFile {
+    path: PathBuf,
+    file: File,
+    size: u64,
+    limit: u64,
+}
+
+impl RotatingFile {
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with_limit(dir, LOG_FILE_LIMIT)
+    }
+
+    fn open_with_limit(dir: &Path, limit: u64) -> io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("kessel.log");
+        let file = File::options().create(true).append(true).open(&path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { path, file, size, limit })
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        let mut old = self.path.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(&self.path, old)?;
+        self.file = File::options().create(true).append(true).open(&self.path)?;
+        self.size = 0;
+        Ok(())
+    }
+}
+
+impl io::Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.size >= self.limit {
+            self.rotate()?;
+        }
+        let written = self.file.write(buf)?;
+        self.size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Record panics in the tracing log (and so the log file) before the default
+/// hook runs; without a console a release build would otherwise vanish silently.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            "panic: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        previous(info);
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn rotating_file_keeps_one_previous_generation() {
+        let dir = std::env::temp_dir().join(format!("kessel-log-test-{}", std::process::id()));
+        let mut log = RotatingFile::open_with_limit(&dir, 10).unwrap();
+        log.write_all(b"0123456789").unwrap();
+        log.write_all(b"second").unwrap();
+        assert_eq!(std::fs::read(dir.join("kessel.log.1")).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(dir.join("kessel.log")).unwrap(), b"second");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -11,8 +11,9 @@
 //! - **macOS** — mounts the DMG and swaps the running `.app` bundle in place.
 //!   Not installed as a writable bundle (`cargo run`, a read-only mount)? The
 //!   DMG is revealed in Finder for a manual drag-install.
-//! - **Windows** — renames the running `.exe` aside (allowed while it runs)
-//!   and moves the downloaded one in; the leftover is swept on next launch.
+//! - **Windows** — stages the downloaded `.exe` beside the running one,
+//!   renames the running `.exe` aside (allowed while it runs) and the staged
+//!   one into its place; the leftover is swept on next launch.
 //!   A non-writable install directory falls back to revealing the download.
 //! - **Anything else** — reveals the download; there is no packaged build.
 
@@ -235,10 +236,22 @@ mod install {
 
         /// Launch the installed bundle in a fresh process. The caller quits the
         /// current one right after.
-        pub fn relaunch(app_path: &Path) {
-            if let Err(error) = Command::new("open").arg("-n").arg(app_path).spawn() {
-                tracing::error!(%error, app = %app_path.display(), "relaunch failed");
-            }
+        pub fn relaunch(app_path: &Path) -> Result<()> {
+            Command::new("open")
+                .arg("-n")
+                .arg(app_path)
+                .spawn()
+                .context("relaunching the updated app")?;
+            Ok(())
+        }
+
+        /// Whether `codesign` accepts the bundle's signature.
+        fn signature_valid(app: &Path) -> bool {
+            Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(app)
+                .output()
+                .is_ok_and(|output| output.status.success())
         }
 
         /// Nothing to sweep: the bundle swap removes its own backup.
@@ -318,6 +331,13 @@ mod install {
                 bail!("ditto failed to copy the new app bundle");
             }
 
+            // Holding the update to the standard of the running build: a signed
+            // install only accepts a bundle whose signature verifies.
+            if signature_valid(target_app) && !signature_valid(&staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                bail!("the downloaded app's code signature is invalid");
+            }
+
             std::fs::rename(target_app, &backup).context("moving the current app aside")?;
             match std::fs::rename(&staging, target_app) {
                 Ok(()) => {
@@ -375,25 +395,51 @@ mod install {
                 .context("executable has no file name")?
                 .to_string_lossy()
                 .to_string();
-            let backup = dir.join(format!("{BACKUP_PREFIX}{}-{name}", std::process::id()));
+            let pid = std::process::id();
+            let backup = dir.join(format!("{BACKUP_PREFIX}{pid}-{name}"));
+            // Staged beside the live executable, so the swap below is two
+            // renames on one volume; the download itself sits in the temp dir.
+            let staging = dir.join(format!(".kessel-new-{pid}-{name}"));
+            let _ = std::fs::remove_file(&staging);
+            std::fs::copy(artifact, &staging).context("staging the new executable")?;
+            // A signed install only accepts a download whose signature verifies.
+            if signature_valid(&exe) && !signature_valid(&staging) {
+                let _ = std::fs::remove_file(&staging);
+                bail!("the downloaded executable's Authenticode signature is invalid");
+            }
+
             std::fs::rename(&exe, &backup).context("moving the running executable aside")?;
-            // A copy, not a rename: the download lives on the temp volume,
-            // which is often a different one.
-            if let Err(error) = std::fs::copy(artifact, &exe) {
-                // Put the previous executable back so the app stays launchable.
+            // Renaming over an existing file replaces it on Windows, so the
+            // restore works even if the failed install left something behind.
+            if let Err(error) = std::fs::rename(&staging, &exe) {
                 let _ = std::fs::rename(&backup, &exe);
+                let _ = std::fs::remove_file(&staging);
                 return Err(anyhow::Error::new(error).context("installing the new executable"));
             }
             tracing::info!(version = %info.version, exe = %exe.display(), "update installed");
             Ok(InstallOutcome::ReadyToRelaunch { app_path: exe })
         }
 
+        /// Whether PowerShell reports a valid Authenticode signature.
+        fn signature_valid(exe: &Path) -> bool {
+            Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "if ((Get-AuthenticodeSignature -LiteralPath $env:KESSEL_EXE).Status -eq 'Valid') { exit 0 } else { exit 1 }",
+                ])
+                .env("KESSEL_EXE", exe)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+
         /// Start the freshly installed executable. The caller quits the current
         /// process right after, which frees the backup for `sweep_leftovers`.
-        pub fn relaunch(app_path: &Path) {
-            if let Err(error) = Command::new(app_path).spawn() {
-                tracing::error!(%error, app = %app_path.display(), "relaunch failed");
-            }
+        pub fn relaunch(app_path: &Path) -> Result<()> {
+            Command::new(app_path)
+                .spawn()
+                .context("relaunching the updated app")?;
+            Ok(())
         }
 
         /// Delete executables a previous install renamed aside. Runs at
@@ -439,8 +485,8 @@ mod install {
             Ok(InstallOutcome::ManualInstall)
         }
 
-        pub fn relaunch(app_path: &Path) {
-            tracing::warn!(app = %app_path.display(), "relaunch is not implemented here");
+        pub fn relaunch(_app_path: &Path) -> Result<()> {
+            bail!("relaunch is not implemented on this platform")
         }
 
         pub fn sweep_leftovers() {}

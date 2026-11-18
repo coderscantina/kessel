@@ -546,6 +546,15 @@ impl KesselApp {
         }
         cx.global_mut::<AppState>().active_space = this.active_space;
         this.sweep_quick_sites(cx);
+
+        // The close button quits through the same flow as Cmd-Q (with the
+        // running-transfers warning) on every platform; closing the only
+        // window would otherwise leave macOS running without one.
+        let app = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            app.update(cx, |this, cx| this.request_quit(window, cx)).ok();
+            false
+        });
         this
     }
 
@@ -1274,8 +1283,15 @@ impl KesselApp {
                 this.update_installing = false;
                 match result {
                     Ok(crate::update::InstallOutcome::ReadyToRelaunch { app_path }) => {
-                        crate::update::relaunch(&app_path);
-                        cx.quit();
+                        // Quitting without a successor would leave no app running.
+                        match crate::update::relaunch(&app_path) {
+                            Ok(()) => cx.quit(),
+                            Err(error) => {
+                                this.update_error = Some(SharedString::from(format!(
+                                    "Updated, but kessel could not restart: {error:#}"
+                                )));
+                            }
+                        }
                     }
                     Ok(crate::update::InstallOutcome::ManualInstall) => {
                         this.update_error = Some(t(if cfg!(target_os = "windows") {
@@ -1401,6 +1417,11 @@ impl KesselApp {
     /// on key repeat re-firing this action while cmd-q stays down. The
     /// `on_app_quit` hook pauses workers and flushes offsets either way.
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_quit(window, cx);
+    }
+
+    /// Shared by Cmd-Q and the window's close button.
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let busy = self
             .transfers
             .read(cx)
