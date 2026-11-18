@@ -690,6 +690,12 @@ impl TransfersPanel {
         if job.files_conflict > 0 {
             return (t("transfers.state.waiting_decision"), theme.warning);
         }
+        if let Some(found) = job.discovering {
+            return (
+                tf("transfers.state.discovering", &[("count", &found.to_string())]),
+                theme.muted_foreground,
+            );
+        }
         match job.state {
             JobState::Active => (t("transfers.state.active"), theme.muted_foreground),
             JobState::Queued => (t("transfers.state.queued"), theme.muted_foreground),

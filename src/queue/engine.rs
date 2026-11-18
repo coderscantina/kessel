@@ -35,6 +35,9 @@ use super::{Command, JobOutcome, JobState, QueueHandle, QueueSnapshot};
 const EXPANSION_BATCH: usize = 200;
 /// Minimum gap between coalesced snapshot publishes.
 const PUBLISH_EVERY: Duration = Duration::from_millis(250);
+/// How long a job waits for a lost connection to come back before its files
+/// use up their normal retries and fail.
+const OUTAGE_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Spawn the engine on the app runtime and hand back its control handle.
 pub fn start(
@@ -94,6 +97,24 @@ struct JobProviders {
     same_site: bool,
     /// The job transfers with move semantics (sources deleted on success).
     move_source: bool,
+    /// Each site's connection limit, enforced across all jobs when claiming.
+    src_limit: Option<usize>,
+    dst_limit: Option<usize>,
+}
+
+impl JobProviders {
+    /// Whether one more task of this job fits the limits of both sites. A
+    /// site with nothing running always admits one task, so a limit below
+    /// what a same-site copy needs can't keep its job from ever being claimed.
+    fn has_room(&self, load: &HashMap<i64, usize>) -> bool {
+        let needed = if self.same_site { 2 } else { 1 };
+        [(self.src.site_id, self.src_limit), (self.dst.site_id, self.dst_limit)]
+            .into_iter()
+            .all(|(site, limit)| {
+                let used = load.get(&site).copied().unwrap_or(0);
+                limit.is_none_or(|limit| used == 0 || used + needed <= limit)
+            })
+    }
 }
 
 #[derive(Default)]
@@ -105,12 +126,14 @@ struct JobRuntime {
     /// Partial files nothing will resume are being removed before the job
     /// settles.
     cleaning: bool,
-    /// Preparation failed transiently this many times in a row.
-    prep_failures: u32,
-    /// Preparation backs off until then.
+    /// Preparation or the connection failed this many times in a row.
+    failures: u32,
+    /// Preparation and claiming back off until then.
     retry_at: Option<Instant>,
-    /// Why preparation is waiting, shown on the job meanwhile.
+    /// Why the job is waiting, shown on it meanwhile.
     waiting: Option<String>,
+    /// When the connection was lost, while it stays lost.
+    outage_since: Option<Instant>,
 }
 
 impl JobRuntime {
@@ -118,6 +141,31 @@ impl JobRuntime {
     /// be removed yet.
     fn settling(&self) -> bool {
         self.preparing || self.active_tasks > 0 || self.cleaning
+    }
+
+    /// Hold the job back because its connection is lost, with growing
+    /// pauses. Failures landing inside a pause belong to the same wait.
+    /// False once the outage outlasted [`OUTAGE_PATIENCE`].
+    fn wait_out_outage(&mut self, reason: String) -> bool {
+        let now = Instant::now();
+        let since = *self.outage_since.get_or_insert(now);
+        if now.duration_since(since) >= OUTAGE_PATIENCE {
+            return false;
+        }
+        if self.retry_at.is_none_or(|at| at <= now) {
+            self.failures += 1;
+            self.retry_at = Some(now + Duration::from_secs(1 << self.failures.min(8)));
+        }
+        self.waiting = Some(reason);
+        true
+    }
+
+    /// The connection works (again).
+    fn connected(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+        self.waiting = None;
+        self.outage_since = None;
     }
 }
 
@@ -282,17 +330,19 @@ impl Engine {
             }
         }
 
-        let ready: Vec<i64> = self
-            .jobs
-            .iter()
-            .filter(|(_, rt)| {
-                rt.providers.is_some() && !rt.control.paused.load(Ordering::Relaxed)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-
         let mut in_flight: usize = self.jobs.values().map(|rt| rt.active_tasks).sum();
         while in_flight < self.max_parallel {
+            let load = self.site_load();
+            let ready: Vec<i64> = self
+                .jobs
+                .iter()
+                .filter(|(_, rt)| {
+                    rt.providers.as_ref().is_some_and(|providers| providers.has_room(&load))
+                        && !rt.control.paused.load(Ordering::Relaxed)
+                        && rt.retry_at.is_none_or(|at| at <= now)
+                })
+                .map(|(id, _)| *id)
+                .collect();
             let Some(task) = store::claim_task(&self.pool, &ready).await? else {
                 break;
             };
@@ -315,6 +365,20 @@ impl Engine {
             tokio::spawn(run_worker(pool, task, providers, control, opts, tx));
         }
         Ok(())
+    }
+
+    /// Connections the running tasks of all jobs hold per site: one for each
+    /// end of a transfer.
+    fn site_load(&self) -> HashMap<i64, usize> {
+        let mut load = HashMap::new();
+        for rt in self.jobs.values() {
+            if let Some(providers) = &rt.providers {
+                for site in [providers.src.site_id, providers.dst.site_id] {
+                    *load.entry(site).or_default() += rt.active_tasks;
+                }
+            }
+        }
+        load
     }
 
     async fn handle_command(&mut self, cmd: Command) -> Result<()> {
@@ -451,9 +515,7 @@ impl Engine {
                 match result {
                     Ok(Some(providers)) => {
                         rt.providers = Some(providers);
-                        rt.prep_failures = 0;
-                        rt.retry_at = None;
-                        rt.waiting = None;
+                        rt.connected();
                         // A retried job whose tasks all settled earlier
                         // (e.g. done before a cancel landed) has nothing to
                         // claim — settle it now instead of idling forever.
@@ -466,11 +528,13 @@ impl Engine {
                         let transient = is_transient(&error);
                         tracing::error!(job_id, transient, error = %format!("{error:#}"), "job preparation failed");
                         let reason = crate::errors::humanize(&error).title;
-                        rt.prep_failures += 1;
-                        if transient && rt.prep_failures <= self.max_retries {
+                        if crate::errors::is_outage(&error) && rt.wait_out_outage(reason.clone()) {
+                            self.maybe_finalize(job_id).await?;
+                        } else if transient && rt.failures < self.max_retries {
                             // Same backoff as a task retry; the job stays
                             // queued and shows why it waits.
-                            let delay = Duration::from_secs(1 << rt.prep_failures.min(8));
+                            rt.failures += 1;
+                            let delay = Duration::from_secs(1 << rt.failures.min(8));
                             rt.retry_at = Some(Instant::now() + delay);
                             rt.waiting = Some(reason);
                             self.maybe_finalize(job_id).await?;
@@ -511,7 +575,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn record_outcome(&self, job_id: i64, task_id: i64, outcome: Outcome) -> Result<()> {
+    async fn record_outcome(&mut self, job_id: i64, task_id: i64, outcome: Outcome) -> Result<()> {
+        if matches!(outcome, Outcome::Done { .. } | Outcome::Skipped | Outcome::Conflict { .. }) {
+            if let Some(rt) = self.jobs.get_mut(&job_id) {
+                rt.connected();
+            }
+        }
         match outcome {
             Outcome::Done { bytes } => {
                 store::complete_task(&self.pool, task_id, bytes).await?;
@@ -543,8 +612,15 @@ impl Engine {
                 let msg = format!("{error:#}");
                 let transient = is_transient(&error);
                 tracing::warn!(job_id, task_id, transient, error = %msg, "transfer task failed");
-                if store::task_failed(&self.pool, task_id, &msg, transient, self.max_retries).await? {
-                    let reason = crate::errors::humanize(&error).title;
+                let reason = crate::errors::humanize(&error).title;
+                let waiting = crate::errors::is_outage(&error)
+                    && self
+                        .jobs
+                        .get_mut(&job_id)
+                        .is_some_and(|rt| rt.wait_out_outage(reason.clone()));
+                if waiting {
+                    store::task_interrupted(&self.pool, task_id, &msg).await?;
+                } else if store::task_failed(&self.pool, task_id, &msg, transient, self.max_retries).await? {
                     store::note_job_error(&self.pool, job_id, &reason).await?;
                 }
             }
@@ -684,6 +760,9 @@ impl Engine {
                 job.error = Some(reason.clone());
             }
             let control = &rt.control;
+            if rt.preparing && control.listing.load(Ordering::Relaxed) {
+                job.discovering = Some(control.discovered.load(Ordering::Relaxed));
+            }
             job.bytes_done += control.unpersisted.load(Ordering::Relaxed);
             if job.state != JobState::Active {
                 self.speeds.remove(&job.id);
@@ -730,6 +809,8 @@ async fn prepare_job(
         dst: connect_site(pool, job.dst_site_id, defaults).await?,
         same_site: job.src_site_id == job.dst_site_id,
         move_source: job.move_source,
+        src_limit: site_limit(pool, job.src_site_id, defaults).await?,
+        dst_limit: site_limit(pool, job.dst_site_id, defaults).await?,
     };
 
     if !job.expanded {
@@ -758,10 +839,17 @@ async fn connect_site(pool: &SqlitePool, site_id: i64, defaults: &LayerConfig) -
     .context("provider connect task panicked")?
 }
 
+/// The connection limit configured for a site, over the app defaults.
+async fn site_limit(pool: &SqlitePool, site_id: i64, defaults: &LayerConfig) -> Result<Option<usize>> {
+    let profile = store::get_site(pool, site_id).await?;
+    Ok(profile.layers.merged_over(defaults).concurrent_limit)
+}
+
 /// Whether a failed task is worth re-queueing: the error class says the
 /// same request can succeed later, or OpenDAL marked it temporary.
 fn is_transient(error: &anyhow::Error) -> bool {
     crate::errors::classify(error).is_transient()
+        || crate::errors::is_outage(error)
         || error
             .chain()
             .filter_map(|cause| cause.downcast_ref::<opendal::Error>())
@@ -833,8 +921,9 @@ async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
 /// is walked *as a stream* ([`TreeWalk`]) — tasks are inserted in batches
 /// while the walk runs, so arbitrarily large trees never sit in memory.
 /// Subdirectories are pre-created at the destination (so empty dirs
-/// survive); symlinks and other non-regular entries are left behind.
-/// Returns false when a pause or cancel stopped the walk early.
+/// survive). Links to files are copied as files; links to folders (which
+/// could form cycles), broken links and special files are recorded as
+/// skipped. Returns false when a pause or cancel stopped the walk early.
 async fn expand_job(
     pool: &SqlitePool,
     providers: &JobProviders,
@@ -881,7 +970,7 @@ async fn expand_job(
     let (src_op, src_rel) = providers.src.op_for(&src_dir)?;
     let base = format!("{}{name}/", job.dst);
 
-    let mut walk = TreeWalk::new(src_op, src_rel.clone(), skip_hidden)
+    let mut walk = TreeWalk::new(src_op.clone(), src_rel.clone(), skip_hidden)
         .await
         .with_context(|| format!("listing `{src_dir}`"))?;
 
@@ -893,6 +982,8 @@ async fn expand_job(
             .context("creating destination folder")?;
     }
 
+    control.discovered.store(0, Ordering::Relaxed);
+    control.listing.store(true, Ordering::Relaxed);
     let mut batch: Vec<NewTask> = Vec::with_capacity(EXPANSION_BATCH);
     while let Some(entry) = walk.next().await? {
         if control.halted() {
@@ -908,21 +999,41 @@ async fn expand_job(
                     .await
                     .with_context(|| format!("creating destination folder `{dst_rel}`"))?;
             }
-        } else if meta.is_file() {
-            batch.push(NewTask {
-                src: format!("{src_dir}{rel}"),
-                dst: format!("{base}{rel}"),
-                total_bytes: Some(meta.content_length()),
-                src_etag: meta.etag().map(str::to_string),
-            });
-            if batch.len() >= EXPANSION_BATCH {
-                store::insert_tasks(pool, job.id, &batch).await?;
-                batch.clear();
-            }
+            continue;
+        }
+        // Listings report links and special files as unknown; stat follows
+        // a link to what it points at.
+        let target = if meta.is_file() {
+            Ok(meta.clone())
         } else {
-            // Symlink / special file: transferring it is undefined across
-            // backends — leave it behind rather than guessing.
-            tracing::debug!(path = %rel, "expansion skipped non-regular entry");
+            src_op.stat(entry.path()).await
+        };
+        let src = format!("{src_dir}{rel}");
+        let dst = format!("{base}{rel}");
+        let skipped = match &target {
+            Ok(target) if target.is_file() => None,
+            Ok(target) if target.is_dir() => Some("Link to a folder, not copied"),
+            Ok(_) => Some("Not a regular file, not copied"),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
+                Some("Broken link, not copied")
+            }
+            Err(_) => None,
+        };
+        if let Some(reason) = skipped {
+            store::insert_skipped(pool, job.id, &src, &dst, reason).await?;
+            continue;
+        }
+        let target = target.with_context(|| format!("stat `{src}`"))?;
+        control.discovered.fetch_add(1, Ordering::Relaxed);
+        batch.push(NewTask {
+            src,
+            dst,
+            total_bytes: Some(target.content_length()),
+            src_etag: target.etag().map(str::to_string),
+        });
+        if batch.len() >= EXPANSION_BATCH {
+            store::insert_tasks(pool, job.id, &batch).await?;
+            batch.clear();
         }
     }
     store::insert_tasks(pool, job.id, &batch).await?;
@@ -1922,6 +2033,169 @@ mod tests {
     }
 
     #[test]
+    fn resume_asks_when_the_destination_is_not_the_start_of_the_source() {
+        let (env, src_dir, dst_dir) = conflict_env("resume-foreign", b"NEW and longer");
+        env.handle.enqueue(job(
+            browse(&src_dir.join("file.txt")),
+            format!("{}/", browse(&dst_dir)),
+            ConflictPolicy::Resume,
+        ));
+        wait_until(&env.handle, |s| s.jobs.first().is_some_and(|j| j.files_conflict == 1));
+        assert_eq!(std::fs::read(dst_dir.join("file.txt")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn an_in_place_restart_from_zero_checks_the_destination_again() {
+        let env = test_env("in-place-restart");
+        let src = env.dir.join("src.txt");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"NEW and longer").unwrap();
+        std::fs::write(&dst, b"OLD").unwrap();
+        let (job, task) = legacy_job(&env, ("paused", "paused"), 0, &src, &dst, 3);
+        // The source changed since the offset was recorded.
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "UPDATE transfer_tasks SET in_place = 1, conflict_policy = 'resume', \
+                     src_modified = '2001-01-01T00:00:00+00:00' WHERE id = ?",
+                )
+                .bind(task)
+                .execute(&env.pool),
+            )
+            .unwrap();
+
+        env.handle.resume(job);
+        wait_until(&env.handle, |s| s.jobs.first().is_some_and(|j| j.files_conflict == 1));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"OLD");
+        let in_place: i64 = env
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT in_place FROM transfer_tasks WHERE id = ?")
+                    .bind(task)
+                    .fetch_one(&env.pool),
+            )
+            .unwrap();
+        assert_eq!(in_place, 0);
+
+        env.handle.resolve(job, ConflictPolicy::Overwrite);
+        let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW and longer");
+    }
+
+    #[test]
+    fn a_second_job_for_the_same_destination_waits_and_then_asks() {
+        let (env, src_dir, dst_dir, content) = slow_env("same-destination");
+        let other = env.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("big.bin"), b"second").unwrap();
+        let ask = |src: &Path| NewJob {
+            conflict_policy: ConflictPolicy::Ask,
+            ..slow_job(src, &dst_dir, false)
+        };
+
+        let first = env.rt.block_on(env.handle.submit(ask(&src_dir.join("big.bin")))).unwrap();
+        wait_until(&env.handle, |s| s.jobs.iter().any(|j| j.id == first && j.bytes_done > 0));
+        let second = env.rt.block_on(env.handle.submit(ask(&other.join("big.bin")))).unwrap();
+
+        let outcome = env.rt.block_on(env.handle.settled(first)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        wait_until(&env.handle, |s| {
+            s.jobs.iter().any(|j| j.id == second && j.files_conflict == 1)
+        });
+        assert!(std::fs::read(dst_dir.join("big.bin")).unwrap() == content);
+    }
+
+    #[test]
+    fn a_lost_connection_keeps_the_job_waiting_without_retries_left() {
+        let env = test_env("outage-wait");
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO sites (id, name, scheme, options) \
+                     VALUES (2, 'Offline', 'webdav', '{\"endpoint\":\"http://127.0.0.1:1\"}')",
+                )
+                .execute(&env.pool),
+            )
+            .unwrap();
+        env.handle.enqueue(NewJob {
+            src_site_id: 2,
+            ..job("file.txt".into(), format!("{}/", browse(&env.dir)), ConflictPolicy::Overwrite)
+        });
+        wait_until(&env.handle, |s| s.jobs.first().is_some_and(|j| j.error.is_some()));
+        // Past the first backoff, with `retries` at 0: still waiting.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(env.handle.latest().jobs[0].state, JobState::Queued);
+    }
+
+    #[test]
+    fn links_to_files_are_copied_and_other_links_are_reported() {
+        let env = test_env("symlinks");
+        let src = env.dir.join("tree");
+        let dst = env.dir.join("out");
+        std::fs::create_dir_all(src.join("folder")).unwrap();
+        std::fs::write(src.join("real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink(src.join("real.txt"), src.join("file-link.txt")).unwrap();
+        std::os::unix::fs::symlink(&src, src.join("folder/cycle")).unwrap();
+        std::os::unix::fs::symlink(src.join("gone"), src.join("broken")).unwrap();
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit(job(
+                format!("{}/", browse(&src)),
+                format!("{}/", browse(&dst)),
+                ConflictPolicy::Overwrite,
+            )))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+        assert_eq!(outcome.files_done, 2);
+        let copied = dst.join("tree/file-link.txt");
+        assert!(!copied.is_symlink());
+        assert_eq!(std::fs::read(copied).unwrap(), b"real");
+        assert!(!dst.join("tree/folder/cycle").exists());
+
+        let tasks = env.rt.block_on(store::job_tasks(&env.pool, id, 10)).unwrap();
+        let reason = |name: &str| {
+            let task = tasks.iter().find(|t| t.src.ends_with(name)).unwrap();
+            assert_eq!(task.state, "skipped");
+            task.error.clone().unwrap()
+        };
+        assert_eq!(reason("folder/cycle"), "Link to a folder, not copied");
+        assert_eq!(reason("broken"), "Broken link, not copied");
+    }
+
+    #[test]
+    fn a_site_limit_holds_across_jobs() {
+        let (env, src_dir, dst_dir, _) = slow_env("site-limit");
+        env.rt
+            .block_on(
+                sqlx::query("UPDATE sites SET layers = '{\"concurrent_limit\":1}' WHERE id = 1")
+                    .execute(&env.pool),
+            )
+            .unwrap();
+        std::fs::write(src_dir.join("small.bin"), vec![1u8; 1024]).unwrap();
+        let first = env
+            .rt
+            .block_on(env.handle.submit(slow_job(&src_dir.join("big.bin"), &dst_dir, false)))
+            .unwrap();
+        wait_until(&env.handle, |s| s.jobs.iter().any(|j| j.id == first && j.bytes_done > 0));
+        let second = env
+            .rt
+            .block_on(env.handle.submit(slow_job(&src_dir.join("small.bin"), &dst_dir, false)))
+            .unwrap();
+
+        // The small file would finish at once if it were let through.
+        std::thread::sleep(Duration::from_millis(800));
+        let states = env.rt.block_on(store::task_states(&env.pool, second)).unwrap();
+        assert_eq!(states.get("queued"), Some(&1), "{states:?}");
+
+        let outcome = env.rt.block_on(env.handle.settled(second)).unwrap();
+        assert_eq!(outcome.state, JobState::Done, "{:?}", outcome.error);
+    }
+
+    #[test]
     fn cancel_and_remove_delete_every_owned_partial() {
         let env = test_env("owned-partials");
         let dst = env.dir.join("dst");
@@ -2062,6 +2336,14 @@ mod tests {
         std::fs::write(&dst, b"OLD").unwrap();
         let offset = 1024 * 1024;
         let (job, task) = legacy_job(&env, ("paused", "paused"), 1, &src, &dst, offset);
+        // A restart from zero asks about an existing file unless told not to.
+        env.rt
+            .block_on(
+                sqlx::query("UPDATE transfer_jobs SET conflict_policy = 'overwrite' WHERE id = ?")
+                    .bind(job)
+                    .execute(&env.pool),
+            )
+            .unwrap();
 
         env.handle.resume(job);
         pause_once_past(&env, job, offset);
@@ -2172,7 +2454,16 @@ mod tests {
                 dst: local,
                 same_site: true,
                 move_source: false,
+                src_limit: None,
+                dst_limit: None,
             };
+            // A full walk reports what it found while listing.
+            let control = JobControl::default();
+            assert!(expand_job(&pool, &providers, &row, false, &control).await.unwrap());
+            assert!(control.listing.load(Ordering::Relaxed));
+            assert_eq!(control.discovered.load(Ordering::Relaxed), 2);
+
+            store::begin_expansion(&pool, id).await.unwrap();
             let control = JobControl::default();
             control.cancelled.store(true, Ordering::Relaxed);
             assert!(!expand_job(&pool, &providers, &row, false, &control).await.unwrap());
