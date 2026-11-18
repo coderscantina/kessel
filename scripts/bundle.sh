@@ -39,6 +39,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/kessel"
 cp "$ICNS" "$APP/Contents/Resources/kessel.icns"
+# Licence notices: kessel's own MIT licence and the bundled Lucide icons' ISC one
+cp LICENSE "$APP/Contents/Resources/LICENSE"
+cp assets/icons/LICENSE "$APP/Contents/Resources/LICENSE-lucide-icons"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

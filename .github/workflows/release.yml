@@ -99,15 +99,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Unset both when no certificate is configured, so the packaging script
-      # takes its unsigned path with a warning instead of failing.
+      # WINDOWS_CERT_PFX_BASE64 is the base64 of the .pfx file. When it is
+      # set, the packaging script must sign (it fails the job otherwise);
+      # without it the build is unsigned, with a warning.
+      - name: Write the signing certificate
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          if (-not $env:PFX_BASE64) { exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'kessel-codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          "KESSEL_WIN_CERT=$pfx" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
       - name: Build, sign and package
         shell: pwsh
         env:
           KESSEL_WIN_CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
-          KESSEL_WIN_CERT: ${{ secrets.WINDOWS_CERT_PATH }}
           KESSEL_WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: scripts/package-windows.ps1
+
+      - name: Remove the signing certificate
+        if: always()
+        shell: pwsh
+        run: Remove-Item (Join-Path $env:RUNNER_TEMP 'kessel-codesign.pfx') -ErrorAction SilentlyContinue
 
       - name: Write update manifest
         shell: pwsh
