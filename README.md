@@ -32,22 +32,34 @@ flag on.
   columns (size, modified, unix permissions, S3 storage class, bucket region)
 - Finder-grade selection: click, cmd-click, shift-click ranges, rubber-band,
   full keyboard navigation
-- Per-pane folder tree, quick look, in-app search, hidden-file toggle
+- Per-pane folder tree, quick look, hidden-file toggle
+- Filter the current folder as you type, or search every subfolder by name
+  (`cmd-shift-f`): results stream in, can be stopped, and work like any other
+  rows. A search stops at 5,000 matches
+- A lost connection keeps the last loaded rows on screen, marked as out of
+  date, with **Reconnect** to rebuild the connection and renew credentials
+- Remote programs and scripts never launch on a double-click: kessel names the
+  file and offers to download it instead
 - Account-root S3 browsing: save a site without a bucket and the root lists
   every bucket in the account
 
 ### Transfers
 
 - **Persistent queue** — every job and per-file task lives in SQLite with its
-  state and byte offset, so the queue survives a crash or quit and resumes
-  mid-transfer on relaunch
+  state and byte offset, so the queue survives a crash or quit and picks up
+  again on relaunch. A file continues from its last byte when the destination
+  can append and the source is provably unchanged. Otherwise, and always on
+  object stores like S3, that file restarts from zero
 - Upload, download and site-to-site copy are the same code path: a layered
   source Operator streamed into a layered destination Operator
 - Resolve conflicts per file or for the entire transfer: overwrite, overwrite
   if newer, skip, resume a known partial copy, or keep both with a unique name
 - Priorities, pause/resume (per job and global), retries, post-transfer
   verification, timestamp preservation, transfer history
-- Global and per-site bandwidth throttling and concurrency caps
+- Global bandwidth and parallel-transfer limits, adjustable while running.
+  The `layers` section of `config.json5` sets the per-site speed limit and
+  concurrency cap for all sites. Per-site overrides are honored when stored on
+  a site, but the site editor has no fields for them yet
 
 ### Synchronization
 
@@ -87,7 +99,6 @@ wrapped in a composable, per-site layer stack:
 | ------------------------------- | --------------------------------------------------------- |
 | `RetryLayer`                    | exponential backoff; dropped FTP/S3 connections self-heal |
 | `TimeoutLayer`                  | bounded operations; no hung transfers on a dead socket    |
-| `ThrottleLayer`                 | bandwidth control, per-site and global                    |
 | `ConcurrentLimitLayer`          | caps in-flight operations per backend                     |
 | `LoggingLayer` + `TracingLayer` | structured logs feeding the in-app console                |
 
@@ -116,8 +127,11 @@ wrapped in a composable, per-site layer stack:
 
 ### Accessibility & localization
 
-- Fully keyboard-operable: every command is reachable via configurable
-  shortcuts, the command bar, or the native menu bar
+- Keyboard-first: navigation, selection, search, upload, download, rename,
+  delete, pane copy and move, and the transfer queue (`cmd-shift-j`) all work
+  from configurable shortcuts and the command bar. A few per-file actions are
+  in the context menu only: Download As, Duplicate, Calculate Folder Size,
+  permissions, S3 storage class and ACL, and presigned URLs
 - Localized UI (English and German built in); add a locale by dropping a
   `<locale>.json5` string table into `<data_dir>/i18n/` — see
   [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -140,17 +154,13 @@ wrapped in a composable, per-site layer stack:
 ### Prerequisites
 
 - Rust stable (latest; GPUI tracks latest stable)
-- macOS 12+ or Windows 10+ — both are built and tested in CI
+- macOS 12+, the platform built and tested in CI and shipped in releases
 
-SFTP is macOS/Linux only: its transport drives the system `ssh` binary through
-a unix control socket, so the Windows build ships without that backend. Every
-other backend — S3, FTP, WebDAV, GCS, Azure Blob, Drive, Dropbox, OneDrive and
-the local filesystem — is available on both.
+Windows builds are paused for now. The Windows code stays in the tree, but CI
+does not compile it and releases do not include it.
 
-One other difference: dragging entries out to Finder or Explorer promises
-remote *files* on both platforms, but remote *folders* only on macOS — the
-Windows protocol needs every file named before the drag starts. Drag a folder
-through the transfer queue instead.
+SFTP signs in with a key or the SSH agent through the system `ssh` binary.
+Password login is not supported.
 
 ### Build & run
 
@@ -173,22 +183,6 @@ identity) and notarizes via `KESSEL_NOTARY_PROFILE` or
 `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_PASSWORD`; without an identity it falls
 back to an ad-hoc-signed, non-notarized DMG for local use.
 
-### Package a Windows build
-
-```powershell
-scripts\package-windows.ps1     # → target\dist\kessel-<version>-x86_64.exe (+ .zip, + .sha256)
-```
-
-kessel is a single self-contained executable on Windows — assets, icons,
-migrations and config defaults are all compiled in — so there is no installer:
-put the `.exe` where you want it and run it. The script signs it when
-`KESSEL_WIN_CERT` (a `.pfx`) or `KESSEL_WIN_CERT_THUMBPRINT` is set, and warns
-that SmartScreen will flag the download when neither is.
-
-The app icon and version metadata are compiled into the executable by
-`build.rs`; regenerate the `.ico` files from the SVG sources with
-`scripts/gen-icons.sh` after changing the artwork.
-
 ## Releases & versioning
 
 - **CalVer**: releases are tagged `vYY.M.D` (e.g. `v26.7.10`) — the version
@@ -199,14 +193,11 @@ The app icon and version metadata are compiled into the executable by
   written to be read.
 - `scripts/release.sh` cuts a release: bumps `Cargo.toml`, creates the
   `🔖 Release` commit, folds the generated changelog entry into it, tags and
-  pushes — and the tag triggers the GitHub workflow, which builds every
-  platform in parallel (a signed, notarized universal DMG on macOS; a signed
-  executable on Windows) and publishes them in one release alongside a
-  per-platform update manifest.
+  pushes — and the tag triggers the GitHub workflow, which builds a signed,
+  notarized universal DMG and publishes it alongside the update manifest.
 - **Auto-update**: kessel checks the latest release on startup (daily
   thereafter, `update.check = false` to opt out) and offers a one-click,
-  checksum-verified install-and-relaunch — swapping the `.app` bundle on
-  macOS, the `.exe` on Windows.
+  checksum-verified install-and-relaunch that swaps the `.app` bundle.
 
 ### Configuration
 

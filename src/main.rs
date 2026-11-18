@@ -11,7 +11,11 @@ mod config;
 mod db;
 mod dragout;
 mod edit;
+mod errors;
+mod ftp;
 mod i18n;
+mod import;
+mod instance;
 mod keymap;
 mod localfs;
 mod logs;
@@ -35,10 +39,10 @@ mod zed;
 
 use anyhow::Result;
 use gpui::{
-    px, size, App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds,
+    px, size, App, AppContext as _, Bounds, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
@@ -46,21 +50,59 @@ use tracing_subscriber::EnvFilter;
 use app::{AppState, KesselApp};
 
 fn main() -> Result<()> {
-    let config = config::load()?;
+    // Dependencies link two rustls crypto backends, so rustls cannot choose one
+    // itself and FTPS would panic on connect.
+    let _ = futures_rustls::rustls::crypto::ring::default_provider().install_default();
+    let data_dir = or_fatal(config::data_dir(), "kessel could not open its data directory.")?;
+    // A damaged config.json5 must not keep the app from opening: fall back to
+    // the defaults and tell the user in the window once it is up.
+    let (config, config_warning) = match config::load() {
+        Ok(config) => (config, None),
+        Err(error) => (
+            config::defaults(),
+            Some(format!(
+                "config.json5 could not be read, so the defaults are in use: {error:#}"
+            )),
+        ),
+    };
     i18n::init(&config.ui.locale);
+
+    // Held until the process ends: two instances would share one queue.
+    let Some(_instance) = or_fatal(
+        instance::acquire(&data_dir, instance::UPDATE_PATIENCE),
+        &i18n::t("startup.lock_failed"),
+    )?
+    else {
+        show_fatal(&i18n::t("startup.already_running"));
+        return Ok(());
+    };
 
     // Reloadable filter so config.json5 edits to `logging.filter` apply
     // live (see app::watch_config); RUST_LOG still wins at startup.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&config.logging.filter));
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let log_file = logs::RotatingFile::open(&data_dir.join("logs"))
+        .inspect_err(|error| eprintln!("kessel: cannot open the log file: {error}"))
+        .ok()
+        .map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        });
     tracing_subscriber::registry()
         .with(filter)
+        .with(logs::credential_guard())
         .with(tracing_subscriber::fmt::layer())
+        .with(log_file)
         // In-app capture for the bottom log panel.
         .with(logs::layer())
         .init();
     config::LOG_FILTER.set(filter_handle).ok();
+    logs::install_panic_hook();
+    if let Some(warning) = &config_warning {
+        tracing::warn!("{warning}");
+    }
 
     // Clear anything a previous in-app update had to leave behind (Windows
     // can't delete a running executable, so the old one is swept here).
@@ -69,8 +111,7 @@ fn main() -> Result<()> {
     // Bootstrap async state (DB, migrations, crash recovery) on the app-owned
     // tokio runtime; it stays alive in AppState for all later I/O work.
     let runtime = tokio::runtime::Runtime::new()?;
-    let (db, sites, folders, spaces, tags, open_tabs, requeued_jobs) = runtime.block_on(async {
-        let data_dir = config::data_dir()?;
+    let booted = runtime.block_on(async {
         let pool = db::connect(&data_dir).await?;
         let requeued_jobs = db::requeue_interrupted(&pool).await?;
         let sites = db::list_sites(&pool).await?;
@@ -79,7 +120,20 @@ fn main() -> Result<()> {
         let tags = db::list_tags(&pool).await?;
         let open_tabs = db::list_open_tabs(&pool).await?;
         anyhow::Ok((pool, sites, folders, spaces, tags, open_tabs, requeued_jobs))
-    })?;
+    });
+    let (db, sites, folders, spaces, tags, open_tabs, requeued_jobs) = match booted {
+        Ok(booted) => booted,
+        Err(error) => {
+            tracing::error!(error = format!("{error:#}"), "startup failed");
+            show_fatal(&format!(
+                "kessel could not open its database.\n\n{error:#}\n\nDatabase: {}\nBackup from before the last upgrade: {}\nLog: {}",
+                data_dir.join("kessel.db").display(),
+                data_dir.join("kessel.db.bak").display(),
+                data_dir.join("logs").join("kessel.log").display(),
+            ));
+            return Err(error);
+        }
+    };
     let queue = queue::start(
         &runtime,
         db.clone(),
@@ -115,7 +169,15 @@ fn main() -> Result<()> {
         "kessel state loaded"
     );
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    let application = gpui_platform::application().with_assets(assets::Assets);
+    // macOS keeps the app alive without windows: a Dock click brings one back.
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_main_window(cx, None);
+            cx.activate(true);
+        }
+    });
+    application.run(move |cx: &mut App| {
         app::init(cx);
         // Graceful queue shutdown: running workers checkpoint their offsets
         // and settle partial writes before the process exits (bounded so a
@@ -123,6 +185,7 @@ fn main() -> Result<()> {
         cx.on_app_quit({
             let queue = state.queue.clone();
             move |cx| {
+                edit::end_sessions();
                 let ack = queue.shutdown();
                 let deadline = cx
                     .background_executor()
@@ -140,8 +203,19 @@ fn main() -> Result<()> {
         cx.set_global(state);
         app::watch_config(cx);
 
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
+        // Quit without a window to receive it (the app menu on macOS).
+        cx.on_action(|_: &app::Quit, cx| cx.quit());
+        open_main_window(cx, config_warning);
+        cx.activate(true);
+    });
+
+    Ok(())
+}
+
+fn open_main_window(cx: &mut App, warning: Option<String>) {
+    let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+    let window = cx
+        .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 // Transparent titlebar: the app draws its own header row
@@ -161,8 +235,43 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open window");
-        cx.activate(true);
-    });
+    if let Some(warning) = warning {
+        window
+            .update(cx, |_, window, cx| window.push_notification(warning, cx))
+            .ok();
+    }
+}
 
-    Ok(())
+/// Unwrap a startup result, showing the failure in a dialog first: release
+/// builds on Windows have no console to print it to.
+fn or_fatal<T>(result: Result<T>, headline: &str) -> Result<T> {
+    result.inspect_err(|error| show_fatal(&format!("{headline}\n\n{error:#}")))
+}
+
+/// Blocking native error dialog for failures before any window exists.
+fn show_fatal(message: &str) {
+    eprintln!("kessel: {message}");
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "display alert \"kessel failed to start\" message (system attribute \"KESSEL_FATAL\") as critical",
+        ])
+        .env("KESSEL_FATAL", message)
+        .status();
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Add-Type -AssemblyName PresentationFramework; \
+             [void][System.Windows.MessageBox]::Show($env:KESSEL_FATAL, 'kessel failed to start', 'OK', 'Error')",
+        ])
+        .env("KESSEL_FATAL", message)
+        .status();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let status: std::io::Result<()> = Ok(());
+    let _ = status;
 }

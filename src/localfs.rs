@@ -14,6 +14,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::provider::SiteProfile;
+use crate::queue::LOCAL_SITE_ID;
+
 /// Root of the built-in Local site: `/`, or the system drive on Windows.
 #[cfg(not(windows))]
 pub fn root() -> String {
@@ -55,6 +58,33 @@ pub fn browse_path_in(root: &str, path: &Path, is_dir: bool) -> String {
 /// [`browse_path_in`] against the built-in Local site's root.
 pub fn browse_path(path: &Path, is_dir: bool) -> String {
     browse_path_in(&root(), path, is_dir)
+}
+
+/// The site that serves a native path, with the path's browse path there.
+///
+/// The built-in Local site covers one root (the system drive on Windows), so
+/// a path on another volume goes to the "Local filesystem" bookmark rooted on
+/// it. `None` when no site covers the path: sending it anywhere else would
+/// touch the wrong files.
+pub fn locate(sites: &[SiteProfile], path: &Path, is_dir: bool) -> Option<(i64, String)> {
+    let local = (LOCAL_SITE_ID, root());
+    let bookmarks = sites
+        .iter()
+        .filter(|site| site.scheme == "fs")
+        .filter_map(|site| Some((site.id, site.options.get("root")?.clone())));
+    std::iter::once(local)
+        .chain(bookmarks)
+        .find(|(_, root)| is_under(root, path))
+        .map(|(id, root)| (id, browse_path_in(&root, path, is_dir)))
+}
+
+/// Whether `path` is `root` or inside it, compared on whole components.
+fn is_under(root: &str, path: &Path) -> bool {
+    let full = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let root = root.replace('\\', "/").to_lowercase();
+    let root = root.trim_end_matches('/');
+    full.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// A local directory as a browse path on the built-in Local site.
@@ -110,6 +140,22 @@ mod tests {
         assert_eq!(file, "Users/ada/a.txt");
         // A path on another volume is left whole rather than silently rerooted.
         assert_eq!(browse_path_in("C:\\", Path::new(r"D:\data"), true), "D:/data/");
+    }
+
+    #[test]
+    fn locate_routes_a_path_to_the_site_covering_it() {
+        let site = |id, root: &str| SiteProfile {
+            id,
+            scheme: "fs".into(),
+            options: [("root".to_string(), root.to_string())].into(),
+            ..Default::default()
+        };
+        let sites = [site(7, "D:\\"), site(8, "/data")];
+        // Neither spelling is under the unix "/" root, so a bookmark serves it.
+        let (id, browse) = locate(&sites, Path::new(r"d:\x\y"), true).unwrap();
+        assert_eq!((id, browse.as_str()), (7, "x/y/"));
+        assert!(locate(&sites, Path::new(r"E:\x"), true).is_none());
+        assert!(!is_under("/data", Path::new("/database/a")));
     }
 
     #[test]

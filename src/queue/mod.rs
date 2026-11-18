@@ -5,16 +5,22 @@
 //! Both ends of a transfer are OpenDAL sites — the local filesystem is the
 //! reserved site 0 — so upload, download and site-to-site copy are the same
 //! code path: a layered source Operator streamed into a layered destination
-//! Operator. Retry, timeout, throttling and tracing come from the per-site
-//! OpenDAL layer stack built in [`crate::provider`]; this module owns only
-//! scheduling, persistence and resume.
+//! Operator. Retry, timeout and tracing come from the per-site OpenDAL layer
+//! stack built in [`crate::provider`]; this module owns scheduling,
+//! persistence, resume and bandwidth limits.
 
 mod engine;
+mod limiter;
 pub(crate) mod store;
 mod transfer;
 
 pub use engine::start;
+pub(crate) use transfer::{normalize_etag, PARTIAL_SUFFIX};
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// The reserved `sites` row backing the local-filesystem side of transfers.
@@ -37,6 +43,77 @@ pub struct NewJob {
     pub move_source: bool,
 }
 
+/// An explicit list of files copied as one job with one task per file, for
+/// callers that already know every pair (sync). Directories in between are
+/// created implicitly by the writes. `src_label` / `dst_label` are what the
+/// transfers panel shows as the job's source and destination.
+#[derive(Debug, Clone)]
+pub struct NewBatch {
+    pub src_site_id: i64,
+    pub dst_site_id: i64,
+    pub src_label: String,
+    pub dst_label: String,
+    pub files: Vec<BatchFile>,
+    pub conflict_policy: ConflictPolicy,
+    /// Delete each source file once it arrived intact.
+    pub move_source: bool,
+}
+
+/// One file of a [`NewBatch`], as full browse paths on each site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFile {
+    pub src: String,
+    pub dst: String,
+    /// Expected size, so the job's total is right before files start.
+    pub size: Option<u64>,
+}
+
+/// Whether a listed path has a `.` or `..` segment. Object keys can hold them,
+/// and a destination built from one would land outside the chosen folder.
+pub(crate) fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| matches!(segment, "." | ".."))
+}
+
+/// Clock slack when comparing modified times across backends (FAT, S3 and
+/// friends round or re-stamp timestamps). Never used to prove that a file on
+/// one backend is unchanged.
+pub(crate) const MTIME_SLACK_SECS: i64 = 2;
+
+/// What a destination must still hold for a reviewed write to go ahead. The
+/// worker checks it right before writing and parks the file as a conflict on
+/// a mismatch, also when an old job is retried later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedDest {
+    /// Nothing may exist at the destination.
+    Absent,
+    /// The file the user reviewed. An ETag known on both sides decides alone;
+    /// otherwise the exact modified time does.
+    File {
+        size: u64,
+        etag: Option<String>,
+        modified: Option<DateTime<Utc>>,
+    },
+}
+
+impl ExpectedDest {
+    /// Whether `current` (`None` = nothing there) is still the reviewed state.
+    fn matches(&self, current: Option<&opendal::Metadata>) -> bool {
+        let (Self::File { size, etag, modified }, Some(meta)) = (self, current) else {
+            return matches!((self, current), (Self::Absent, None));
+        };
+        if meta.is_dir() || meta.content_length() != *size {
+            return false;
+        }
+        if let (Some(expected), Some(now)) = (etag.as_deref(), meta.etag()) {
+            return normalize_etag(expected) == normalize_etag(now);
+        }
+        match (modified, meta.last_modified().and_then(crate::provider::to_datetime)) {
+            (Some(expected), Some(now)) => *expected == now,
+            _ => true,
+        }
+    }
+}
+
 /// What to do when a destination file already exists. Applied per file at
 /// transfer time; `Ask` parks the file until the user decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,8 +124,9 @@ pub enum ConflictPolicy {
     /// Replace only a newer source; missing timestamps leave a conflict.
     OverwriteNewer,
     Skip,
-    /// Append the missing tail where the backend supports it; skip files the
-    /// destination already holds completely; overwrite where neither fits.
+    /// Append the missing tail when the destination provably is the start of
+    /// the source and the backend can append; skip files the destination
+    /// already holds completely; otherwise ask, and never overwrite.
     Resume,
     /// Write under a unique name ("file (1).txt").
     Rename,
@@ -85,6 +163,9 @@ pub enum JobState {
     Paused,
     Failed,
     Done,
+    /// Cancel requested; workers and partial cleanup are still winding
+    /// down. Never stored: a `cancelled` row that hasn't settled yet.
+    Cancelling,
     Cancelled,
 }
 
@@ -96,6 +177,7 @@ impl JobState {
             Self::Paused => "paused",
             Self::Failed => "failed",
             Self::Done => "done",
+            Self::Cancelling => "cancelling",
             Self::Cancelled => "cancelled",
         }
     }
@@ -106,6 +188,7 @@ impl JobState {
             "paused" => Self::Paused,
             "failed" => Self::Failed,
             "done" => Self::Done,
+            "cancelling" => Self::Cancelling,
             "cancelled" => Self::Cancelled,
             _ => Self::Queued,
         }
@@ -127,6 +210,9 @@ pub struct JobSnapshot {
     pub dst_site: String,
     pub src: String,
     pub dst: String,
+    /// Where a single-file job writes, after any "Keep both" rename; `None`
+    /// for folder and batch jobs.
+    pub dst_file: Option<String>,
     pub state: JobState,
     pub error: Option<String>,
     pub files_total: u64,
@@ -134,7 +220,11 @@ pub struct JobSnapshot {
     pub files_skipped: u64,
     /// Files parked awaiting a conflict decision.
     pub files_conflict: u64,
+    /// Files that failed for good. A `Done` job with failed files finished
+    /// with errors; `error` then holds the count and a representative reason.
+    pub files_failed: u64,
     pub bytes_total: u64,
+    /// Bytes transferred, including in-flight bytes not yet checkpointed.
     pub bytes_done: u64,
     /// Smoothed bytes/sec while the job is active.
     pub bps: u64,
@@ -142,6 +232,8 @@ pub struct JobSnapshot {
     pub priority: i64,
     /// Sources are deleted after successful transfer (move semantics).
     pub move_source: bool,
+    /// Files found so far while the source tree is being listed.
+    pub discovering: Option<u64>,
 }
 
 /// One per-file task, for the transfers panel's drill-down view.
@@ -174,10 +266,25 @@ pub struct HistoryEntry {
     pub dst: String,
     pub outcome: String,
     pub files: i64,
+    pub files_failed: i64,
     pub bytes: u64,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub finished_at: String,
+}
+
+/// How a job settled, as reported by [`QueueHandle::settled`].
+#[derive(Debug, Clone)]
+pub struct JobOutcome {
+    /// `Done` (possibly with failed files), `Failed` or `Cancelled`.
+    pub state: JobState,
+    /// What went wrong, in plain words: the reason for a failed job, or the
+    /// failure count plus a representative reason for a done one.
+    pub error: Option<String>,
+    pub files_done: u64,
+    /// Files left alone, for example by a conflict decision.
+    pub files_skipped: u64,
+    pub files_failed: u64,
 }
 
 impl JobSnapshot {
@@ -201,8 +308,8 @@ pub struct QueueSnapshot {
     pub total_bps: u64,
     /// Current global concurrency cap (runtime-adjustable).
     pub max_parallel: usize,
-    /// Current global bandwidth cap in bytes/sec, 0 = unlimited
-    /// (runtime-adjustable; applies to jobs started afterwards).
+    /// Current global bandwidth cap in bytes/sec, 0 = unlimited, shared by
+    /// all transfers (runtime-adjustable; applies to files started afterwards).
     pub bandwidth_limit: u64,
 }
 
@@ -212,10 +319,19 @@ pub(crate) enum Command {
     /// Enqueue and report the created job id back — used by drag-out file
     /// promises, which must know when *their* job settles.
     EnqueueTracked(NewJob, oneshot::Sender<i64>),
+    /// Enqueue and report the persisted id or the rejection reason.
+    Submit(NewJob, oneshot::Sender<anyhow::Result<i64>>),
+    /// Persist a multi-file job, with the destination state each listed
+    /// `dst` must still hold, and report its id or the rejection reason.
+    SubmitBatch(NewBatch, HashMap<String, ExpectedDest>, oneshot::Sender<anyhow::Result<i64>>),
+    /// Report the job's outcome once it settles.
+    Settled(i64, oneshot::Sender<anyhow::Result<JobOutcome>>),
     Pause(i64),
     Resume(i64),
     Cancel(i64),
     Retry(i64),
+    /// Re-run only the failed files of a settled job.
+    RetryFailed(i64),
     /// Apply a decision to a job's parked conflicts (and future ones).
     Resolve(i64, ConflictPolicy),
     ResolveTask(i64, ConflictPolicy),
@@ -230,7 +346,7 @@ pub(crate) enum Command {
     /// Adjust the global concurrency cap at runtime.
     SetMaxParallel(usize),
     /// Adjust the global bandwidth cap (bytes/sec, 0 = unlimited) at
-    /// runtime; takes effect for jobs prepared afterwards.
+    /// runtime; takes effect for files started afterwards.
     SetBandwidth(u64),
     /// Apply reloaded `transfers.*` config values (retries, verify,
     /// preserve_timestamps, skip_hidden) at runtime.
@@ -257,6 +373,8 @@ pub struct QueueHandle {
 }
 
 impl QueueHandle {
+    /// Fire-and-forget enqueue; a rejected job only reaches the log.
+    /// Prefer [`Self::submit`].
     pub fn enqueue(&self, job: NewJob) {
         let _ = self.cmds.send(Command::Enqueue(job));
     }
@@ -267,28 +385,45 @@ impl QueueHandle {
         let _ = self.cmds.send(Command::EnqueueTracked(job, tx));
         rx
     }
-    /// Wait until the job reaches a terminal state. A job that vanishes from
-    /// the snapshot after having been seen (user cleared finished jobs)
-    /// counts as done; one that never appears keeps waiting until the engine
-    /// itself goes away.
-    pub async fn wait_terminal(&self, job_id: i64) -> JobState {
-        let mut rx = self.subscribe();
-        let mut seen = false;
-        loop {
-            let state = {
-                let snapshot = rx.borrow();
-                snapshot.jobs.iter().find(|job| job.id == job_id).map(|job| job.state)
-            };
-            match state {
-                Some(state) if state.is_terminal() => return state,
-                Some(_) => seen = true,
-                None if seen => return JobState::Done,
-                None => {}
-            }
-            if rx.changed().await.is_err() {
-                return JobState::Cancelled;
-            }
-        }
+    /// Enqueue and wait until the job is persisted. Returns its id, or the
+    /// reason it was rejected (e.g. source and destination are the same).
+    pub async fn submit(&self, job: NewJob) -> anyhow::Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::Submit(job, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
+    }
+    /// Persist a multi-file job (one task per listed file) and return its id.
+    pub async fn submit_batch(&self, batch: NewBatch) -> anyhow::Result<i64> {
+        self.submit_reviewed_batch(batch, HashMap::new()).await
+    }
+    /// [`Self::submit_batch`] for files the user reviewed: `expected` maps a
+    /// file's `dst` to what that destination must still hold when it is
+    /// written. Files without an entry are written unconditionally.
+    pub async fn submit_reviewed_batch(
+        &self,
+        batch: NewBatch,
+        expected: HashMap<String, ExpectedDest>,
+    ) -> anyhow::Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::SubmitBatch(batch, expected, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
+    }
+    /// Wait until the job settles (done, failed or cancelled) and return its
+    /// outcome. Resolves at once for a job that already settled. Errors if
+    /// the job doesn't exist or the engine stops first.
+    pub async fn settled(&self, job_id: i64) -> anyhow::Result<JobOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::Settled(job_id, tx))
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
     }
     pub fn pause(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Pause(job_id));
@@ -301,6 +436,10 @@ impl QueueHandle {
     }
     pub fn retry(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Retry(job_id));
+    }
+    /// Re-run only the failed files of a settled job; done files stay done.
+    pub fn retry_failed(&self, job_id: i64) {
+        let _ = self.cmds.send(Command::RetryFailed(job_id));
     }
     /// Resolve a job's parked conflicts; the policy also applies to any
     /// conflicts the job hits later.
@@ -330,7 +469,8 @@ impl QueueHandle {
     pub fn set_max_parallel(&self, limit: usize) {
         let _ = self.cmds.send(Command::SetMaxParallel(limit));
     }
-    /// Bytes/sec, 0 = unlimited. Applies to jobs started afterwards.
+    /// Bytes/sec, 0 = unlimited, shared by all transfers. Applies to files
+    /// started afterwards.
     pub fn set_bandwidth(&self, bps: u64) {
         let _ = self.cmds.send(Command::SetBandwidth(bps));
     }
@@ -363,5 +503,39 @@ impl QueueHandle {
 
     pub fn latest(&self) -> QueueSnapshot {
         self.snapshot.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+    use opendal::raw::Timestamp;
+    use opendal::{EntryMode, Metadata};
+
+    use super::*;
+
+    #[test]
+    fn a_reviewed_destination_must_be_the_exact_version() {
+        let current = |etag: Option<&str>| {
+            let mut meta = Metadata::new(EntryMode::FILE);
+            meta.set_content_length(3);
+            meta.set_last_modified(Timestamp::from_second(100).unwrap());
+            if let Some(etag) = etag {
+                meta.set_etag(etag);
+            }
+            meta
+        };
+        let reviewed = |secs, etag: Option<&str>| ExpectedDest::File {
+            size: 3,
+            etag: etag.map(str::to_string),
+            modified: Some(Utc.timestamp_opt(secs, 0).unwrap()),
+        };
+
+        assert!(reviewed(100, None).matches(Some(&current(None))));
+        // Within the old two second tolerance, but another version.
+        assert!(!reviewed(101, None).matches(Some(&current(None))));
+        // The reviewed ETag decides, however the server quotes it.
+        assert!(reviewed(90, Some("\"ABC\"")).matches(Some(&current(Some("abc")))));
+        assert!(!reviewed(100, Some("abc")).matches(Some(&current(Some("def")))));
     }
 }

@@ -207,7 +207,21 @@ pub fn save_values(section: &str, updates: &[(&str, String)]) -> Result<()> {
     let path = data_dir()?.join("config.json5");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let text = upsert_section_values(&text, section, updates);
-    std::fs::write(&path, text).with_context(|| format!("writing `{}`", path.display()))
+    write_atomic(&path, &text)
+}
+
+/// Write `text` to a temp file beside `path`, then rename it over `path`, so
+/// a crash or full disk can't leave a half-written config behind.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("writing `{}`", path.display()))
 }
 
 /// A JSON5 string literal.
@@ -411,6 +425,48 @@ pub struct TransferConfig {
     /// per-file transfer tasks.
     #[serde(default)]
     pub skip_hidden: bool,
+    /// What a transfer started from a file pane does when the destination
+    /// file already exists.
+    #[serde(default)]
+    pub default_conflict_policy: DefaultConflictPolicy,
+}
+
+/// The configurable subset of [`crate::queue::ConflictPolicy`], in the
+/// words the conflict dialog uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultConflictPolicy {
+    #[default]
+    Ask,
+    Replace,
+    Skip,
+    KeepBoth,
+    ReplaceIfNewer,
+}
+
+impl DefaultConflictPolicy {
+    /// The value as written in config.json5.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Replace => "replace",
+            Self::Skip => "skip",
+            Self::KeepBoth => "keep_both",
+            Self::ReplaceIfNewer => "replace_if_newer",
+        }
+    }
+}
+
+impl From<DefaultConflictPolicy> for crate::queue::ConflictPolicy {
+    fn from(policy: DefaultConflictPolicy) -> Self {
+        match policy {
+            DefaultConflictPolicy::Ask => Self::Ask,
+            DefaultConflictPolicy::Replace => Self::Overwrite,
+            DefaultConflictPolicy::Skip => Self::Skip,
+            DefaultConflictPolicy::KeepBoth => Self::Rename,
+            DefaultConflictPolicy::ReplaceIfNewer => Self::OverwriteNewer,
+        }
+    }
 }
 
 fn default_retries() -> u32 {
@@ -450,6 +506,23 @@ mod tests {
 
     /// In-place UI-state writes must keep comments/formatting, update
     /// existing keys, and insert missing ones into the ui block.
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("kessel-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json5");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!dir.join("config.json5.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn defaults_parse() {
+        defaults();
+    }
+
     #[test]
     fn upsert_preserves_comments_and_inserts() {
         let existing = "{\n  // my config\n  ui: {\n    theme: \"dark\",\n    sidebar_width: 200, // tuned by hand\n  },\n}\n";
@@ -545,6 +618,27 @@ mod tests {
             .ends_with("releases/latest/download/latest.json"));
     }
 
+    /// The default conflict policy is "ask" and accepts the documented names.
+    #[test]
+    fn default_conflict_policy_parses() {
+        let parse = |json5: &str| -> KesselConfig {
+            config::Config::builder()
+                .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Json5))
+                .add_source(config::File::from_str(json5, config::FileFormat::Json5))
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap()
+        };
+        assert_eq!(parse("{}").transfers.default_conflict_policy, DefaultConflictPolicy::Ask);
+        let cfg = parse("{ transfers: { default_conflict_policy: \"keep_both\" } }");
+        assert_eq!(cfg.transfers.default_conflict_policy, DefaultConflictPolicy::KeepBoth);
+        assert_eq!(
+            crate::queue::ConflictPolicy::from(DefaultConflictPolicy::ReplaceIfNewer),
+            crate::queue::ConflictPolicy::OverwriteNewer
+        );
+    }
+
     /// Zed-style theme_overrides use dotted style keys ("element.selected");
     /// they must survive the config crate as literal map keys, not nested tables.
     #[test]
@@ -570,6 +664,15 @@ mod tests {
         assert_eq!(patch["element.selected"], "#212121");
         assert_eq!(patch["border"], "#1A1A1A");
     }
+}
+
+/// The compiled-in defaults alone, ignoring the user's config.json5.
+pub fn defaults() -> KesselConfig {
+    config::Config::builder()
+        .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Json5))
+        .build()
+        .and_then(config::Config::try_deserialize)
+        .expect("compiled-in default config is valid")
 }
 
 pub fn load() -> Result<KesselConfig> {
@@ -641,7 +744,7 @@ fn migrate_dock_height() -> Result<()> {
     if dock.is_none() {
         out = upsert_section_values(&out, "ui", &[("dock_height", fmt_f32(height))]);
     }
-    std::fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))
+    write_atomic(&path, &out)
 }
 
 /// (`dock_height`, legacy height) as present in the user config text.

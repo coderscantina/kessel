@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, div, px, AnyElement, App, Context, Corner, DispatchPhase, Entity, EntityId,
+    actions, canvas, div, px, AnyElement, App, Context, Anchor, DispatchPhase, Entity, EntityId,
     FocusHandle, Focusable as _, Global, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::DialogFooter;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::popover::Popover;
@@ -34,13 +35,15 @@ use sqlx::SqlitePool;
 use crate::config::KesselConfig;
 use crate::db::{self, BookmarkFolder, OpenTabRow, Space};
 use crate::provider::{LayerConfig, SiteProfile};
-use crate::queue::{ConflictPolicy, JobState, NewJob, LOCAL_SITE_ID};
+use crate::queue::{ConflictPolicy, JobOutcome, JobState, NewJob, LOCAL_SITE_ID};
 use crate::i18n::{t, tf};
 use crate::ui::bookmarks::{BookmarkEvent, BookmarkManager};
+use crate::bookmarks::QUICK_CONNECT_SPACE;
 use crate::ui::command_bar::{CommandBar, CommandBarEvent, RunRequest};
+use crate::ui::connect::{open_host_key_dialog, QuickConnectEvent, QuickConnectForm};
 use crate::ui::file_pane::{DraggedEntries as DraggedRowEntries, FilePane, FsEntry, PaneEvent, PendingDragOut};
 use crate::ui::logs::LogsPanel;
-use crate::ui::transfers::{TransfersEvent, TransfersPanel};
+use crate::ui::transfers::{TransfersEvent, TransfersPanel, TransfersRequest};
 use crate::ui::{bookmark_color, bookmark_icon};
 
 actions!(
@@ -52,6 +55,8 @@ actions!(
         PrevTab,
         ToggleSidebar,
         ToggleTransfers,
+        ShowTransfers,
+        FocusTransfers,
         ToggleLogs,
         LayoutSingle,
         LayoutSplitH,
@@ -65,9 +70,29 @@ actions!(
         SyncPanes,
         Help,
         CheckForUpdates,
+        QuickConnect,
+        SaveAsSite,
         Quit
     ]
 );
+
+/// Open the ssh host key trust dialog for `host:port`. After the user
+/// trusts the key, every pane showing that server reloads. Dispatch it when a
+/// connection fails with `errors::Class::HostKeyUnknown`.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace)]
+pub struct TrustHostKey {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Open the site editor for one saved site (or "Save as site" for a
+/// quick-connect site).
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace)]
+pub struct EditSite {
+    pub site_id: i64,
+}
 
 /// Switch to the nth space (1-based); `ctrl-1…9` by default.
 #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
@@ -288,6 +313,13 @@ pub struct KesselApp {
     space_active: HashMap<i64, u64>,
     /// Shared manager backing the "Bookmarks" dialog (list + editor).
     bookmarks: Entity<BookmarkManager>,
+    /// The quick-connect field of the empty workspace (first run, last tab
+    /// closed). The header button and command bar open their own copy in a
+    /// dialog.
+    quick_connect: Entity<QuickConnectForm>,
+    /// Set when the empty workspace appears; the next render focuses its
+    /// quick-connect field.
+    pending_quick_focus: bool,
     transfers: Entity<TransfersPanel>,
     /// The global log bottom pane (see `crate::logs`).
     logs: Entity<LogsPanel>,
@@ -347,10 +379,16 @@ impl KesselApp {
         cx.subscribe_in(&bookmarks, window, Self::on_bookmark_event)
             .detach();
 
+        let quick_connect = cx.new(|cx| QuickConnectForm::new(window, cx));
+        cx.subscribe_in(&quick_connect, window, Self::on_quick_connect_event)
+            .detach();
+
         let transfers = cx.new(TransfersPanel::new);
         // Re-render the status bar's transfer summary as snapshots arrive.
         cx.observe(&transfers, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&transfers, window, Self::on_transfers_event)
+            .detach();
+        cx.subscribe_in(&transfers, window, Self::on_transfers_request)
             .detach();
 
         let logs = cx.new(LogsPanel::new);
@@ -366,7 +404,7 @@ impl KesselApp {
                 .default_value(queue_snap.max_parallel as f32)
         });
         cx.subscribe(&parallel_slider, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             cx.global::<AppState>()
                 .queue
                 .set_max_parallel(value.start() as usize);
@@ -381,7 +419,7 @@ impl KesselApp {
                 .default_value(queue_snap.bandwidth_limit as f32 / MB)
         });
         cx.subscribe(&throttle_slider, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             cx.global::<AppState>()
                 .queue
                 .set_bandwidth((value.start() * MB) as u64);
@@ -401,6 +439,8 @@ impl KesselApp {
             active_space: first_space,
             space_active: HashMap::new(),
             bookmarks,
+            quick_connect,
+            pending_quick_focus: false,
             transfers,
             logs,
             bottom_dock: None,
@@ -436,6 +476,21 @@ impl KesselApp {
             while let Ok(conflict) = edit_conflicts.recv().await {
                 let alive = this.update_in(cx, |_, window, cx| {
                     crate::edit::open_conflict_dialog(conflict, window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // "Saved notes.txt to example.com" and upload failures from
+        // external-edit sessions.
+        let edit_notices = crate::edit::subscribe_notices();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(notice) = edit_notices.recv().await {
+                let alive = this.update_in(cx, |_, window, cx| {
+                    crate::edit::show_notice(notice, window, cx);
                 });
                 if alive.is_err() {
                     break;
@@ -488,9 +543,42 @@ impl KesselApp {
         if let Some(first) = this.tabs.first() {
             this.active_space = first.space_id;
             this.active = first.uid;
+        } else {
+            this.pending_quick_focus = true;
         }
         cx.global_mut::<AppState>().active_space = this.active_space;
+        this.sweep_quick_sites(cx);
+
+        // The close button quits through the same flow as Cmd-Q (with the
+        // running-transfers warning) on every platform; closing the only
+        // window would otherwise leave macOS running without one.
+        let app = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            app.update(cx, |this, cx| this.request_quit(window, cx)).ok();
+            false
+        });
         this
+    }
+
+    /// Forget quick-connect sites from earlier runs that no tab or
+    /// unfinished transfer still uses.
+    fn sweep_quick_sites(&self, cx: &mut Context<Self>) {
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let task = state
+            .runtime
+            .spawn(async move { crate::ui::connect::sweep_quick_sites(&pool).await });
+        cx.spawn(async move |_, cx| match task.await {
+            Ok(Ok(removed)) if !removed.is_empty() => {
+                cx.update_global::<AppState, _>(|state, _| {
+                    state.sites.retain(|site| !removed.contains(&site.id));
+                });
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "sweeping quick-connect sites failed"),
+            Err(error) => tracing::warn!(%error, "quick-connect sweep task failed"),
+        })
+        .detach();
     }
 
     // --- tab/pane construction ---
@@ -611,6 +699,7 @@ impl KesselApp {
     /// the workspace renders its empty state — never a synthesized local tab.
     fn clear_active_tab(&mut self, space_id: i64, cx: &mut Context<Self>) {
         self.active = 0;
+        self.pending_quick_focus = true;
         self.active_space = space_id;
         cx.global_mut::<AppState>().active_space = space_id;
         cx.notify();
@@ -905,7 +994,7 @@ impl KesselApp {
             }
             workspace.active = 1 - workspace.active;
             let focus = workspace.panes[workspace.active].focus_handle(cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
             cx.notify();
         }
     }
@@ -928,6 +1017,21 @@ impl KesselApp {
 
     fn on_toggle_transfers(&mut self, _: &ToggleTransfers, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_bottom(BottomPanel::Transfers, cx);
+    }
+
+    /// Open the queue without moving the keyboard: where every "queued" note
+    /// leads, whichever way the transfer was started.
+    fn on_show_transfers(&mut self, _: &ShowTransfers, _: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        cx.notify();
+    }
+
+    /// Open the queue and give it the keyboard.
+    fn on_focus_transfers(&mut self, _: &FocusTransfers, window: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        let focus = self.transfers.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     fn on_toggle_logs(&mut self, _: &ToggleLogs, _: &mut Window, cx: &mut Context<Self>) {
@@ -1146,27 +1250,30 @@ impl KesselApp {
                 .w(px(420.))
                 .overlay_closable(!installing)
                 .child(body)
-                .footer(move |_ok, _cancel, _window, _cx| {
+                .footer({
                     let install_app = footer_app.clone();
                     let install_info = footer_info.clone();
-                    vec![
-                        Button::new("update-later")
-                            .label(t("update.dialog.later"))
-                            .ghost()
-                            .disabled(installing)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                        Button::new("update-install")
-                            .label(t("update.dialog.install"))
-                            .primary()
-                            .loading(installing)
-                            .disabled(installing)
-                            .on_click(move |_, _, cx| {
-                                let info = install_info.clone();
-                                install_app
-                                    .update(cx, |this, cx| this.start_install(info, cx))
-                                    .ok();
-                            }),
-                    ]
+                    DialogFooter::new()
+                        .child(
+                            Button::new("update-later")
+                                .label(t("update.dialog.later"))
+                                .ghost()
+                                .disabled(installing)
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("update-install")
+                                .label(t("update.dialog.install"))
+                                .primary()
+                                .loading(installing)
+                                .disabled(installing)
+                                .on_click(move |_, _, cx| {
+                                    let info = install_info.clone();
+                                    install_app
+                                        .update(cx, |this, cx| this.start_install(info, cx))
+                                        .ok();
+                                }),
+                        )
                 })
         });
     }
@@ -1193,8 +1300,15 @@ impl KesselApp {
                 this.update_installing = false;
                 match result {
                     Ok(crate::update::InstallOutcome::ReadyToRelaunch { app_path }) => {
-                        crate::update::relaunch(&app_path);
-                        cx.quit();
+                        // Quitting without a successor would leave no app running.
+                        match crate::update::relaunch(&app_path) {
+                            Ok(()) => cx.quit(),
+                            Err(error) => {
+                                this.update_error = Some(SharedString::from(format!(
+                                    "Updated, but kessel could not restart: {error:#}"
+                                )));
+                            }
+                        }
                     }
                     Ok(crate::update::InstallOutcome::ManualInstall) => {
                         this.update_error = Some(t(if cfg!(target_os = "windows") {
@@ -1231,7 +1345,7 @@ impl KesselApp {
         cx.subscribe_in(&bar, window, Self::on_command_bar_event)
             .detach();
         let focus = bar.read(cx).focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         self.command_bar = Some(bar);
         cx.notify();
     }
@@ -1263,7 +1377,7 @@ impl KesselApp {
                         if let Some(tab) = self.active_tab() {
                             if let TabContent::Panes(workspace) = &tab.content {
                                 let focus = workspace.panes[workspace.active].focus_handle(cx);
-                                window.focus(&focus);
+                                window.focus(&focus, cx);
                             }
                         }
                         match cx.build_action(name, None) {
@@ -1274,6 +1388,7 @@ impl KesselApp {
                         }
                     }
                     RunRequest::Bookmark(site_id) => self.open_bookmark(site_id, window, cx),
+                    RunRequest::QuickConnect(url) => self.open_quick_connect(Some(url), window, cx),
                     RunRequest::Space(space_id) => self.switch_space(space_id, cx),
                 }
             }
@@ -1319,6 +1434,11 @@ impl KesselApp {
     /// on key repeat re-firing this action while cmd-q stays down. The
     /// `on_app_quit` hook pauses workers and flushes offsets either way.
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_quit(window, cx);
+    }
+
+    /// Shared by Cmd-Q and the window's close button.
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let busy = self
             .transfers
             .read(cx)
@@ -1349,7 +1469,7 @@ impl KesselApp {
     fn confirm_quit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.quit_dialog_open = true;
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
             let reset = move |cx: &mut App| {
                 app.update(cx, |this, _| this.quit_dialog_open = false).ok();
@@ -1357,7 +1477,7 @@ impl KesselApp {
             let on_cancel_reset = reset.clone();
             dialog
                 .title("Transfers are running")
-                .w(px(440.))
+                .width(px(440.))
                 .child(format!(
                     "Quitting pauses running transfers and resumes them the next \
                      time kessel starts. Keep holding {} to quit without asking.",
@@ -1493,6 +1613,7 @@ impl KesselApp {
                 };
                 self.enqueue_entries(tab_ix, pane_ix, entries.clone(), true, window, cx);
             }
+            PaneEvent::EditSite(site_id) => self.edit_site(*site_id, window, cx),
             PaneEvent::OpenInNewTab { profile, path } => {
                 self.open_tab_with(profile.clone(), path.clone(), None, window, cx);
             }
@@ -1530,6 +1651,64 @@ impl KesselApp {
                 }
             }
         }
+    }
+
+    fn on_transfers_request(
+        &mut self,
+        _: &Entity<TransfersPanel>,
+        request: &TransfersRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            TransfersRequest::ConflictParked { job_id } => {
+                self.bottom_dock = Some(BottomPanel::Transfers);
+                let job_id = *job_id;
+                self.transfers
+                    .update(cx, |panel, cx| panel.prompt_conflicts(job_id, window, cx));
+                cx.notify();
+            }
+            TransfersRequest::ShowInPane { site_id, dir } => {
+                self.show_in_pane(*site_id, dir.clone(), window, cx);
+            }
+            TransfersRequest::ReturnToPane => {
+                self.pending_pane_focus = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Point a pane on `site_id` at `dir`: the active tab's pane if it shows
+    /// that site, then any other tab's, else a new tab.
+    fn show_in_pane(&mut self, site_id: i64, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let known = site_id == LOCAL_SITE_ID
+            || cx.global::<AppState>().sites.iter().any(|site| site.id == site_id);
+        if !known {
+            return;
+        }
+        let mut tabs: Vec<&Tab> = self.tabs.iter().collect();
+        tabs.sort_by_key(|tab| tab.uid != self.active);
+        let found = tabs.into_iter().find_map(|tab| {
+            let TabContent::Panes(workspace) = &tab.content else {
+                return None;
+            };
+            workspace
+                .panes
+                .iter()
+                .find(|pane| pane.read(cx).site_id() == site_id)
+                .map(|pane| (tab.uid, pane.clone()))
+        });
+        match found {
+            Some((uid, pane)) => {
+                self.activate_tab(uid, cx);
+                pane.update(cx, |pane, cx| pane.navigate_to(dir, window, cx));
+            }
+            None => {
+                let profile = self.profile_for(Some(site_id), cx);
+                self.open_tab_with(profile, dir, None, window, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn on_transfers_event(
@@ -1594,10 +1773,16 @@ impl KesselApp {
                         );
                         let tab = &mut self.tabs[ix];
                         tab.content = TabContent::Panes(workspace);
-                        tab.bookmark_id = (profile.id > 0).then_some(profile.id);
+                        // A one-off connection has no bookmark row to pin to.
+                        tab.bookmark_id = (profile.id > 0
+                            && profile.space_id != QUICK_CONNECT_SPACE)
+                            .then_some(profile.id);
                         let uid = tab.uid;
                         self.activate_tab(uid, cx);
                         self.persist_session(cx);
+                    }
+                    None if profile.space_id == QUICK_CONNECT_SPACE => {
+                        self.open_tab_with(profile, String::new(), None, window, cx);
                     }
                     None => self.open_bookmark(profile.id, window, cx),
                 }
@@ -1606,6 +1791,161 @@ impl KesselApp {
                 self.refresh_tags(cx);
                 cx.notify();
             }
+            BookmarkEvent::Promoted(site_id) => {
+                // The saved site joined the active space: its tabs there
+                // become its pinned bookmark tab, like a bookmark click.
+                let site_id = *site_id;
+                let space = self.active_space;
+                let mut pinned = false;
+                for tab in &mut self.tabs {
+                    let shows_site = matches!(&tab.content, TabContent::Panes(workspace)
+                        if workspace.panes[0].read(cx).site_id() == site_id);
+                    if !pinned && shows_site && tab.space_id == space && tab.bookmark_id.is_none() {
+                        tab.bookmark_id = Some(site_id);
+                        pinned = true;
+                    }
+                }
+                self.persist_session(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    // --- quick connect & host keys ---
+
+    fn on_quick_connect_event(
+        &mut self,
+        _: &Entity<QuickConnectForm>,
+        event: &QuickConnectEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let QuickConnectEvent::Connect(profile) = event;
+        self.open_tab_with(profile.clone(), String::new(), None, window, cx);
+    }
+
+    /// Quick connect from the header or command bar. The empty workspace
+    /// already shows the field, so it just takes focus; otherwise a small
+    /// dialog opens. `url` pre-fills it and connects right away.
+    fn open_quick_connect(&mut self, url: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab().is_none() {
+            let quick = self.quick_connect.clone();
+            quick.update(cx, |quick, cx| {
+                quick.focus(window, cx);
+                if let Some(url) = &url {
+                    quick.connect_to(url, window, cx);
+                }
+            });
+            return;
+        }
+        let quick = cx.new(|cx| QuickConnectForm::new(window, cx));
+        cx.subscribe_in(&quick, window, |this, _, event: &QuickConnectEvent, window, cx| {
+            window.close_dialog(cx);
+            this.on_quick_connect_event(&this.quick_connect.clone(), event, window, cx);
+        })
+        .detach();
+        let dialog_quick = quick.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(t("connect.quick.title"))
+                .w(px(560.))
+                .child(dialog_quick.clone())
+        });
+        quick.update(cx, |quick, cx| {
+            quick.focus(window, cx);
+            if let Some(url) = &url {
+                quick.connect_to(url, window, cx);
+            }
+        });
+    }
+
+    fn on_quick_connect(&mut self, _: &QuickConnect, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_quick_connect(None, window, cx);
+    }
+
+    fn on_trust_host_key(&mut self, action: &TrustHostKey, window: &mut Window, cx: &mut Context<Self>) {
+        let app = cx.entity().downgrade();
+        let (host, port) = (action.host.clone(), action.port);
+        let target = (host.clone(), port);
+        open_host_key_dialog(
+            host,
+            port,
+            std::rc::Rc::new(move |window, cx| {
+                app.update(cx, |this, cx| this.reload_server_panes(&target, window, cx))
+                    .ok();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Reload every pane connected to the sftp server at `host:port`.
+    fn reload_server_panes(&mut self, target: &(String, u16), window: &mut Window, cx: &mut Context<Self>) {
+        let panes: Vec<Entity<FilePane>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Panes(workspace) => Some(workspace.panes.clone()),
+                TabContent::Connect(_) => None,
+            })
+            .flatten()
+            .filter(|pane| {
+                let profile = pane.read(cx).profile();
+                profile.scheme == "sftp"
+                    && profile
+                        .options
+                        .get("endpoint")
+                        .and_then(|endpoint| crate::sftp::host_port(endpoint))
+                        .is_some_and(|found| &found == target)
+            })
+            .collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| pane.refresh(window, cx));
+        }
+    }
+
+    fn on_edit_site(&mut self, action: &EditSite, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_site(action.site_id, window, cx);
+    }
+
+    /// Site editor for `site_id`; a quick-connect site opens as "Save as
+    /// site" and joins the active space on save.
+    fn edit_site(&mut self, site_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let quick = cx
+            .global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.id == site_id && site.space_id == QUICK_CONNECT_SPACE);
+        self.bookmarks.update(cx, |manager, cx| {
+            if quick {
+                manager.open_promote(site_id, window, cx);
+            } else {
+                manager.open_edit(site_id, window, cx);
+            }
+        });
+        let manager = self.bookmarks.clone();
+        let title = if quick { t("connect.save_as_site") } else { "Bookmarks".into() };
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title.clone()).w(px(560.)).child(manager.clone())
+        });
+    }
+
+    /// The quick-connect site shown in the active tab's focused pane.
+    fn active_quick_site(&self, cx: &App) -> Option<i64> {
+        let Some(Tab { content: TabContent::Panes(workspace), .. }) = self.active_tab() else {
+            return None;
+        };
+        let site_id = workspace.panes[workspace.active].read(cx).site_id();
+        cx.global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.id == site_id && site.space_id == QUICK_CONNECT_SPACE)
+            .then_some(site_id)
+    }
+
+    fn on_save_as_site(&mut self, _: &SaveAsSite, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(site_id) = self.active_quick_site(cx) {
+            self.edit_site(site_id, window, cx);
         }
     }
 
@@ -1624,7 +1964,7 @@ impl KesselApp {
             return;
         };
         if workspace.layout == PaneLayout::Single {
-            window.push_notification("Switch to split view to copy between panes.", cx);
+            window.push_notification(t("app.split_needed"), cx);
             return;
         }
         let src_pane = &workspace.panes[src_ix];
@@ -1632,25 +1972,22 @@ impl KesselApp {
         let src_site_id = src_pane.read(cx).site_id();
         let dst_site_id = dst_pane.read(cx).site_id();
         let dst_dir = dst_pane.read(cx).current_dir();
-        let count = entries.len();
-        let queue = cx.global::<AppState>().queue.clone();
-        for entry in entries {
-            queue.enqueue(NewJob {
+        let conflict_policy = crate::ui::file_pane::default_conflict_policy(cx);
+        let jobs = entries
+            .into_iter()
+            .map(|entry| NewJob {
                 src_site_id,
                 dst_site_id,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                // Existing files park as conflicts; the Transfers panel prompts.
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source,
-            });
-        }
-        let verb = if move_source { "move" } else { "item" };
-        window.push_notification(format!("Queued {count} {verb}(s)."), cx);
-        // Surface the queue right where the work was kicked off.
-        self.bottom_dock = Some(BottomPanel::Transfers);
-        cx.notify();
+            })
+            .collect();
+        src_pane
+            .clone()
+            .update(cx, |pane, cx| pane.submit_jobs(jobs, window, cx));
     }
 
     // --- panel size persistence ---
@@ -1790,14 +2127,31 @@ impl KesselApp {
     }
 
     /// Bookmark click: focus its pinned tab in the current space, opening it
-    /// first if needed. Never adds a row to the ephemeral tab list.
+    /// first if needed. Never adds a row to the ephemeral tab list. An imported
+    /// site still missing its credentials opens the site editor instead.
     fn open_bookmark(&mut self, site_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(uid) = self.bookmark_tab(site_id) {
             self.activate_tab(uid, cx);
             return;
         }
-        let profile = self.profile_for(Some(site_id), cx);
-        self.open_tab_with(profile, String::new(), Some(site_id), window, cx);
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let task = state
+            .runtime
+            .spawn(async move { db::sites_needing_credentials(&pool).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let needs_credentials = matches!(task.await, Ok(Ok(ids)) if ids.contains(&site_id));
+            this.update_in(cx, |this, window, cx| {
+                if needs_credentials {
+                    this.edit_site(site_id, window, cx);
+                } else {
+                    let profile = this.profile_for(Some(site_id), cx);
+                    this.open_tab_with(profile, String::new(), Some(site_id), window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Await a DB task returning the fresh site list and sync it into the
@@ -1862,8 +2216,9 @@ impl KesselApp {
         self.sync_sites(task, cx);
     }
 
-    /// Context menu "Delete…": confirm, close its pinned tabs, then remove
-    /// the site row and its keychain secrets.
+    /// Context menu "Delete…": refuse while open transfer jobs use the site
+    /// (deleting it would cascade them away), otherwise confirm, close its
+    /// pinned tabs, then remove the site row and its keychain secrets.
     fn confirm_delete_bookmark(
         &mut self,
         site_id: i64,
@@ -1879,20 +2234,44 @@ impl KesselApp {
         else {
             return;
         };
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let jobs = state
+            .runtime
+            .spawn(async move { db::open_job_count(&pool, site_id).await });
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let app = app.clone();
-            dialog
-                .title(format!("Delete bookmark `{name}`?"))
-                .w(px(380.))
-                .child("Its saved connection settings and secrets are removed for good.")
-                .confirm()
-                .on_ok(move |_, _, cx| {
-                    app.update(cx, |this, cx| this.delete_bookmark(site_id, cx))
-                        .ok();
-                    true
-                })
-        });
+        cx.spawn_in(window, async move |this, cx| {
+            let jobs = match jobs.await {
+                Ok(Ok(jobs)) => jobs,
+                _ => 0,
+            };
+            this.update_in(cx, |_, window, cx| {
+                if jobs > 0 {
+                    window.open_alert_dialog(cx, move |dialog, _, _| {
+                        dialog
+                            .title(t("site.busy.title"))
+                            .width(px(420.))
+                            .child(db::SiteBusy::Delete(jobs).to_string())
+                    });
+                    return;
+                }
+                window.open_alert_dialog(cx, move |dialog, _, _| {
+                    let app = app.clone();
+                    dialog
+                        .title(format!("Delete bookmark `{name}`?"))
+                        .width(px(380.))
+                        .child("Its saved connection settings and secrets are removed for good.")
+                        .confirm()
+                        .on_ok(move |_, _, cx| {
+                            app.update(cx, |this, cx| this.delete_bookmark(site_id, cx))
+                                .ok();
+                            true
+                        })
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn delete_bookmark(&mut self, site_id: i64, cx: &mut Context<Self>) {
@@ -1909,10 +2288,10 @@ impl KesselApp {
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
         let task = state.runtime.spawn(async move {
+            db::delete_site(&pool, site_id).await?;
             let _ = crate::secrets::SecretStore::delete(
                 &crate::secrets::SecretStore::handle_for_site(site_id),
             );
-            db::delete_site(&pool, site_id).await?;
             db::list_sites(&pool).await
         });
         self.sync_sites(task, cx);
@@ -1968,12 +2347,12 @@ impl KesselApp {
     fn new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("folder name"));
         let app = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
             let input = input.clone();
             dialog
                 .title("New folder")
-                .w(px(380.))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, _, cx| {
@@ -2060,6 +2439,8 @@ impl KesselApp {
         } else {
             Some(panel)
         };
+        // A closing panel may hold the keyboard; hand it back to the files.
+        self.pending_pane_focus |= self.bottom_dock.is_none();
         cx.notify();
     }
 
@@ -2107,6 +2488,7 @@ impl KesselApp {
                             .tooltip(t("dock.close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bottom_dock = None;
+                                this.pending_pane_focus = true;
                                 cx.notify();
                             })),
                     ),
@@ -2190,7 +2572,7 @@ impl KesselApp {
         })
         .detach();
         let focus = input.focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         self.rename = Some((target, input));
         cx.notify();
     }
@@ -2427,6 +2809,29 @@ impl KesselApp {
                 );
             }
         }
+        if self.active_quick_site(cx).is_some() {
+            right = right.child(
+                Button::new("save-as-site")
+                    .label(t("connect.save_as_site"))
+                    .icon(Icon::new(IconName::Plus))
+                    .ghost()
+                    .small()
+                    .tooltip(t("connect.save_as_site_tooltip"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_save_as_site(&SaveAsSite, window, cx);
+                    })),
+            );
+        }
+        right = right.child(
+            Button::new("quick-connect")
+                .icon(Icon::default().path("icons/zap.svg"))
+                .ghost()
+                .small()
+                .tooltip(t("connect.quick.title"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_quick_connect(None, window, cx);
+                })),
+        );
         if sidebar_right {
             right = right.child(toggle);
         } else {
@@ -2870,7 +3275,7 @@ impl KesselApp {
         let app = cx.entity().downgrade();
         let name_input = self.space_name_input.clone();
         Popover::new("new-space")
-            .anchor(Corner::BottomRight)
+            .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("add-space")
                     .icon(Icon::new(IconName::Plus))
@@ -3165,7 +3570,7 @@ impl KesselApp {
         let parallel = self.parallel_slider.clone();
         let throttle = self.throttle_slider.clone();
         Popover::new("queue-limits")
-            .anchor(Corner::BottomRight)
+            .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("queue-limits-trigger")
                     .icon(Icon::default().path("icons/gauge.svg"))
@@ -3331,7 +3736,7 @@ impl KesselApp {
                         .child(
                             div()
                                 .w(px(120.))
-                                .child(Progress::new().value(stats.percent())),
+                                .child(Progress::new("status-progress").value(stats.percent())),
                         ),
                 )
             })
@@ -3429,29 +3834,96 @@ impl KesselApp {
             .on_click(cx.listener(move |this, _, _, cx| this.set_layout(layout, cx)))
     }
 
+    /// The empty workspace: quick connect first, then the saved sites, a
+    /// full site setup, and the local disk.
+    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let has_sites = cx
+            .global::<AppState>()
+            .sites
+            .iter()
+            .any(|site| site.space_id == self.active_space);
+        let local_label = if cfg!(target_os = "macos") {
+            t("connect.empty.browse_mac")
+        } else {
+            t("connect.empty.browse_computer")
+        };
+        v_flex()
+            .id("empty-workspace")
+            .size_full()
+            .overflow_y_scroll()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(520.))
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_semibold()
+                                    .child(t("connect.empty.title")),
+                            )
+                            .child(div().text_sm().text_color(muted).child(t("connect.empty.body"))),
+                    )
+                    .child(self.quick_connect.clone())
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .when(has_sites, |row| {
+                                row.child(
+                                    Button::new("empty-saved-site")
+                                        .label(t("connect.empty.saved_site"))
+                                        .icon(Icon::default().path("icons/server.svg"))
+                                        .ghost()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_bookmarks_dialog(None, window, cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("empty-new-site")
+                                    .label(t("connect.empty.new_site"))
+                                    .icon(Icon::new(IconName::Plus))
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.push_connection_tab(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("empty-local")
+                                    .label(local_label)
+                                    .icon(Icon::default().path("icons/hard-drive.svg"))
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_tab_with(
+                                            local_profile(),
+                                            home_path(),
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // No tab selected (fresh space, last tab closed): an inviting blank,
-        // never a synthesized local browser.
+        // No tab selected (first run, fresh space, last tab closed): lead
+        // with the main task, connecting, never a synthesized local browser.
         let Some(tab) = self.active_tab() else {
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_color(cx.theme().muted_foreground)
-                .child(Icon::new(IconName::Globe))
-                .child(div().text_sm().child("No open tabs in this space."))
-                .child(
-                    Button::new("empty-new-tab")
-                        .label("New tab")
-                        .icon(Icon::new(IconName::Plus))
-                        .outline()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.push_connection_tab(window, cx);
-                        })),
-                )
-                .into_any_element();
+            return self.render_empty_workspace(cx);
         };
         match &tab.content {
             // Centered column that scrolls inside the pane, so a tall form
@@ -3489,6 +3961,18 @@ impl KesselApp {
     }
 }
 
+/// A drag-out promise succeeded only if every file arrived: a folder job can
+/// settle as `Done` with some of its files failed.
+fn promise_result(outcome: &JobOutcome) -> anyhow::Result<()> {
+    if outcome.state == JobState::Done && outcome.files_failed == 0 {
+        return Ok(());
+    }
+    Err(match &outcome.error {
+        Some(error) => anyhow::anyhow!(error.clone()),
+        None => anyhow::anyhow!("transfer {}", outcome.state.as_str()),
+    })
+}
+
 /// Promote an in-flight internal row drag to a native OS drag session —
 /// gpui has no outbound drag support, so once the pointer leaves the window
 /// the gpui drag is stopped and the still-held gesture is handed to the
@@ -3515,17 +3999,20 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
         .collect();
 
     let site_id = drag.site_id;
+    let sites = state.sites.clone();
     let sources: Vec<String> = drag.entries.iter().map(|entry| entry.path.clone()).collect();
     let fulfill: crate::dragout::FulfillFn = Box::new(move |ix, dest| {
         use anyhow::Context as _;
         let src = sources.get(ix).context("unknown drag item")?.clone();
         let dir = dest.parent().context("promise destination has no parent")?;
         let name = dest.file_name().context("promise destination has no name")?;
+        let (dst_site_id, dst_dir) = crate::localfs::locate(&sites, dir, true)
+            .context("no local site covers the drop destination")?;
         let job = NewJob {
             src_site_id: site_id,
-            dst_site_id: LOCAL_SITE_ID,
+            dst_site_id,
             src,
-            dst_dir: crate::ui::file_pane::local_dir_path(dir),
+            dst_dir,
             dst_name: Some(name.to_string_lossy().to_string()),
             // The destination already chose the final (unique) name; never
             // park a promise on a conflict prompt.
@@ -3538,21 +4025,7 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
                 .enqueue_tracked(job)
                 .await
                 .map_err(|_| anyhow::anyhow!("transfer was rejected"))?;
-            match queue.wait_terminal(job_id).await {
-                JobState::Done => Ok(()),
-                state => {
-                    let detail = queue
-                        .latest()
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == job_id)
-                        .and_then(|job| job.error.clone());
-                    Err(match detail {
-                        Some(error) => anyhow::anyhow!(error),
-                        None => anyhow::anyhow!("transfer {}", state.as_str()),
-                    })
-                }
-            }
+            promise_result(&queue.settled(job_id).await?)
         })
     });
 
@@ -3583,15 +4056,25 @@ impl Render for KesselApp {
             if let Some(tab) = self.active_tab() {
                 if let TabContent::Panes(workspace) = &tab.content {
                     let focus = workspace.panes[workspace.active].focus_handle(cx);
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                 }
             }
         }
+        // The empty workspace leads with quick connect: its field takes the
+        // keyboard when it appears.
+        if self.active_tab().is_none() && std::mem::take(&mut self.pending_quick_focus) {
+            let focus = self.quick_connect.focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         // Keyboard shortcuts must work everywhere: when nothing holds focus
-        // (empty space, freshly closed dialog), park it on the workspace so
-        // Workspace-context bindings (quit, tabs, panels) keep firing.
+        // (empty space, a dialog that opened with nothing focused), park it
+        // on the active pane, or the workspace when no pane is showing.
         if window.focused(cx).is_none() && self.rename.is_none() {
-            window.focus(&self.focus_handle);
+            let focus = match self.active_tab().map(|tab| &tab.content) {
+                Some(TabContent::Panes(workspace)) => workspace.panes[workspace.active].focus_handle(cx),
+                _ => self.focus_handle.clone(),
+            };
+            window.focus(&focus, cx);
         }
 
         // Where the OS draws no menu bar, kessel draws one in its title bar.
@@ -3600,7 +4083,7 @@ impl Render for KesselApp {
         if !cfg!(target_os = "macos") {
             let epoch = crate::menu::epoch();
             if self.menu_bar.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
-                let bar = gpui_component::menu::AppMenuBar::new(window, cx);
+                let bar = gpui_component::menu::AppMenuBar::new(cx);
                 self.menu_bar = Some((epoch, bar));
             }
         }
@@ -3703,6 +4186,8 @@ impl Render for KesselApp {
             .on_action(cx.listener(Self::on_layout_split_v))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_transfers))
+            .on_action(cx.listener(Self::on_show_transfers))
+            .on_action(cx.listener(Self::on_focus_transfers))
             .on_action(cx.listener(Self::on_toggle_logs))
             .on_action(cx.listener(Self::on_open_bookmarks))
             .on_action(cx.listener(Self::on_about))
@@ -3712,6 +4197,10 @@ impl Render for KesselApp {
             .on_action(cx.listener(Self::on_sync_panes))
             .on_action(cx.listener(Self::on_help))
             .on_action(cx.listener(Self::on_check_for_updates))
+            .on_action(cx.listener(Self::on_quick_connect))
+            .on_action(cx.listener(Self::on_trust_host_key))
+            .on_action(cx.listener(Self::on_edit_site))
+            .on_action(cx.listener(Self::on_save_as_site))
             .on_action(cx.listener(Self::on_quit))
             .child(
                 v_flex()
@@ -3853,7 +4342,7 @@ pub fn watch_config(cx: &mut App) {
                 .await;
             while rx.try_recv().is_ok() {}
 
-            let applied = cx.update(|cx| {
+            cx.update(|cx| {
                 let new = match crate::config::load() {
                     Ok(new) => new,
                     Err(error) => {
@@ -3908,9 +4397,6 @@ pub fn watch_config(cx: &mut App) {
                 state.config_epoch += 1;
                 cx.refresh_windows();
             });
-            if applied.is_err() {
-                break;
-            }
         }
     })
     .detach();
@@ -3947,5 +4433,25 @@ mod linked_browsing_tests {
         assert_eq!(linked_directory("a/b/", "a/", "www/"), Some("".into()));
         assert_eq!(linked_directory("a/b/", "", "www/"), None);
         assert_eq!(linked_directory("project/", "project/../private/", "www/"), None);
+    }
+}
+
+#[cfg(test)]
+mod drag_out_tests {
+    use super::*;
+
+    #[test]
+    fn a_promise_fails_when_any_file_failed() {
+        let outcome = |state, files_failed, error: Option<&str>| JobOutcome {
+            state,
+            error: error.map(str::to_string),
+            files_done: 3,
+            files_skipped: 0,
+            files_failed,
+        };
+        assert!(promise_result(&outcome(JobState::Done, 0, None)).is_ok());
+        let partial = promise_result(&outcome(JobState::Done, 2, Some("2 files failed"))).unwrap_err();
+        assert_eq!(partial.to_string(), "2 files failed");
+        assert!(promise_result(&outcome(JobState::Cancelled, 0, None)).is_err());
     }
 }

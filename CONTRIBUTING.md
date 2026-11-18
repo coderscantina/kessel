@@ -12,17 +12,16 @@ cargo run            # debug build straight from the checkout
 scripts/bundle.sh dev  # or a signed dev .app bundle
 ```
 
-Requirements: latest stable Rust; macOS 12+ for the `.app` bundle, Windows 10+
-for the Windows build (`scripts\package-windows.ps1`). Tests run with
+Requirements: latest stable Rust and macOS 12+. Tests run with
 `cargo test`, lints with `cargo clippy --all-targets`.
 
 On macOS, gpui compiles its Metal shaders at build time. Xcode 26+ ships the
 Metal compiler as a separate component. If the build stops with "missing Metal
 Toolchain", run `xcodebuild -downloadComponent MetalToolchain` once.
 
-kessel builds for macOS and Windows from one tree and CI builds both on every
-push, so keep platform-specific code behind `cfg` and reach for the shared
-helpers rather than assuming POSIX:
+CI and releases cover macOS only while Windows builds are paused. The Windows
+code stays in the tree, so keep platform-specific code behind `cfg` and reach
+for the shared helpers rather than assuming POSIX:
 
 - `src/localfs.rs` — local paths and the Local site's root (`/` vs. `C:\`).
 - `src/update.rs` — per-platform install paths for the in-app updater.

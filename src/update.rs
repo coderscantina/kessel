@@ -11,8 +11,9 @@
 //! - **macOS** — mounts the DMG and swaps the running `.app` bundle in place.
 //!   Not installed as a writable bundle (`cargo run`, a read-only mount)? The
 //!   DMG is revealed in Finder for a manual drag-install.
-//! - **Windows** — renames the running `.exe` aside (allowed while it runs)
-//!   and moves the downloaded one in; the leftover is swept on next launch.
+//! - **Windows** — stages the downloaded `.exe` beside the running one,
+//!   renames the running `.exe` aside (allowed while it runs) and the staged
+//!   one into its place; the leftover is swept on next launch.
 //!   A non-writable install directory falls back to revealing the download.
 //! - **Anything else** — reveals the download; there is no packaged build.
 
@@ -235,9 +236,64 @@ mod install {
 
         /// Launch the installed bundle in a fresh process. The caller quits the
         /// current one right after.
-        pub fn relaunch(app_path: &Path) {
-            if let Err(error) = Command::new("open").arg("-n").arg(app_path).spawn() {
-                tracing::error!(%error, app = %app_path.display(), "relaunch failed");
+        pub fn relaunch(app_path: &Path) -> Result<()> {
+            Command::new("open")
+                .arg("-n")
+                .arg(app_path)
+                .spawn()
+                .context("relaunching the updated app")?;
+            Ok(())
+        }
+
+        /// Whether `codesign` accepts the bundle's signature.
+        fn signature_valid(app: &Path) -> bool {
+            Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(app)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+
+        /// The Team ID in `codesign --display` output. Ad-hoc signatures
+        /// report `TeamIdentifier=not set`.
+        pub(super) fn parse_team_id(details: &str) -> Option<&str> {
+            details
+                .lines()
+                .find_map(|line| line.strip_prefix("TeamIdentifier="))
+                .filter(|id| id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        }
+
+        /// The Team ID the bundle is signed with, if any.
+        fn team_id(app: &Path) -> Option<String> {
+            let output = Command::new("codesign")
+                .args(["--display", "--verbose=2"])
+                .arg(app)
+                .output()
+                .ok()?;
+            parse_team_id(&String::from_utf8_lossy(&output.stderr)).map(str::to_string)
+        }
+
+        /// Whether the bundle verifies and chains to Apple for this team. A
+        /// self-made certificate can claim any Team ID, so the requirement
+        /// asks for Apple's anchor too.
+        pub(super) fn signed_by_team(app: &Path, team: &str) -> bool {
+            Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(format!(
+                    "-R=anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+                ))
+                .arg(app)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+
+        /// Holding the update to the standard of the running build: a build
+        /// signed by a team only accepts that team's bundles, an ad-hoc signed
+        /// one any valid signature, an unsigned dev build anything.
+        fn update_acceptable(running: &Path, update: &Path) -> bool {
+            match team_id(running) {
+                Some(team) => signed_by_team(update, &team),
+                None => !signature_valid(running) || signature_valid(update),
             }
         }
 
@@ -253,8 +309,8 @@ mod install {
             (app.extension().is_some_and(|ext| ext == "app")).then_some(app)
         }
 
-        /// Mount the DMG, copy the new bundle over `target_app` with an
-        /// atomic-ish swap, and detach the mount.
+        /// Mount the DMG, swap the new bundle in for `target_app` atomically,
+        /// and detach the mount.
         fn install_in_place(dmg: &Path, target_app: &Path) -> Result<()> {
             let mount = attach_dmg(dmg)?;
             let result = swap_bundle(&mount, target_app);
@@ -294,17 +350,29 @@ mod install {
                 .status();
         }
 
+        /// Atomically trade the paths of two entries on one volume, so both
+        /// paths exist at every moment.
+        fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let (a, b) = (CString::new(a.as_os_str().as_bytes())?, CString::new(b.as_os_str().as_bytes())?);
+            // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+            match unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+
         /// Copy the `.app` out of the read-only mount to a staging path, then
-        /// swap it over the current bundle (old moved aside, new moved in, old
-        /// removed). On failure the previous bundle is restored.
+        /// exchange it with the current bundle and remove the old one from the
+        /// staging path. An interruption never leaves the install path empty.
         fn swap_bundle(mount: &Path, target_app: &Path) -> Result<()> {
             let new_app = find_app(mount)?;
             let parent = target_app.parent().context("app bundle has no parent")?;
             let pid = std::process::id();
             let staging = parent.join(format!(".kessel-new-{pid}.app"));
-            let backup = parent.join(format!(".kessel-old-{pid}.app"));
             let _ = std::fs::remove_dir_all(&staging);
-            let _ = std::fs::remove_dir_all(&backup);
 
             // ditto preserves bundle metadata/extended attributes and dereferences the
             // read-only DMG into a writable copy we own.
@@ -318,19 +386,15 @@ mod install {
                 bail!("ditto failed to copy the new app bundle");
             }
 
-            std::fs::rename(target_app, &backup).context("moving the current app aside")?;
-            match std::fs::rename(&staging, target_app) {
-                Ok(()) => {
-                    let _ = std::fs::remove_dir_all(&backup);
-                    Ok(())
-                }
-                Err(error) => {
-                    // Restore the previous bundle so the app stays launchable.
-                    let _ = std::fs::rename(&backup, target_app);
-                    let _ = std::fs::remove_dir_all(&staging);
-                    Err(anyhow::Error::new(error).context("installing the new app bundle"))
-                }
+            if !update_acceptable(target_app, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                bail!("the downloaded app's code signature is invalid");
             }
+
+            let exchanged = exchange(&staging, target_app);
+            // Holds the old bundle after the exchange, the new one without it.
+            let _ = std::fs::remove_dir_all(&staging);
+            exchanged.context("installing the new app bundle")
         }
 
         /// The first `.app` directory at the root of the mounted DMG.
@@ -342,6 +406,27 @@ mod install {
                 }
             }
             bail!("no .app bundle found in the mounted DMG");
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn exchange_trades_two_folders_in_place() {
+                let dir = std::env::temp_dir().join(format!("kessel-swap-test-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let (old, new) = (dir.join("Kessel.app"), dir.join(".kessel-new.app"));
+                std::fs::create_dir_all(&old).unwrap();
+                std::fs::create_dir_all(&new).unwrap();
+                std::fs::write(old.join("version"), b"old").unwrap();
+                std::fs::write(new.join("version"), b"new").unwrap();
+
+                super::exchange(&new, &old).unwrap();
+
+                assert_eq!(std::fs::read(old.join("version")).unwrap(), b"new");
+                assert_eq!(std::fs::read(new.join("version")).unwrap(), b"old");
+                assert!(super::exchange(&dir.join("missing"), &old).is_err());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 
@@ -375,25 +460,56 @@ mod install {
                 .context("executable has no file name")?
                 .to_string_lossy()
                 .to_string();
-            let backup = dir.join(format!("{BACKUP_PREFIX}{}-{name}", std::process::id()));
+            let pid = std::process::id();
+            let backup = dir.join(format!("{BACKUP_PREFIX}{pid}-{name}"));
+            // Staged beside the live executable, so the swap below is two
+            // renames on one volume; the download itself sits in the temp dir.
+            let staging = dir.join(format!(".kessel-new-{pid}-{name}"));
+            let _ = std::fs::remove_file(&staging);
+            std::fs::copy(artifact, &staging).context("staging the new executable")?;
+            // A signed install only accepts a download from the same signer.
+            if signer(&exe).is_some_and(|running| signer(&staging).as_ref() != Some(&running)) {
+                let _ = std::fs::remove_file(&staging);
+                bail!("the downloaded executable's Authenticode signature is invalid");
+            }
+
             std::fs::rename(&exe, &backup).context("moving the running executable aside")?;
-            // A copy, not a rename: the download lives on the temp volume,
-            // which is often a different one.
-            if let Err(error) = std::fs::copy(artifact, &exe) {
-                // Put the previous executable back so the app stays launchable.
+            // Renaming over an existing file replaces it on Windows, so the
+            // restore works even if the failed install left something behind.
+            if let Err(error) = std::fs::rename(&staging, &exe) {
                 let _ = std::fs::rename(&backup, &exe);
+                let _ = std::fs::remove_file(&staging);
                 return Err(anyhow::Error::new(error).context("installing the new executable"));
             }
             tracing::info!(version = %info.version, exe = %exe.display(), "update installed");
             Ok(InstallOutcome::ReadyToRelaunch { app_path: exe })
         }
 
+        /// The certificate subject of a valid Authenticode signature. The
+        /// subject rather than the thumbprint, so renewing the certificate
+        /// doesn't lock existing installs out of updates.
+        fn signer(exe: &Path) -> Option<String> {
+            let output = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "$s = Get-AuthenticodeSignature -LiteralPath $env:KESSEL_EXE; \
+                     if ($s.Status -eq 'Valid') { $s.SignerCertificate.Subject } else { exit 1 }",
+                ])
+                .env("KESSEL_EXE", exe)
+                .output()
+                .ok()?;
+            let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (output.status.success() && !subject.is_empty()).then_some(subject)
+        }
+
         /// Start the freshly installed executable. The caller quits the current
         /// process right after, which frees the backup for `sweep_leftovers`.
-        pub fn relaunch(app_path: &Path) {
-            if let Err(error) = Command::new(app_path).spawn() {
-                tracing::error!(%error, app = %app_path.display(), "relaunch failed");
-            }
+        pub fn relaunch(app_path: &Path) -> Result<()> {
+            Command::new(app_path)
+                .spawn()
+                .context("relaunching the updated app")?;
+            Ok(())
         }
 
         /// Delete executables a previous install renamed aside. Runs at
@@ -439,14 +555,44 @@ mod install {
             Ok(InstallOutcome::ManualInstall)
         }
 
-        pub fn relaunch(app_path: &Path) {
-            tracing::warn!(app = %app_path.display(), "relaunch is not implemented here");
+        pub fn relaunch(_app_path: &Path) -> Result<()> {
+            bail!("relaunch is not implemented on this platform")
         }
 
         pub fn sweep_leftovers() {}
     }
 
     pub use imp::{install, relaunch, sweep_leftovers};
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::imp::{parse_team_id, signed_by_team};
+        use std::process::Command;
+
+        #[test]
+        fn only_a_real_team_id_counts() {
+            assert_eq!(parse_team_id("Identifier=x\nTeamIdentifier=ABCDE12345\n"), Some("ABCDE12345"));
+            assert_eq!(parse_team_id("Signature=adhoc\nTeamIdentifier=not set\n"), None);
+            assert_eq!(parse_team_id("code object is not signed at all"), None);
+        }
+
+        #[test]
+        fn an_ad_hoc_signature_does_not_pass_for_a_team() {
+            let dir = std::env::temp_dir().join(format!("kessel-adhoc-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let binary = dir.join("adhoc");
+            std::fs::copy("/usr/bin/true", &binary).unwrap();
+            let signed = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(signed.status.success(), "{}", String::from_utf8_lossy(&signed.stderr));
+
+            assert!(!signed_by_team(&binary, "ABCDE12345"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 #[cfg(test)]

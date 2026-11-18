@@ -17,19 +17,25 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::Watcher as _;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, div, px, uniform_list, App, Bounds, ClickEvent, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, PathPromptOptions, Pixels,
-    Point, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, UniformListScrollHandle,
+    Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_component::dialog::DialogButtonProps;
+use gpui_component::notification::Notification;
+use gpui_component::spinner::Spinner;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::{
@@ -38,10 +44,16 @@ use gpui_component::{
 };
 
 use crate::app::AppState;
-use crate::provider::Provider;
-use crate::queue::{ConflictPolicy, NewJob};
+use crate::errors::{humanize, is_outage, Class, Humanized};
+use crate::i18n::{t, tf};
+use crate::provider::{Provider, SiteProfile};
+use crate::queue::{BatchFile, ConflictPolicy, NewBatch, NewJob};
 use crate::ui::file_icons::{self, FileIcons};
 use crate::ui::{human_size, human_time};
+
+mod tree_search;
+
+use tree_search::{Hit, Query, SearchEnd, SearchEvent, MAX_HITS};
 
 actions!(
     file_pane,
@@ -55,6 +67,7 @@ actions!(
         SelectAll,
         ClearSelection,
         Activate,
+        EnterFolder,
         GoUp,
         GoBack,
         GoForward,
@@ -66,13 +79,35 @@ actions!(
         QuickLook,
         Search,
         ToggleTree,
-        EditPath
+        EditPath,
+        CopyToOtherPane,
+        MoveToOtherPane,
+        Reconnect,
+        SearchTree,
+        RevealInFolder,
+        Download,
+        DownloadTo,
+        Upload
     ]
 );
 
 const KEY_CONTEXT: &str = "FilePane";
 /// Fixed row height; the rubber band's hit math depends on it.
 const ROW_HEIGHT: f32 = 26.0;
+/// Opening more items than this at once asks first.
+const OPEN_CONFIRM_THRESHOLD: usize = 20;
+/// Suffix of the queue's in-progress partial files, kept out of listings.
+use crate::queue::PARTIAL_SUFFIX;
+/// Listings at least this long sort and filter off the UI thread.
+const BACKGROUND_ROWS: usize = 5_000;
+/// Quiet time after a keystroke before filtering a long listing.
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(40);
+/// How long a new folder may take to list before its first rows show.
+const PREVIEW_DELAY: Duration = Duration::from_millis(400);
+/// Rows shown from a slow listing until the complete one arrives.
+const PREVIEW_ROWS: usize = 1_000;
+/// Width of the "Folder" column while showing recursive search results.
+const LOCATION_WIDTH: f32 = 220.0;
 
 #[derive(Clone)]
 pub struct FsEntry {
@@ -144,14 +179,14 @@ impl Column {
         }
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Column::Size => "Size",
-            Column::Modified => "Modified",
-            Column::Permissions => "Permissions",
-            Column::StorageClass => "Class",
-            Column::Region => "Region",
-        }
+    fn title(self) -> SharedString {
+        t(match self {
+            Column::Size => "file_pane.column.size",
+            Column::Modified => "file_pane.column.modified",
+            Column::Permissions => "file_pane.column.permissions",
+            Column::StorageClass => "file_pane.column.class",
+            Column::Region => "file_pane.column.region",
+        })
     }
 
     fn default_width(self) -> f32 {
@@ -231,6 +266,20 @@ impl Default for Sort {
 
 impl Sort {
     fn compare(&self, a: &FsEntry, b: &FsEntry) -> std::cmp::Ordering {
+        self.compare_keyed(a, &a.name.to_lowercase(), b, &b.name.to_lowercase())
+    }
+
+    /// Sort rows in place, lowercasing each name once instead of per compare.
+    fn sort_rows(&self, rows: &mut Vec<FsEntry>) {
+        let mut keyed: Vec<(String, FsEntry)> = rows
+            .drain(..)
+            .map(|entry| (entry.name.to_lowercase(), entry))
+            .collect();
+        keyed.sort_by(|a, b| self.compare_keyed(&a.1, &a.0, &b.1, &b.0));
+        rows.extend(keyed.into_iter().map(|(_, entry)| entry));
+    }
+
+    fn compare_keyed(&self, a: &FsEntry, a_name: &str, b: &FsEntry, b_name: &str) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let group = b
             .is_parent
@@ -247,8 +296,7 @@ impl Sort {
             Some(Column::StorageClass) => a.storage_class.cmp(&b.storage_class),
             Some(Column::Region) => a.region.cmp(&b.region),
         };
-        let name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-        let keyed = keyed.then(name);
+        let keyed = keyed.then_with(|| a_name.cmp(b_name));
         if self.ascending {
             keyed
         } else {
@@ -275,6 +323,8 @@ pub enum PaneEvent {
     LinkedNavigationFailed,
     /// The user interacted with this pane; it becomes the tab's active pane.
     Focused,
+    /// "Edit site" on a failed connection: open this site's settings.
+    EditSite(i64),
 }
 
 impl EventEmitter<PaneEvent> for FilePane {}
@@ -286,7 +336,7 @@ impl EventEmitter<PaneEvent> for FilePane {}
 #[derive(Clone)]
 pub struct DraggedEntries {
     pub site_id: i64,
-    pub entries: Vec<FsEntry>,
+    pub entries: Arc<[FsEntry]>,
 }
 
 /// The row drag currently in flight, if any. Set when a row drag starts and
@@ -307,12 +357,20 @@ impl gpui::Global for PendingDragOut {}
 /// the pill way off to the side. The stored offset pads the pill back under
 /// the pointer, just below-right so the cursor doesn't cover it.
 struct DragGhost {
-    label: SharedString,
+    /// What is dragged ("report.pdf", "3 items"); the operation is prefixed
+    /// live from the held modifiers.
+    what: SharedString,
     grab_offset: Point<Pixels>,
 }
 
 impl Render for DragGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = if is_move_drop(&window.modifiers()) {
+            "file_pane.drag.move"
+        } else {
+            "file_pane.drag.copy"
+        };
+        let label = tf(key, &[("what", &self.what)]);
         div()
             .pl(self.grab_offset.x + px(12.))
             .pt(self.grab_offset.y + px(12.))
@@ -325,9 +383,23 @@ impl Render for DragGhost {
                     .text_color(cx.theme().primary_foreground)
                     .text_xs()
                     .whitespace_nowrap()
-                    .child(self.label.clone()),
+                    .child(label),
             )
     }
+}
+
+/// Holding Shift (or Cmd on macOS, as in Finder) turns a drop into a move.
+fn is_move_drop(modifiers: &Modifiers) -> bool {
+    modifiers.shift || (cfg!(target_os = "macos") && modifiers.platform)
+}
+
+/// Where the pane's backend connection stands. Connecting runs on the app
+/// runtime because it reads the keychain and may call AWS STS; a failure
+/// keeps the requested site so the pane can retry or open its settings.
+enum Connection {
+    Connecting,
+    Failed(Humanized),
+    Ready(Provider),
 }
 
 /// An in-progress rubber-band selection, in content coordinates (y = 0 is
@@ -339,12 +411,30 @@ struct RubberBand {
     base: BTreeSet<usize>,
 }
 
+/// A recursive search whose hits are the pane's current rows.
+struct TreeSearch {
+    /// Folder the search started from; hits show their path relative to it.
+    root: String,
+    query: String,
+    running: bool,
+    scanned: u64,
+    capped: bool,
+    unreadable: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TreeSearch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct FilePane {
     label: SharedString,
-    provider: Provider,
+    connection: Connection,
     /// Profile the provider was built from — cloned into "open in new tab"
     /// requests and used for the URL-style path display.
-    profile: crate::provider::SiteProfile,
+    profile: SiteProfile,
     /// Current directory, OpenDAL-style: `""` or `some/dir/`.
     path: String,
     /// Per-pane navigation history (paths within the current site).
@@ -354,20 +444,45 @@ pub struct FilePane {
     /// True while the path bar shows the editable input instead of the
     /// clickable breadcrumb (toggled by `EditPath` / cmd-l).
     editing_path: bool,
+    /// Why the last path-bar entry was rejected (a URL for another site).
+    path_error: Option<SharedString>,
     /// Rendered listing — `all_entries` narrowed by the type-to-search
-    /// filter (or a plain copy when no search is active). All row/selection
-    /// indices refer to this view.
-    entries: Vec<FsEntry>,
+    /// filter (the same allocation when no filter is active). All
+    /// row/selection indices refer to this view.
+    entries: Arc<Vec<FsEntry>>,
     /// Full listing for the current directory, in sort order.
-    all_entries: Vec<FsEntry>,
+    all_entries: Arc<Vec<FsEntry>>,
+    /// Bumped per view change, so a late background sort or filter is dropped.
+    view_seq: usize,
+    /// The selection as drag payload, rebuilt when the selection changes so
+    /// a big selection isn't copied for every visible row on every frame.
+    drag_selection: Option<(BTreeSet<usize>, Arc<[FsEntry]>)>,
     /// Type-to-search: the filter bar input, shown while `search_active`.
     search_input: Entity<InputState>,
     search_active: bool,
     /// Mirrors `search_input`'s value so filtering doesn't need the input
     /// entity (updated from its change events).
     search_query: String,
+    /// The search bar looks through subfolders instead of filtering rows.
+    tree_scope: bool,
+    /// While set, `all_entries` holds this search's hits, not a listing.
+    tree_search: Option<TreeSearch>,
+    /// Row to select and scroll to once the next listing arrives.
+    reveal_name: Option<SharedString>,
     loading: bool,
-    error: Option<SharedString>,
+    /// A listing has been in flight for longer than a blink: shows the
+    /// path-bar spinner.
+    slow_loading: bool,
+    /// Directory the rows in `all_entries` belong to. While a listing for
+    /// another path loads, the old rows stay visible but dimmed and inert.
+    loaded_path: Option<String>,
+    /// Failed listing of the current directory.
+    error: Option<Humanized>,
+    /// The connection dropped while rows were on screen: they stay visible,
+    /// dimmed and inert, under a banner offering Reconnect.
+    connection_lost: Option<Humanized>,
+    /// The error state's "Details" disclosure is open.
+    details_open: bool,
     selection: BTreeSet<usize>,
     /// Keyboard focus row.
     cursor: Option<usize>,
@@ -426,26 +541,25 @@ impl Focusable for FilePane {
 
 impl FilePane {
     /// A pane browsing any site profile (local is just the reserved fs
-    /// profile). A backend that fails to build falls back to the local
-    /// filesystem with the error surfaced in the pane.
+    /// profile). Remote sites connect in the background; a failed connect
+    /// stays on the site and shows the error with Retry and Edit site.
     pub fn for_profile(
-        profile: crate::provider::SiteProfile,
+        profile: SiteProfile,
         start_path: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let defaults = cx.global::<AppState>().config.layers.clone();
-        let (profile, start_path, provider, error) =
-            match Provider::connect(&profile, &defaults) {
-                Ok(provider) => (profile, start_path, provider, None),
-                Err(error) => {
-                    tracing::error!(site = %profile.name, %error, "connecting site failed");
-                    let local = crate::app::local_profile();
-                    let provider = Provider::connect(&local, &defaults)
-                        .expect("local fs operator must build");
-                    (local, String::new(), provider, Some(format!("{error:#}").into()))
-                }
-            };
+        // A plain local site builds without any I/O, so it connects inline
+        // and never flashes a connecting state.
+        let connection = if profile.scheme == "fs" && profile.secret_handle.is_none() {
+            let defaults = &cx.global::<AppState>().config.layers;
+            match Provider::connect(&profile, defaults) {
+                Ok(provider) => Connection::Ready(provider),
+                Err(error) => Connection::Failed(humanize(&error)),
+            }
+        } else {
+            Connection::Connecting
+        };
 
         let path_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/dir"));
 
@@ -455,14 +569,23 @@ impl FilePane {
             |this, input, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     let raw = input.read(cx).value();
-                    this.editing_path = false;
-                    this.navigate_to(parse_path_input(&raw), window, cx);
+                    match parse_path_input(&raw, &this.profile) {
+                        PathInput::Here(path) => {
+                            this.editing_path = false;
+                            this.navigate_to(path, window, cx);
+                        }
+                        PathInput::Elsewhere(url) => {
+                            this.path_error =
+                                Some(tf("file_pane.path_elsewhere", &[("url", &url)]));
+                            cx.notify();
+                        }
+                    }
                 }
             },
         )
         .detach();
 
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(t("file_pane.search.placeholder")));
 
         cx.subscribe_in(
             &search_input,
@@ -470,11 +593,16 @@ impl FilePane {
             |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change { .. } => {
                     this.search_query = input.read(cx).value().to_string();
-                    this.rebuild_view();
-                    cx.notify();
+                    this.schedule_filter(cx);
                 }
                 InputEvent::PressEnter { .. } => {
-                    this.activate(&Activate, window, cx);
+                    let query = this.search_query.trim();
+                    let searched = this.tree_search.as_ref().is_some_and(|search| search.query == query);
+                    if this.tree_scope && !searched {
+                        this.run_tree_search(window, cx);
+                    } else {
+                        this.activate(window, cx);
+                    }
                 }
                 _ => {}
             },
@@ -497,20 +625,30 @@ impl FilePane {
 
         let mut this = Self {
             label: profile.name.clone().into(),
-            provider,
+            connection,
             profile,
             path: start_path,
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             path_input,
             editing_path: false,
-            entries: Vec::new(),
-            all_entries: Vec::new(),
+            path_error: None,
+            entries: Arc::default(),
+            all_entries: Arc::default(),
+            view_seq: 0,
+            drag_selection: None,
             search_input,
             search_active: false,
             search_query: String::new(),
+            tree_scope: false,
+            tree_search: None,
+            reveal_name: None,
             loading: false,
-            error,
+            slow_loading: false,
+            loaded_path: None,
+            error: None,
+            connection_lost: None,
+            details_open: false,
             selection: BTreeSet::new(),
             cursor: None,
             anchor: None,
@@ -537,11 +675,77 @@ impl FilePane {
             config_epoch_seen: config_epoch,
         };
         this.init_watcher(window, cx);
-        this.reload(window, cx);
-        if this.tree_visible {
-            this.tree_load(String::new(), cx);
+        match this.connection {
+            Connection::Ready(_) => this.on_connected(window, cx),
+            Connection::Connecting => this.connect(window, cx),
+            Connection::Failed(_) => {}
         }
         this
+    }
+
+    fn provider(&self) -> Option<&Provider> {
+        match &self.connection {
+            Connection::Ready(provider) => Some(provider),
+            Connection::Connecting | Connection::Failed(_) => None,
+        }
+    }
+
+    /// Build the site's provider on the app runtime (keychain reads and AWS
+    /// STS block), then load the listing.
+    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection = Connection::Connecting;
+        self.details_open = false;
+        let profile = self.profile.clone();
+        let state = cx.global::<AppState>();
+        let defaults = state.config.layers.clone();
+        let task = state
+            .runtime
+            .spawn_blocking(move || Provider::connect(&profile, &defaults));
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(join_error) => Err(anyhow::anyhow!("connect task failed: {join_error}")),
+            };
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(provider) => {
+                        this.connection = Connection::Ready(provider);
+                        this.on_connected(window, cx);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            site = %this.profile.name,
+                            error = %format!("{error:#}"),
+                            "connecting site failed"
+                        );
+                        let human = humanize(&error);
+                        if this.connection_lost.is_some() {
+                            this.connection_lost = Some(human.clone());
+                        }
+                        this.connection = Connection::Failed(human);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Rebuild the operator from the site's stored settings, which picks up
+    /// rotated keys and renews expired credentials, then list again.
+    fn reconnect(&mut self, _: &Reconnect, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.connection, Connection::Connecting) {
+            self.connect(window, cx);
+        }
+    }
+
+    fn on_connected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload(window, cx);
+        if self.tree_visible {
+            self.tree_load(String::new(), cx);
+        }
     }
 
     /// Config hot reload: re-seed the per-pane values that come from
@@ -596,7 +800,7 @@ impl FilePane {
             .unwrap_or_else(|| column.default_width()))
     }
 
-    /// Re-sort in place, keeping the selection (by name).
+    /// Re-sort in place; the selection follows its entries.
     fn set_sort(&mut self, column: Option<Column>, cx: &mut Context<Self>) {
         if self.sort.column == column {
             self.sort.ascending = !self.sort.ascending;
@@ -606,54 +810,148 @@ impl FilePane {
                 ascending: true,
             };
         }
-        let selected: Vec<SharedString> = self
-            .selected_entries()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        self.apply_sort();
-        self.selection = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| !entry.is_parent && selected.contains(&entry.name))
-            .map(|(ix, _)| ix)
-            .collect();
-        self.cursor = None;
-        self.anchor = None;
+        self.apply_sort(cx);
         cx.notify();
     }
 
-    fn apply_sort(&mut self) {
+    /// Re-sort the listing; long ones sort off the UI thread and swap in when
+    /// done, so clicking a column header never freezes the window.
+    fn apply_sort(&mut self, cx: &mut Context<Self>) {
         let sort = self.sort;
-        self.all_entries.sort_by(|a, b| sort.compare(a, b));
-        self.rebuild_view();
+        if self.all_entries.len() < BACKGROUND_ROWS {
+            let mut rows = (*self.all_entries).clone();
+            sort.sort_rows(&mut rows);
+            self.all_entries = Arc::new(rows);
+            self.rebuild_view(cx);
+            return;
+        }
+        self.view_seq += 1;
+        let seq = self.view_seq;
+        let rows = self.all_entries.clone();
+        cx.spawn(async move |this, cx| {
+            let sorted = cx
+                .background_spawn(async move {
+                    let mut rows = (*rows).clone();
+                    sort.sort_rows(&mut rows);
+                    rows
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.view_seq == seq {
+                    this.all_entries = Arc::new(sorted);
+                    this.rebuild_view(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Change rows in the listing and the rendered view alike.
+    fn update_rows(&mut self, update: impl Fn(&mut FsEntry)) {
+        let shared = Arc::ptr_eq(&self.entries, &self.all_entries);
+        if shared {
+            // Drop the view's reference so the rows are edited in place.
+            self.entries = Arc::default();
+        } else {
+            Arc::make_mut(&mut self.entries).iter_mut().for_each(&update);
+        }
+        Arc::make_mut(&mut self.all_entries).iter_mut().for_each(&update);
+        if shared {
+            self.entries = self.all_entries.clone();
+        }
     }
 
     // --- type-to-search ---
 
-    /// Rebuild the rendered `entries` view from `all_entries` and the fuzzy
-    /// query, resetting row-index state (selection, cursor, rubber band).
-    fn rebuild_view(&mut self) {
-        self.selection.clear();
-        self.cursor = None;
-        self.anchor = None;
-        self.rubber = None;
+    /// The fuzzy filter currently narrowing the rows, if any.
+    fn active_filter(&self) -> Option<String> {
         let query = self.search_query.trim();
-        if !self.search_active || query.is_empty() {
-            self.entries = self.all_entries.clone();
+        (self.search_active && !query.is_empty() && self.tree_search.is_none())
+            .then(|| query.to_string())
+    }
+
+    /// Rebuild the rendered `entries` view from `all_entries` and the fuzzy
+    /// query, right away.
+    fn rebuild_view(&mut self, cx: &mut Context<Self>) {
+        self.view_seq += 1;
+        let view = match self.active_filter() {
+            Some(query) => Arc::new(filter_rows(&self.all_entries, &query)),
+            None => self.all_entries.clone(),
+        };
+        self.install_view(view, cx);
+    }
+
+    /// Apply the search bar's text after a keystroke. Long listings filter
+    /// off the UI thread once typing pauses, so input stays responsive.
+    fn schedule_filter(&mut self, cx: &mut Context<Self>) {
+        if self.all_entries.len() < BACKGROUND_ROWS {
+            self.rebuild_view(cx);
+            cx.notify();
             return;
         }
-        self.entries = self
-            .all_entries
+        self.view_seq += 1;
+        let seq = self.view_seq;
+        let rows = self.all_entries.clone();
+        let query = self.active_filter();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FILTER_DEBOUNCE).await;
+            let current = this.read_with(cx, |this, _| this.view_seq == seq).unwrap_or(false);
+            if !current {
+                return;
+            }
+            let view = cx
+                .background_spawn(async move {
+                    match query {
+                        Some(query) => Arc::new(filter_rows(&rows, &query)),
+                        None => rows,
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.view_seq == seq {
+                    this.install_view(view, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show `view`. Row indices change, so selection and cursor are carried
+    /// over by path; entries the filter hides drop out of the selection.
+    fn install_view(&mut self, view: Arc<Vec<FsEntry>>, cx: &mut Context<Self>) {
+        let selected: HashSet<String> = self
+            .selection
             .iter()
-            .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
-            .cloned()
+            .filter_map(|&ix| self.entries.get(ix))
+            .filter(|entry| !entry.is_parent)
+            .map(|entry| entry.path.clone())
             .collect();
+        let cursor_path = self
+            .cursor
+            .and_then(|ix| self.entries.get(ix))
+            .map(|entry| entry.path.clone());
+        self.rubber = None;
+        let filtering = self.active_filter().is_some();
+        let previous = std::mem::replace(&mut self.entries, view);
+        // Freeing a long listing takes milliseconds; do it elsewhere.
+        if previous.len() >= BACKGROUND_ROWS {
+            cx.background_spawn(async move { drop(previous) }).detach();
+        }
+        self.selection = select_paths(&self.entries, &selected);
+        self.cursor = cursor_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path));
+        self.anchor = self.cursor;
         // Preselect the first match so Enter opens it right away.
-        if let Some(first) = self.entries.iter().position(|entry| !entry.is_parent) {
-            self.selection.insert(first);
-            self.cursor = Some(first);
+        if filtering && self.selection.is_empty() {
+            if let Some(first) = self.entries.iter().position(|entry| !entry.is_parent) {
+                self.selection.insert(first);
+                self.cursor = Some(first);
+                self.anchor = Some(first);
+            }
         }
     }
 
@@ -665,8 +963,8 @@ impl FilePane {
         self.search_input.update(cx, |input, cx| {
             input.set_value(seed, window, cx);
         });
-        window.focus(&focus);
-        self.rebuild_view();
+        window.focus(&focus, cx);
+        self.rebuild_view(cx);
         cx.notify();
     }
 
@@ -675,19 +973,165 @@ impl FilePane {
             return;
         }
         self.search_active = false;
+        self.tree_scope = false;
         self.search_query.clear();
         self.search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.rebuild_view();
-        window.focus(&self.focus_handle);
+        if self.tree_search.take().is_some() {
+            // The rows were search hits: bring the folder's listing back.
+            self.reload(window, cx);
+        } else {
+            self.rebuild_view(cx);
+        }
+        window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    // --- recursive search ---
+
+    /// Open the search bar in subfolder mode, or focus it when it is open.
+    fn search_tree_action(&mut self, _: &SearchTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_scope = true;
+        if self.search_active {
+            let focus = self.search_input.focus_handle(cx);
+            window.focus(&focus, cx);
+            cx.notify();
+        } else {
+            self.start_search("", window, cx);
+        }
+    }
+
+    /// Flip the search bar between filtering this folder and searching below it.
+    fn toggle_tree_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_scope = !self.tree_scope;
+        if self.tree_scope {
+            self.run_tree_search(window, cx);
+        } else if self.tree_search.take().is_some() {
+            self.reload(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Search below the current folder for the bar's text. The hits replace
+    /// the rows, so selection, drag, transfers and the context menu all work
+    /// on them as on any listing.
+    fn run_tree_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_string();
+        let Some(provider) = self.provider().cloned() else { return };
+        if query.is_empty() || self.connection_lost.is_some() {
+            return;
+        }
+        let (events, mut updates) = tokio::sync::mpsc::channel(4);
+        let root = self.path.clone();
+        let task = cx.global::<AppState>().runtime.spawn(tree_search::run(
+            provider,
+            root.clone(),
+            Query::new(&query, self.show_hidden),
+            events,
+        ));
+        // Replacing an earlier search aborts it.
+        self.tree_search = Some(TreeSearch {
+            root,
+            query,
+            running: true,
+            scanned: 0,
+            capped: false,
+            unreadable: 0,
+            task,
+        });
+        self.all_entries = Arc::default();
+        self.rebuild_view(cx);
+        cx.notify();
+
+        let task_id = self.tree_search.as_ref().map(|search| search.task.id());
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = updates.recv().await {
+                let applied = this.update_in(cx, |this, window, cx| {
+                    let current = this.tree_search.as_ref().map(|search| search.task.id());
+                    if current != task_id {
+                        return false;
+                    }
+                    this.apply_tree_event(event, window, cx);
+                    true
+                });
+                if !matches!(applied, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_tree_event(&mut self, event: SearchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search) = self.tree_search.as_mut() else { return };
+        match event {
+            SearchEvent::Batch { hits, scanned } => {
+                search.scanned = scanned;
+                if !hits.is_empty() {
+                    Arc::make_mut(&mut self.all_entries).extend(hits.into_iter().map(hit_entry));
+                    self.apply_sort(cx);
+                }
+            }
+            SearchEvent::Finished(SearchEnd { scanned, capped, unreadable, error }) => {
+                search.running = false;
+                search.scanned = scanned;
+                search.capped = capped;
+                search.unreadable = unreadable;
+                if let Some(error) = error {
+                    tracing::error!(error = %format!("{error:#}"), "recursive search failed");
+                    notify_error(&error, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stop walking and keep the hits found so far.
+    fn stop_tree_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = self.tree_search.as_mut() {
+            search.task.abort();
+            search.running = false;
+            cx.notify();
+        }
+    }
+
+    /// Leave the results and open the folder holding the selected hit, with
+    /// the hit selected.
+    fn reveal_in_folder(&mut self, _: &RevealInFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_search.is_none() {
+            return;
+        }
+        let Some(entry) = self.selected_entries().into_iter().next() else { return };
+        self.reveal_name = Some(entry.name);
+        self.navigate_to(parent_of(&entry.path), window, cx);
+    }
+
+    /// The search bar's status text while it shows recursive results.
+    fn tree_search_status(search: &TreeSearch, found: usize) -> SharedString {
+        let found_text = found.to_string();
+        let scanned = search.scanned.to_string();
+        let args = [("found", found_text.as_str()), ("scanned", scanned.as_str())];
+        let mut status = if search.running {
+            tf("file_pane.search.running", &args).to_string()
+        } else {
+            tf("file_pane.search.done", &args).to_string()
+        };
+        if search.capped {
+            status.push_str(" · ");
+            status.push_str(&tf("file_pane.search.capped", &[("max", &MAX_HITS.to_string())]));
+        }
+        if search.unreadable > 0 {
+            status.push_str(" · ");
+            status.push_str(&tf("file_pane.search.unreadable", &[("count", &search.unreadable.to_string())]));
+        }
+        status.into()
     }
 
     fn search_action(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_active {
             // Already open: just refocus the input.
             let focus = self.search_input.focus_handle(cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         } else {
             self.start_search("", window, cx);
         }
@@ -768,11 +1212,10 @@ impl FilePane {
 
     /// Load a directory's subdirectories into the tree cache.
     fn tree_load(&mut self, dir: String, cx: &mut Context<Self>) {
-        if self.tree_loading.contains(&dir) {
+        let Some(provider) = self.provider().cloned() else { return };
+        if !self.tree_loading.insert(dir.clone()) {
             return;
         }
-        self.tree_loading.insert(dir.clone());
-        let provider = self.provider.clone();
         let show_hidden = self.show_hidden;
         let list_dir = dir.clone();
         let task = cx
@@ -954,7 +1397,7 @@ impl FilePane {
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Loading…")
+                    .child(t("file_pane.loading"))
                     .into_any_element(),
             );
         }
@@ -1021,7 +1464,7 @@ impl FilePane {
     /// via `load_seq`.
     fn fetch_details(&mut self, cx: &mut Context<Self>) {
         let seq = self.load_seq;
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = self.path.clone();
         let scheme = self.profile.scheme.clone();
         let runtime = cx.global::<AppState>().runtime.handle().clone();
@@ -1076,9 +1519,12 @@ impl FilePane {
                     if this.load_seq != seq {
                         return;
                     }
-                    // `entries` holds clones of `all_entries`, so merge into
-                    // both the source listing and the rendered view.
-                    for entry in this.all_entries.iter_mut().chain(this.entries.iter_mut()) {
+                    let sorted_by = match &detail {
+                        Detail::Permissions(_) => Column::Permissions,
+                        Detail::StorageClasses(_) => Column::StorageClass,
+                        Detail::Regions(_) => Column::Region,
+                    };
+                    this.update_rows(|entry| {
                         let name = entry.name.as_ref();
                         match &detail {
                             Detail::Permissions(modes) => {
@@ -1097,6 +1543,9 @@ impl FilePane {
                                 }
                             }
                         }
+                    });
+                    if this.sort.column == Some(sorted_by) {
+                        this.apply_sort(cx);
                     }
                     cx.notify();
                 })
@@ -1117,7 +1566,7 @@ impl FilePane {
     /// Site backing this pane (0 = the reserved local-fs site), used to
     /// address transfer jobs.
     pub fn site_id(&self) -> i64 {
-        self.provider.site_id
+        self.profile.id
     }
 
     /// Current directory as a browse path (`""` = root, otherwise ends `/`).
@@ -1142,21 +1591,38 @@ impl FilePane {
             .iter()
             .filter(|entry| !entry.is_parent)
             .count();
-        let selected = self.selected_entries();
-        if selected.is_empty() {
-            return format!("{item_count} items");
+        // Runs on every render, so it reads the selection without copying it.
+        let selected = || {
+            self.selection
+                .iter()
+                .filter_map(|&ix| self.entries.get(ix))
+                .filter(|entry| !entry.is_parent)
+        };
+        let selected_count = selected().count();
+        if selected_count == 0 {
+            return items_label(item_count).to_string();
         }
         // Folder sizes aren't known from a listing; sum files only.
-        let bytes: u64 = selected
-            .iter()
+        let bytes: u64 = selected()
             .filter(|entry| !entry.is_dir)
             .map(|entry| entry.size)
             .sum();
-        let mut status = format!("{item_count} items · {} selected", selected.len());
+        let mut status = tf(
+            "file_pane.summary.selected",
+            &[("items", &items_label(item_count)), ("count", &selected_count.to_string())],
+        )
+        .to_string();
         if bytes > 0 {
             status.push_str(&format!(" · {}", human_size(bytes)));
         }
         status
+    }
+
+    /// The visible rows must not be acted on: a listing for another
+    /// directory is in flight, or the connection behind them is gone.
+    fn is_stale(&self) -> bool {
+        self.connection_lost.is_some()
+            || (self.loading && self.loaded_path.as_deref() != Some(self.path.as_str()))
     }
 
     // --- selection model ---
@@ -1183,8 +1649,11 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.emit(PaneEvent::Focused);
+        if self.is_stale() {
+            return;
+        }
         let Some(entry) = self.entries.get(ix).cloned() else {
             return;
         };
@@ -1194,6 +1663,8 @@ impl FilePane {
                 self.go_up(window, cx);
             } else if entry.is_dir {
                 self.navigate_to(entry.path, window, cx);
+            } else {
+                self.open_files(vec![entry], window, cx);
             }
             return;
         }
@@ -1222,8 +1693,8 @@ impl FilePane {
     /// Right-click on an unselected row moves the selection there before the
     /// context menu opens (Finder behavior).
     fn on_row_right_down(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
-        if self.selectable(ix) && !self.selection.contains(&ix) {
+        window.focus(&self.focus_handle, cx);
+        if !self.is_stale() && self.selectable(ix) && !self.selection.contains(&ix) {
             self.select_single(ix);
             cx.notify();
         }
@@ -1275,13 +1746,46 @@ impl FilePane {
         cx.notify();
     }
 
-    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+    /// Escape: leave the search bar while typing in it or with nothing
+    /// selected, otherwise clear the selection first.
+    fn clear_selection(&mut self, _: &ClearSelection, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self.search_input.focus_handle(cx).is_focused(window);
+        if self.search_active && (typing || self.selection.is_empty()) {
+            self.close_search(window, cx);
+            return;
+        }
         self.selection.clear();
         self.rubber = None;
         cx.notify();
     }
 
-    fn activate(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
+    /// Right arrow: enter a single selected folder; files and multi-selections
+    /// are left alone (opening a file is Enter's job).
+    fn enter_folder(&mut self, _: &EnterFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_stale() {
+            return;
+        }
+        if let [entry] = self.selected_entries().as_slice() {
+            if entry.is_dir {
+                self.navigate_to(entry.path.clone(), window, cx);
+            }
+        }
+    }
+
+    /// The Enter binding. It also fires for Enter pressed inside the path bar
+    /// or search bar, which act on their own text instead.
+    fn activate_action(&mut self, _: &Activate, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.text_input_focused(window, cx) {
+            self.activate(window, cx);
+        }
+    }
+
+    /// Enter / double-click: a single folder is entered;
+    /// files open in their default app, extra folders in new tabs.
+    fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_stale() {
+            return;
+        }
         let selected = self.selected_entries();
         if let [entry] = selected.as_slice() {
             if entry.is_dir {
@@ -1289,10 +1793,194 @@ impl FilePane {
                 return;
             }
         }
-        // Enter on files starts their transfer to the other pane.
-        let files: Vec<FsEntry> = selected.into_iter().filter(|entry| !entry.is_dir).collect();
-        if !files.is_empty() {
-            cx.emit(PaneEvent::CopyRequested(files));
+        if selected.len() > OPEN_CONFIRM_THRESHOLD {
+            self.confirm_open(selected, window, cx);
+        } else {
+            self.open_entries(selected, window, cx);
+        }
+    }
+
+    /// Ask before opening a big selection: each item becomes a window or tab.
+    fn confirm_open(&mut self, entries: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.entity().downgrade();
+        let title = tf("file_pane.open_many.title", &[("count", &entries.len().to_string())]);
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let pane = pane.clone();
+            let entries = entries.clone();
+            dialog
+                .title(title.clone())
+                .width(px(380.))
+                .child(t("file_pane.open_many.body"))
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text(t("file_pane.open_many.ok")))
+                .on_ok(move |_, window, cx| {
+                    let entries = entries.clone();
+                    pane.update(cx, |this, cx| this.open_entries(entries, window, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    /// Folders open in new tabs, files in their default app.
+    fn open_entries(&mut self, selected: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        let (dirs, files): (Vec<FsEntry>, Vec<FsEntry>) =
+            selected.into_iter().partition(|entry| entry.is_dir);
+        for dir in dirs {
+            cx.emit(PaneEvent::OpenInNewTab {
+                profile: self.profile.clone(),
+                path: dir.path,
+            });
+        }
+        self.open_files(files, window, cx);
+    }
+
+    /// Open files in their default app. Local files open in place; remote
+    /// ones go through the external-edit path, which downloads them and
+    /// uploads saves back.
+    fn open_files(&mut self, files: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile.scheme == "fs" {
+            let root = self.local_root();
+            for file in files {
+                let full = crate::localfs::full_path(&root, &file.path);
+                crate::ui::open_path_or_url(&full.to_string_lossy());
+            }
+        } else {
+            let (risky, safe): (Vec<FsEntry>, Vec<FsEntry>) = files
+                .into_iter()
+                .partition(|file| can_run_code(&file.name, file.permissions));
+            for file in safe {
+                self.start_external_edit(file, window, cx);
+            }
+            if !risky.is_empty() {
+                self.confirm_launch(risky, window, cx);
+            }
+        }
+    }
+
+    /// A remote file that the OS would execute never opens on a plain Enter
+    /// or double-click: the dialog names it, leads with downloading it, and
+    /// has no default button, so a stray Enter does nothing.
+    fn confirm_launch(&mut self, files: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.entity().downgrade();
+        let title = match files.as_slice() {
+            [file] => tf("file_pane.launch.title_one", &[("name", &file.name)]),
+            _ => tf("file_pane.launch.title_other", &[("count", &files.len().to_string())]),
+        };
+        // The title already names a single file.
+        let names = (files.len() > 1).then(|| name_list(&files));
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let download = {
+                let pane = pane.clone();
+                let files = files.clone();
+                Button::new("launch-download")
+                    .label(t("file_pane.launch.download"))
+                    .small()
+                    .primary()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let files = files.clone();
+                        pane.update(cx, |this, cx| this.download(files, window, cx)).ok();
+                    })
+            };
+            let open = {
+                let pane = pane.clone();
+                let files = files.clone();
+                Button::new("launch-open")
+                    .label(t("file_pane.launch.open_anyway"))
+                    .small()
+                    .danger()
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        for file in files.clone() {
+                            pane.update(cx, |this, cx| this.start_external_edit(file, window, cx)).ok();
+                        }
+                    })
+            };
+            dialog.title(title.clone()).w(px(440.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(t("file_pane.launch.body"))
+                    .children(names.clone().map(|names| {
+                        div().text_sm().text_color(cx.theme().muted_foreground).child(names)
+                    }))
+                    .child(
+                        h_flex().gap_2().child(download).child(open).child(
+                            Button::new("launch-cancel")
+                                .label(t("file_pane.launch.cancel"))
+                                .small()
+                                .ghost()
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                    ),
+            )
+        });
+    }
+
+    /// Filesystem root of a local (fs) site.
+    fn local_root(&self) -> String {
+        self.profile
+            .options
+            .get("root")
+            .cloned()
+            .unwrap_or_else(crate::localfs::root)
+    }
+
+    /// Whether the path bar or the filter box has keyboard focus; pane-wide
+    /// shortcuts must not fire while the user types there.
+    fn text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path_input.focus_handle(cx).is_focused(window)
+            || self.search_input.focus_handle(cx).is_focused(window)
+    }
+
+    fn copy_to_other_pane(&mut self, _: &CopyToOtherPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input_focused(window, cx) {
+            return;
+        }
+        let selected = self.selected_entries();
+        if !selected.is_empty() && !self.is_stale() {
+            cx.emit(PaneEvent::CopyRequested(selected));
+        }
+    }
+
+    fn move_to_other_pane(&mut self, _: &MoveToOtherPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input_focused(window, cx) {
+            return;
+        }
+        let selected = self.selected_entries();
+        if !selected.is_empty() && !self.is_stale() {
+            cx.emit(PaneEvent::MoveRequested(selected));
+        }
+    }
+
+    /// The selection a keyboard transfer acts on: remote rows only, and none
+    /// while the user types in the path bar or filter.
+    fn selected_for_download(&self, window: &Window, cx: &App) -> Vec<FsEntry> {
+        if self.text_input_focused(window, cx)
+            || self.is_stale()
+            || self.site_id() == crate::queue::LOCAL_SITE_ID
+        {
+            return Vec::new();
+        }
+        self.selected_entries()
+    }
+
+    fn download_action(&mut self, _: &Download, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_for_download(window, cx);
+        if !selected.is_empty() {
+            self.download(selected, window, cx);
+        }
+    }
+
+    fn download_to_action(&mut self, _: &DownloadTo, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_for_download(window, cx);
+        if !selected.is_empty() {
+            self.download_to(selected, window, cx);
+        }
+    }
+
+    fn upload_action(&mut self, _: &Upload, window: &mut Window, cx: &mut Context<Self>) {
+        if self.provider().is_some() && !self.text_input_focused(window, cx) {
+            self.upload(window, cx);
         }
     }
 
@@ -1326,8 +2014,14 @@ impl FilePane {
         }
     }
 
+    /// The user asked for fresh rows: on search results that means searching
+    /// again. Background refreshes (`refresh`) leave results alone.
     fn refresh_action(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh(window, cx);
+        if self.tree_search.is_some() {
+            self.run_tree_search(window, cx);
+        } else {
+            self.refresh(window, cx);
+        }
     }
 
     fn new_folder_action(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -1352,12 +2046,15 @@ impl FilePane {
         if entry.is_bucket {
             return false;
         }
+        let Some(caps) = self.provider().map(|provider| provider.caps) else {
+            return false;
+        };
         if entry.is_dir {
             // On virtual-dir backends a directory is only a prefix, so
             // renaming it isn't a single server-side op.
-            self.provider.caps.rename && !self.provider.caps.virtual_dirs
+            caps.rename && !caps.virtual_dirs
         } else {
-            self.provider.caps.rename || self.provider.caps.copy
+            caps.rename || caps.copy
         }
     }
 
@@ -1387,11 +2084,19 @@ impl FilePane {
 
         let files: Vec<FsEntry> = entries.into_iter().filter(|entry| !entry.is_dir).collect();
         if files.is_empty() {
-            window.push_notification("Quick Look works on remote files, not folders.", cx);
+            window.push_notification(t("file_pane.quick_look.files_only"), cx);
             return;
         }
-        let provider = self.provider.clone();
-        let tmp = quicklook_dir(self.provider.site_id, &self.path);
+        // Only macOS has a real previewer; elsewhere a preview is the OS
+        // default handler, which would execute these.
+        if !cfg!(target_os = "macos")
+            && files.iter().any(|file| can_run_code(&file.name, file.permissions))
+        {
+            window.push_notification(t("file_pane.launch.no_preview"), cx);
+            return;
+        }
+        let Some(provider) = self.provider().cloned() else { return };
+        let tmp = quicklook_dir(self.site_id(), &self.path);
         let task = cx.global::<AppState>().runtime.spawn(async move {
             tokio::fs::create_dir_all(&tmp).await?;
             let mut paths = Vec::new();
@@ -1402,7 +2107,7 @@ impl FilePane {
             }
             anyhow::Ok(paths)
         });
-        window.push_notification("Preparing Quick Look…", cx);
+        window.push_notification(t("file_pane.quick_look.preparing"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -1412,7 +2117,7 @@ impl FilePane {
                 Ok(paths) => preview_files(paths),
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "quick look failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1438,7 +2143,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.emit(PaneEvent::Focused);
         let Some(point) = self.content_point(event.position) else {
             return;
@@ -1534,8 +2239,9 @@ impl FilePane {
 
     // --- drag & drop ---
 
-    /// Entries an internal drag drops here: enqueue transfers into `dst_dir`.
-    /// Dropping something onto the directory it's already in is a no-op.
+    /// Entries an internal drag drops here: enqueue transfers into `dst_dir`,
+    /// moving when Shift (macOS: also Cmd) is held. Dropping something onto
+    /// the directory it's already in is a no-op.
     fn accept_entries(
         &mut self,
         drag: &DraggedEntries,
@@ -1543,29 +2249,27 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dst_site = self.provider.site_id;
-        let queue = cx.global::<AppState>().queue.clone();
-        let mut queued = 0;
-        for entry in &drag.entries {
-            if drag.site_id == dst_site
-                && (parent_of(&entry.path) == dst_dir || entry.path == dst_dir)
-            {
-                continue;
-            }
-            queue.enqueue(NewJob {
+        let dst_site = self.site_id();
+        let move_source = is_move_drop(&window.modifiers());
+        let conflict_policy = default_conflict_policy(cx);
+        let jobs = drag
+            .entries
+            .iter()
+            .filter(|entry| {
+                drag.site_id != dst_site
+                    || (parent_of(&entry.path) != dst_dir && entry.path != dst_dir)
+            })
+            .map(|entry| NewJob {
                 src_site_id: drag.site_id,
                 dst_site_id: dst_site,
                 src: entry.path.clone(),
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                conflict_policy: ConflictPolicy::Ask,
-                move_source: false,
-            });
-            queued += 1;
-        }
-        if queued > 0 {
-            window.push_notification(format!("Queued {queued} item(s)."), cx);
-        }
+                conflict_policy,
+                move_source,
+            })
+            .collect();
+        self.submit_jobs(jobs, window, cx);
     }
 
     /// Files dragged in from Finder/Explorer: they're paths on the reserved
@@ -1587,7 +2291,7 @@ impl FilePane {
             files: true,
             directories: true,
             multiple: true,
-            prompt: Some("Upload files or folders".into()),
+            prompt: Some(t("file_pane.upload.prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picker.await else {
@@ -1610,28 +2314,85 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dst_site = self.provider.site_id;
-        let queue = cx.global::<AppState>().queue.clone();
-        let mut queued = 0;
-        for path in paths {
-            let src = crate::localfs::browse_path(path, path.is_dir());
-            if dst_site == crate::queue::LOCAL_SITE_ID && parent_of(&src) == dst_dir {
-                continue;
-            }
-            queue.enqueue(NewJob {
-                src_site_id: crate::queue::LOCAL_SITE_ID,
+        let dst_site = self.site_id();
+        let conflict_policy = default_conflict_policy(cx);
+        let sites = &cx.global::<AppState>().sites;
+        let mut unreachable = 0;
+        let jobs = paths
+            .iter()
+            .filter_map(|path| {
+                let located = crate::localfs::locate(sites, path, path.is_dir());
+                unreachable += usize::from(located.is_none());
+                located
+            })
+            .filter(|(site, src)| dst_site != *site || parent_of(src) != dst_dir)
+            .map(|(src_site_id, src)| NewJob {
+                src_site_id,
                 dst_site_id: dst_site,
                 src,
                 dst_dir: dst_dir.clone(),
                 dst_name: None,
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source: false,
-            });
-            queued += 1;
+            })
+            .collect();
+        if unreachable > 0 {
+            window.push_notification(unreachable_volume_message(unreachable), cx);
         }
-        if queued > 0 {
-            window.push_notification(format!("Queued {queued} item(s)."), cx);
+        self.submit_jobs(jobs, window, cx);
+    }
+
+    /// Start transfers and report what the queue said once it has persisted
+    /// them: one note for what was accepted and one grouped note for what
+    /// was rejected. Plain file copies of one action share a batch job.
+    pub fn submit_jobs(&mut self, jobs: Vec<NewJob>, window: &mut Window, cx: &mut Context<Self>) {
+        if jobs.is_empty() {
+            return;
         }
+        let queue = cx.global::<AppState>().queue.clone();
+        let submissions = plan_submissions(jobs);
+        cx.spawn_in(window, async move |_, cx| {
+            let mut accepted = 0;
+            let mut rejected = 0;
+            let mut first_error: Option<anyhow::Error> = None;
+            for submission in submissions {
+                let entries = submission.entries();
+                let result = match submission {
+                    Submission::Job(job) => queue.submit(job).await,
+                    Submission::Batch(batch) => queue.submit_batch(batch).await,
+                };
+                match result {
+                    Ok(_) => accepted += entries,
+                    Err(error) => {
+                        rejected += entries;
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            cx.update(|window, cx| {
+                if accepted > 0 {
+                    window.push_notification(queued_notification(accepted), cx);
+                }
+                if let Some(error) = &first_error {
+                    let reason = humanize(error).title;
+                    let message = if rejected == 1 {
+                        reason
+                    } else {
+                        tf(
+                            "file_pane.start_failed.many",
+                            &[("count", &rejected.to_string()), ("reason", &reason)],
+                        )
+                        .to_string()
+                    };
+                    window.push_notification(
+                        Notification::error(message).title(t("transfers.start_failed")),
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // --- file operations (context menu) ---
@@ -1653,79 +2414,148 @@ impl FilePane {
             this.update_in(cx, |this, window, cx| {
                 if let Err(error) = result {
                     tracing::error!(error = %format!("{error:#}"), "file operation failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
-                this.reload(window, cx);
+                if this.tree_search.is_some() {
+                    this.run_tree_search(window, cx);
+                } else {
+                    this.reload(window, cx);
+                }
             })
             .ok();
         })
         .detach();
     }
 
+    /// Confirm, then delete. Local entries go to the OS trash; remote
+    /// deletes are permanent and the dialog says so.
     fn confirm_delete(
         &mut self,
         entries: Vec<FsEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if entries.is_empty() {
+        if entries.is_empty() || self.is_stale() {
             return;
         }
         let pane = cx.entity().downgrade();
-        let title: SharedString = if let [entry] = entries.as_slice() {
-            format!(
-                "Delete {} `{}`?",
-                if entry.is_dir { "folder" } else { "file" },
-                entry.name
-            )
-            .into()
+        let to_trash = self.profile.scheme == "fs";
+        let bin = t(if cfg!(windows) {
+            "file_pane.trash.bin_windows"
         } else {
-            format!("Delete {} items?", entries.len()).into()
+            "file_pane.trash.bin"
+        });
+        let count = entries.len().to_string();
+        let (title_one, title_other) = if to_trash {
+            ("file_pane.trash.title_one", "file_pane.trash.title_other")
+        } else {
+            ("file_pane.delete.title_one", "file_pane.delete.title_other")
         };
-        let any_dir = entries.iter().any(|entry| entry.is_dir);
-        window.open_dialog(cx, move |dialog, _, _| {
+        let title = match entries.as_slice() {
+            [entry] => tf(title_one, &[("name", &entry.name), ("bin", &bin)]),
+            _ => tf(title_other, &[("count", &count), ("bin", &bin)]),
+        };
+        let body = if to_trash {
+            tf("file_pane.trash.body", &[("bin", &bin)])
+        } else if entries.iter().any(|entry| entry.is_dir) {
+            t("file_pane.delete.body_folders")
+        } else {
+            t("file_pane.delete.body")
+        };
+        let ok_text = if to_trash {
+            tf("file_pane.trash.ok", &[("bin", &bin)])
+        } else {
+            t("file_pane.delete.ok")
+        };
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entries = entries.clone();
             dialog
                 .title(title.clone())
-                .w(px(380.))
-                .child(if any_dir {
-                    "Folders and everything in them will be deleted. This cannot be undone."
-                } else {
-                    "This cannot be undone."
-                })
+                .width(px(380.))
+                .child(body.clone())
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text.clone())
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .on_ok(move |_, window, cx| {
                     let entries = entries.clone();
-                    pane.update(cx, |this, cx| {
-                        let provider = this.provider.clone();
-                        this.spawn_op(
-                            async move {
-                                for entry in entries {
-                                    provider.delete(&entry.path, entry.is_dir).await?;
-                                }
-                                Ok(())
-                            },
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
+                    pane.update(cx, |this, cx| this.delete_entries(entries, to_trash, window, cx))
+                        .ok();
                     true
                 })
         });
     }
 
+    /// Delete in order and stop at the first failure, so one unreachable item
+    /// doesn't repeat its error for every other. The report names what failed
+    /// and what was not attempted.
+    fn delete_entries(
+        &mut self,
+        entries: Vec<FsEntry>,
+        to_trash: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider().cloned() else { return };
+        let single = entries.len() == 1;
+        let task = cx.global::<AppState>().runtime.spawn(async move {
+            let mut entries = entries.into_iter();
+            let mut deleted = 0;
+            while let Some(entry) = entries.next() {
+                let result = if to_trash {
+                    provider.trash(&entry.path).await
+                } else {
+                    provider.delete(&entry.path, entry.is_dir).await
+                };
+                if let Err(error) = result {
+                    return Err(DeleteStopped {
+                        deleted,
+                        failed: entry.name.to_string(),
+                        error,
+                        remaining: entries.collect(),
+                    });
+                }
+                deleted += 1;
+            }
+            Ok(())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(stopped)) if single => notify_error(&stopped.error, window, cx),
+                    Ok(Err(stopped)) => {
+                        tracing::error!(error = %format!("{:#}", stopped.error), "delete stopped early");
+                        let (title, body) = stopped.report();
+                        window.push_notification(Notification::error(body).title(title).autohide(false), cx);
+                    }
+                    Err(join_error) => notify_error(&anyhow::anyhow!("delete task failed: {join_error}"), window, cx),
+                }
+                if this.tree_search.is_some() {
+                    this.run_tree_search(window, cx);
+                } else {
+                    this.reload(window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn rename_dialog(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(entry.name.clone()));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entry = entry.clone();
             let input = input.clone();
             dialog
-                .title("Rename")
-                .w(px(380.))
+                .title(t("file_pane.rename.title"))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -1756,20 +2586,20 @@ impl FilePane {
         if to == entry.path {
             return;
         }
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let from = entry.path.clone();
         self.spawn_op(async move { provider.rename(&from, &to).await }, window, cx);
     }
 
     fn new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("folder name"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t("file_pane.new_folder.placeholder")));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let input = input.clone();
             dialog
-                .title("New folder")
-                .w(px(380.))
+                .title(t("file_pane.new_folder.title"))
+                .width(px(380.))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -1779,7 +2609,7 @@ impl FilePane {
                     }
                     pane.update(cx, |this, cx| {
                         let path = format!("{}{name}/", this.path);
-                        let provider = this.provider.clone();
+                        let Some(provider) = this.provider().cloned() else { return };
                         this.spawn_op(async move { provider.create_dir(&path).await }, window, cx);
                     })
                     .ok();
@@ -1793,32 +2623,38 @@ impl FilePane {
     fn enqueue_downloads(
         &mut self,
         entries: Vec<FsEntry>,
-        dst_dir: String,
+        dst_dir: &Path,
         dst_name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let queue = cx.global::<AppState>().queue.clone();
-        let count = entries.len();
-        for entry in entries {
-            queue.enqueue(NewJob {
-                src_site_id: self.provider.site_id,
-                dst_site_id: crate::queue::LOCAL_SITE_ID,
+        let Some((dst_site_id, dst_dir)) =
+            crate::localfs::locate(&cx.global::<AppState>().sites, dst_dir, true)
+        else {
+            window.push_notification(unreachable_volume_message(1), cx);
+            return;
+        };
+        let conflict_policy = default_conflict_policy(cx);
+        let jobs = entries
+            .into_iter()
+            .map(|entry| NewJob {
+                src_site_id: self.site_id(),
+                dst_site_id,
                 src: entry.path,
                 dst_dir: dst_dir.clone(),
                 dst_name: dst_name.clone(),
-                conflict_policy: ConflictPolicy::Ask,
+                conflict_policy,
                 move_source: false,
-            });
-        }
-        window.push_notification(format!("Queued {count} download(s)."), cx);
+            })
+            .collect();
+        self.submit_jobs(jobs, window, cx);
     }
 
     /// Download into the platform Downloads folder (falls back to the
     /// folder picker when the platform has none).
     fn download(&mut self, entries: Vec<FsEntry>, window: &mut Window, cx: &mut Context<Self>) {
         match dirs::download_dir() {
-            Some(dir) => self.enqueue_downloads(entries, local_dir_path(&dir), None, window, cx),
+            Some(dir) => self.enqueue_downloads(entries, &dir, None, window, cx),
             None => self.download_to(entries, window, cx),
         }
     }
@@ -1834,7 +2670,7 @@ impl FilePane {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Download".into()),
+            prompt: Some(t("file_pane.download.prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
@@ -1844,7 +2680,7 @@ impl FilePane {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.enqueue_downloads(entries, local_dir_path(&dir), None, window, cx);
+                this.enqueue_downloads(entries, &dir, None, window, cx);
             })
             .ok();
         })
@@ -1870,7 +2706,7 @@ impl FilePane {
             this.update_in(cx, |this, window, cx| {
                 this.enqueue_downloads(
                     vec![entry],
-                    local_dir_path(&dir),
+                    &dir,
                     Some(name),
                     window,
                     cx,
@@ -1887,7 +2723,7 @@ impl FilePane {
     fn duplicate_entry(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
         let new_name = duplicate_name(&entry.name, &self.all_entries);
         let to = format!("{}{new_name}", parent_of(&entry.path));
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let from = entry.path.clone();
         self.spawn_op(async move { provider.copy(&from, &to).await }, window, cx);
     }
@@ -1900,7 +2736,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let task = cx
             .global::<AppState>()
@@ -1914,11 +2750,11 @@ impl FilePane {
             this.update_in(cx, |_, window, cx| match result {
                 Ok(url) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
-                    window.push_notification("Presigned URL copied to clipboard.", cx);
+                    window.push_notification(t("file_pane.presign.copied"), cx);
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "presign failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1934,7 +2770,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let task = cx
             .global::<AppState>()
@@ -1949,7 +2785,7 @@ impl FilePane {
                 Ok(url) => crate::ui::open_path_or_url(&url),
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "presign failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1960,7 +2796,7 @@ impl FilePane {
     /// Recursively sum a folder and show the result right in the listing's
     /// Size column (the entry keeps it until the next reload).
     fn calc_folder_size(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let name = entry.name.clone();
         let seq = self.load_seq;
@@ -1968,7 +2804,7 @@ impl FilePane {
             .global::<AppState>()
             .runtime
             .spawn(async move { provider.dir_size(&path).await });
-        window.push_notification(format!("Calculating size of `{name}`…"), cx);
+        window.push_notification(tf("file_pane.folder_size.calculating", &[("name", &name)]), cx);
         let path = entry.path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
@@ -1980,17 +2816,16 @@ impl FilePane {
                     if this.load_seq != seq {
                         return;
                     }
-                    // `entries` holds clones of `all_entries`; write both.
-                    for entry in this.all_entries.iter_mut().chain(this.entries.iter_mut()) {
+                    this.update_rows(|entry| {
                         if entry.path == path {
                             entry.size = bytes;
                         }
-                    }
+                    });
                     cx.notify();
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), "folder size failed");
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 }
             })
             .ok();
@@ -1999,9 +2834,10 @@ impl FilePane {
     }
 
     /// Download to temp, open in the default app, and re-upload on save
-    /// (see `crate::edit`).
-    fn edit_external(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+    /// (see `crate::edit`). Callers go through [`Self::open_files`], which
+    /// asks first for files the OS would execute.
+    fn start_external_edit(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider().cloned() else { return };
         let queue = cx.global::<AppState>().queue.clone();
         let path = entry.path.clone();
         let name = entry.name.to_string();
@@ -2009,7 +2845,7 @@ impl FilePane {
             .global::<AppState>()
             .runtime
             .spawn(async move { crate::edit::start(provider, path, name, queue).await });
-        window.push_notification("Opening in external editor — saves upload back automatically.", cx);
+        window.push_notification(t("file_pane.edit.opening"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -2018,7 +2854,7 @@ impl FilePane {
             if let Err(error) = result {
                 tracing::error!(error = %format!("{error:#}"), "external edit failed");
                 this.update_in(cx, |_, window, cx| {
-                    window.push_notification(format!("{error:#}"), cx);
+                    notify_error(&error, window, cx);
                 })
                 .ok();
             }
@@ -2033,7 +2869,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         self.spawn_op(
             async move { provider.set_storage_class(&path, class).await },
@@ -2049,7 +2885,7 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         self.spawn_op(async move { provider.set_acl(&path, acl).await }, window, cx);
     }
@@ -2057,7 +2893,7 @@ impl FilePane {
     /// chmod dialog: stat the current mode first so the input starts from
     /// what's actually on the server.
     fn permissions_dialog(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let path = entry.path.clone();
         let known = entry.permissions;
         let task = cx
@@ -2087,14 +2923,14 @@ impl FilePane {
         let initial = format!("{:03o}", mode.unwrap_or(0o644));
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
         let pane = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             let pane = pane.clone();
             let entry = entry.clone();
             let input = input.clone();
             dialog
-                .title(format!("Permissions for `{}`", entry.name))
-                .w(px(380.))
-                .child("Octal mode, e.g. 644 or 755.")
+                .title(tf("file_pane.permissions.title", &[("name", &entry.name)]))
+                .width(px(380.))
+                .child(t("file_pane.permissions.hint"))
                 .child(Input::new(&input))
                 .confirm()
                 .on_ok(move |_, window, cx| {
@@ -2106,7 +2942,7 @@ impl FilePane {
                         return false;
                     }
                     pane.update(cx, |this, cx| {
-                        let provider = this.provider.clone();
+                        let Some(provider) = this.provider().cloned() else { return };
                         let path = entry.path.clone();
                         this.spawn_op(
                             async move { provider.chmod(&path, mode).await },
@@ -2129,7 +2965,7 @@ impl FilePane {
     pub fn navigate_linked(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.linked_seq += 1;
         let seq = self.linked_seq;
-        let provider = self.provider.clone();
+        let Some(provider) = self.provider().cloned() else { return };
         let target = path.clone();
         let task = cx.global::<AppState>().runtime.spawn(async move {
             if target.is_empty() {
@@ -2162,7 +2998,7 @@ impl FilePane {
                     }
                     _ => {
                         window.push_notification(
-                            format!("Linked browsing stopped: cannot open matching folder /{path}"),
+                            tf("file_pane.linked_stopped", &[("path", &path)]),
                             cx,
                         );
                         cx.emit(PaneEvent::LinkedNavigationFailed);
@@ -2175,10 +3011,12 @@ impl FilePane {
     }
 
     pub fn navigate_to(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.path_error = None;
         if path != self.path {
             self.back_stack.push(std::mem::replace(&mut self.path, path));
             self.forward_stack.clear();
         }
+        self.tree_search = None;
         self.close_search(window, cx);
         self.reload(window, cx);
         cx.emit(PaneEvent::Navigated);
@@ -2188,6 +3026,7 @@ impl FilePane {
         if let Some(path) = self.back_stack.pop() {
             self.forward_stack
                 .push(std::mem::replace(&mut self.path, path));
+            self.tree_search = None;
             self.close_search(window, cx);
             self.reload(window, cx);
             cx.emit(PaneEvent::Navigated);
@@ -2198,6 +3037,7 @@ impl FilePane {
         if let Some(path) = self.forward_stack.pop() {
             self.back_stack
                 .push(std::mem::replace(&mut self.path, path));
+            self.tree_search = None;
             self.close_search(window, cx);
             self.reload(window, cx);
             cx.emit(PaneEvent::Navigated);
@@ -2237,19 +3077,21 @@ impl FilePane {
 
     fn begin_edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_path = true;
+        self.path_error = None;
         let display = self.display_url();
         let focus = self.path_input.focus_handle(cx);
         self.path_input.update(cx, |input, cx| {
             input.set_value(display, window, cx);
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
     fn cancel_edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_path {
             self.editing_path = false;
-            window.focus(&self.focus_handle);
+            self.path_error = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -2330,7 +3172,16 @@ impl FilePane {
     }
 
     /// Reload the listing but keep the current selection (matched by name).
+    /// On a failed connection this retries connecting instead.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_search.is_some() {
+            return;
+        }
+        match self.connection {
+            Connection::Ready(_) => {}
+            Connection::Failed(_) => return self.connect(window, cx),
+            Connection::Connecting => return,
+        }
         self.pending_selection = Some(
             self.selected_entries()
                 .into_iter()
@@ -2350,19 +3201,24 @@ impl FilePane {
     }
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider().cloned() else { return };
         self.update_watch();
         self.linked_navigation = false;
         self.linked_seq += 1;
         self.load_seq += 1;
         let seq = self.load_seq;
-        let provider = self.provider.clone();
         let path = self.path.clone();
 
         let state = cx.global::<AppState>();
         let show_hidden = self.show_hidden;
-        let list_task = state
-            .runtime
-            .spawn(async move { list_dir(provider, path, show_hidden).await });
+        let sort = self.sort;
+        let preview_source = (self.loaded_path.as_deref() != Some(path.as_str()))
+            .then(|| (provider.clone(), path.clone()));
+        let list_task = state.runtime.spawn(async move {
+            let mut rows = list_dir(provider, path, show_hidden).await?;
+            sort.sort_rows(&mut rows);
+            anyhow::Ok(rows)
+        });
 
         // Only rewrite the path bar when it actually changed, and never while
         // the user is editing it: a background refresh (fs watch, details
@@ -2378,11 +3234,53 @@ impl FilePane {
             });
         }
         self.loading = true;
+        self.slow_loading = false;
+        self.error = None;
+        self.details_open = false;
         self.selection.clear();
         self.cursor = None;
         self.anchor = None;
         self.rubber = None;
         cx.notify();
+
+        // Fast listings never show the spinner.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.load_seq == seq && this.loading {
+                    this.slow_loading = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+
+        // A new folder that takes a while shows its first rows meanwhile.
+        if let Some((provider, path)) = preview_source {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PREVIEW_DELAY).await;
+                let waiting = this.read_with(cx, |this, _| this.load_seq == seq && this.loading);
+                if !matches!(waiting, Ok(true)) {
+                    return;
+                }
+                let runtime = this.read_with(cx, |_, cx| cx.global::<AppState>().runtime.handle().clone());
+                let Ok(runtime) = runtime else { return };
+                let Ok(Ok(rows)) = runtime.spawn(preview_rows(provider, path, show_hidden, sort)).await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    if this.load_seq == seq && this.loading {
+                        this.install_view(Arc::new(rows), cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
 
         cx.spawn_in(window, async move |this, cx| {
             let result = match list_task.await {
@@ -2394,6 +3292,7 @@ impl FilePane {
                     return;
                 }
                 this.loading = false;
+                this.slow_loading = false;
                 let pending = this.pending_selection.take();
                 match result {
                     Ok(mut entries) => {
@@ -2416,9 +3315,16 @@ impl FilePane {
                                 },
                             );
                         }
-                        this.all_entries = entries;
-                        this.apply_sort();
-                        this.error = None;
+                        this.connection_lost = None;
+                        this.all_entries = Arc::new(entries);
+                        this.loaded_path = Some(this.path.clone());
+                        // Sorted on the runtime already, unless the user
+                        // picked another column while it was listing.
+                        if this.sort == sort {
+                            this.rebuild_view(cx);
+                        } else {
+                            this.apply_sort(cx);
+                        }
                         cx.emit(PaneEvent::DirectoryLoaded { linked: this.linked_navigation });
                         this.fetch_details(cx);
                         // Selection-preserving refresh: re-select by name.
@@ -2433,12 +3339,23 @@ impl FilePane {
                                 .map(|(ix, _)| ix)
                                 .collect();
                         }
+                        if let Some(name) = this.reveal_name.take() {
+                            if let Some(ix) = this.entries.iter().position(|entry| entry.name == name) {
+                                this.jump_to(ix, cx);
+                            }
+                        }
                     }
                     Err(error) => {
-                        tracing::error!(path = %this.path, %error, "listing failed");
-                        this.all_entries = Vec::new();
-                        this.entries = Vec::new();
-                        this.error = Some(format!("{error:#}").into());
+                        tracing::error!(path = %this.path, error = %format!("{error:#}"), "listing failed");
+                        if is_connection_loss(&error) && this.loaded_path.is_some() {
+                            this.connection_lost = Some(humanize(&error));
+                        } else {
+                            this.all_entries = Arc::default();
+                            this.entries = Arc::default();
+                            this.loaded_path = None;
+                            this.connection_lost = None;
+                            this.error = Some(humanize(&error));
+                        }
                         cx.emit(PaneEvent::LinkedNavigationFailed);
                     }
                 }
@@ -2594,31 +3511,37 @@ impl FilePane {
         };
 
         // Dragging a selected row carries the whole selection.
-        let drag_entries = if is_selected && !entry.is_parent {
-            self.selected_entries()
-        } else if entry.is_parent {
-            Vec::new()
-        } else {
-            vec![entry.clone()]
+        let drag_entries: Arc<[FsEntry]> = match &self.drag_selection {
+            Some((_, selection)) if is_selected && !entry.is_parent => selection.clone(),
+            _ if entry.is_parent => Arc::new([]),
+            _ => Arc::new([entry.clone()]),
         };
-        let ghost_label: SharedString = if let [single] = drag_entries.as_slice() {
+        let ghost_what: SharedString = if let [single] = &*drag_entries {
             single.name.clone()
         } else {
-            format!("{} items", drag_entries.len()).into()
+            items_label(drag_entries.len())
         };
         let payload = DraggedEntries {
-            site_id: self.provider.site_id,
+            site_id: self.site_id(),
             entries: drag_entries,
         };
-        let is_drag_source = !payload.entries.is_empty();
+        // Rows of a directory that is being replaced are inert.
+        // They dim only once the load is slow, so fast navigation doesn't
+        // flash.
+        let stale = self.is_stale();
+        let dimmed = self.connection_lost.is_some() || (stale && self.slow_loading);
+        let is_drag_source = !payload.entries.is_empty() && !stale;
 
         // Dirs (and the `..` row) accept drops into themselves.
-        let drop_dir = entry
-            .is_dir
-            .then(|| entry.path.clone());
+        let drop_dir = (entry.is_dir && !stale).then(|| entry.path.clone());
 
         let weak = cx.entity().downgrade();
         let entry_clone = entry.clone();
+        let location = self.tree_search.as_ref().map(|search| {
+            let parent = parent_of(&entry.path);
+            let inner = parent.strip_prefix(search.root.as_str()).unwrap_or(&parent);
+            SharedString::from(format!("/{}", inner.trim_end_matches('/')))
+        });
 
         h_flex()
             .id(ix)
@@ -2627,9 +3550,10 @@ impl FilePane {
             .px_2()
             .gap_2()
             .text_sm()
-            .cursor_pointer()
+            .when(!stale, |el| el.cursor_pointer())
             .overflow_hidden()
-            .when(entry.is_hidden, |style| style.opacity(0.55))
+            .when(entry.is_hidden && !dimmed, |style| style.opacity(0.55))
+            .when(dimmed, |style| style.opacity(0.4))
             // A constant left border keeps content from shifting when the
             // selection accent appears.
             .border_l_2()
@@ -2655,8 +3579,8 @@ impl FilePane {
             .when(is_drag_source, |el| {
                 el.on_drag(payload, move |payload, grab_offset, _window, cx| {
                     cx.set_global(PendingDragOut(Some(payload.clone())));
-                    let label = ghost_label.clone();
-                    cx.new(|_| DragGhost { label, grab_offset })
+                    let what = ghost_what.clone();
+                    cx.new(|_| DragGhost { what, grab_offset })
                 })
             })
             .when_some(drop_dir, |el, dir| {
@@ -2688,6 +3612,16 @@ impl FilePane {
             })
             .child(icon)
             .child(div().flex_1().min_w_0().truncate().child(entry.name.clone()))
+            .when_some(location, |el, location| {
+                el.child(
+                    div()
+                        .w(px(LOCATION_WIDTH))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(location),
+                )
+            })
             .children(self.columns.iter().map(|column| {
                 div()
                     .w(self.column_width(*column))
@@ -2701,6 +3635,260 @@ impl FilePane {
                         column.text_for(entry)
                     })
             }))
+    }
+
+    /// "Review server key" when an sftp failure is an untrusted host key.
+    fn trust_action(&self, human: &Humanized) -> Option<Button> {
+        if human.class != crate::errors::Class::HostKeyUnknown || self.profile.scheme != "sftp" {
+            return None;
+        }
+        let (host, port) = self
+            .profile
+            .options
+            .get("endpoint")
+            .and_then(|endpoint| crate::sftp::host_port(endpoint))?;
+        Some(
+            Button::new("trust-host-key")
+                .label(t("connect.trust.review"))
+                .small()
+                .outline()
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::app::TrustHostKey { host: host.clone(), port }),
+                        cx,
+                    )
+                }),
+        )
+    }
+
+    /// The centered state over the file list: connecting, a failed connect
+    /// or listing, a slow first load, an empty folder, or a filter with no
+    /// matches. `None` while rows tell the story themselves.
+    fn render_list_state(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        // Kept rows tell the story, with the banner above them.
+        if self.connection_lost.is_some() {
+            return None;
+        }
+        let spinner = |cx: &mut Context<Self>| {
+            Spinner::new()
+                .color(cx.theme().muted_foreground)
+                .into_any_element()
+        };
+        let failure = |human: &Humanized| {
+            (human.title.clone().into(), human.hint.clone().map(SharedString::from), Some(human.details.clone()))
+        };
+        match &self.connection {
+            Connection::Connecting => {
+                let title = tf("file_pane.connecting", &[("site", &self.profile.name)]);
+                return Some(self.render_state(Some(spinner(cx)), title, None, None, Vec::new(), cx));
+            }
+            Connection::Failed(human) => {
+                let (title, hint, details) = failure(human);
+                let mut actions = vec![Button::new("connect-retry")
+                    .label(t("file_pane.retry"))
+                    .small()
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))];
+                actions.extend(self.trust_action(human));
+                if self.profile.id != crate::queue::LOCAL_SITE_ID {
+                    let site_id = self.profile.id;
+                    actions.push(
+                        Button::new("connect-edit-site")
+                            .label(t("file_pane.edit_site"))
+                            .small()
+                            .outline()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(PaneEvent::EditSite(site_id))
+                            })),
+                    );
+                }
+                let icon = Icon::new(IconName::CircleX)
+                    .text_color(cx.theme().danger)
+                    .into_any_element();
+                return Some(self.render_state(Some(icon), title, hint, details, actions, cx));
+            }
+            Connection::Ready(_) => {}
+        }
+        if let Some(human) = &self.error {
+            let (title, hint, details) = failure(human);
+            let actions = vec![
+                Button::new("list-retry")
+                    .label(t("file_pane.retry"))
+                    .small()
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                Button::new("list-reconnect")
+                    .label(t("file_pane.reconnect"))
+                    .small()
+                    .outline()
+                    .on_click(cx.listener(|this, _, window, cx| this.reconnect(&Reconnect, window, cx))),
+                Button::new("list-go-up")
+                    .label(t("file_pane.go_up"))
+                    .small()
+                    .outline()
+                    .disabled(self.path.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
+            ];
+            let mut actions = actions;
+            actions.extend(self.trust_action(human));
+            let icon = Icon::new(IconName::TriangleAlert)
+                .text_color(cx.theme().danger)
+                .into_any_element();
+            return Some(self.render_state(Some(icon), title, hint, details, actions, cx));
+        }
+        if self.loading {
+            if !(self.slow_loading && self.entries.is_empty()) {
+                return None;
+            }
+            let title = t("file_pane.loading");
+            return Some(self.render_state(Some(spinner(cx)), title, None, None, Vec::new(), cx));
+        }
+        if self.entries.iter().any(|entry| !entry.is_parent) {
+            return None;
+        }
+        let query = self.search_query.trim();
+        if self.search_active && !query.is_empty() {
+            let title = tf("file_pane.no_matches", &[("query", query)]);
+            let actions = vec![Button::new("clear-filter")
+                .label(t("file_pane.clear_filter"))
+                .small()
+                .outline()
+                .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx)))];
+            let icon = Icon::new(IconName::Search)
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element();
+            return Some(self.render_state(Some(icon), title, None, None, actions, cx));
+        }
+        let icon = Icon::new(IconName::FolderOpen)
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element();
+        let hint = Some(t("file_pane.empty_hint"));
+        Some(self.render_state(Some(icon), t("file_pane.empty"), hint, None, Vec::new(), cx))
+    }
+
+    /// Above the kept rows of a lost connection: what happened, which folder
+    /// the rows are from, and the way back.
+    fn render_connection_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let human = self.connection_lost.as_ref()?;
+        let busy = self.loading || matches!(self.connection, Connection::Connecting);
+        let folder = format!("/{}", self.loaded_path.as_deref().unwrap_or_default());
+        let mut actions = vec![Button::new("banner-reconnect")
+            .label(t(if busy { "file_pane.reconnecting" } else { "file_pane.reconnect" }))
+            .small()
+            .primary()
+            .loading(busy)
+            .disabled(busy)
+            .on_click(cx.listener(|this, _, window, cx| this.reconnect(&Reconnect, window, cx)))];
+        actions.extend(self.trust_action(human));
+        Some(
+            h_flex()
+                .id("connection-banner")
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().warning.opacity(0.12))
+                .text_sm()
+                .child(Icon::new(IconName::TriangleAlert).small().text_color(cx.theme().warning))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().font_weight(gpui::FontWeight::MEDIUM).child(human.title.clone()))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(tf("file_pane.stale_rows", &[("folder", &folder)])),
+                        ),
+                )
+                .children(actions)
+                .into_any_element(),
+        )
+    }
+
+    /// One centered list state: icon, title, hint, an optional "Details"
+    /// disclosure for the raw error chain, and actions.
+    fn render_state(
+        &self,
+        icon: Option<gpui::AnyElement>,
+        title: SharedString,
+        hint: Option<SharedString>,
+        details: Option<String>,
+        actions: Vec<Button>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let details_open = self.details_open;
+        v_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .text_sm()
+            .text_center()
+            .children(icon)
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(cx.theme().foreground)
+                    .child(title),
+            )
+            .children(hint.map(|hint| {
+                div()
+                    .max_w(px(420.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint)
+            }))
+            .when(!actions.is_empty(), |el| {
+                el.child(h_flex().pt_1().gap_2().children(actions))
+            })
+            .children(details.map(|details| {
+                v_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("toggle-details")
+                            .label(if details_open {
+                                t("file_pane.hide_details")
+                            } else {
+                                t("file_pane.show_details")
+                            })
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.details_open = !this.details_open;
+                                cx.notify();
+                            })),
+                    )
+                    .when(details_open, |el| {
+                        el.child(
+                            div()
+                                .id("error-details")
+                                .max_w(px(420.))
+                                .max_h(px(140.))
+                                .overflow_y_scroll()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .text_left()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(details),
+                        )
+                    })
+            }))
+            .into_any_element()
     }
 
     /// The translucent rubber-band rectangle, converted back from content to
@@ -2747,10 +3935,10 @@ const S3_ACLS: [&str; 4] = [
 
 /// Presigned-URL lifetimes offered in the context menu.
 const PRESIGN_EXPIRIES: [(&str, u64); 4] = [
-    ("15 minutes", 900),
-    ("1 hour", 3600),
-    ("1 day", 86400),
-    ("1 week", 604800),
+    ("file_pane.presign.15_minutes", 900),
+    ("file_pane.presign.1_hour", 3600),
+    ("file_pane.presign.1_day", 86400),
+    ("file_pane.presign.1_week", 604800),
 ];
 
 /// Right-click menu, acting on the pane's current selection.
@@ -2766,9 +3954,15 @@ fn build_context_menu(
     }
     let (selected, caps, scheme, is_local) = {
         let pane = pane.read(cx);
+        let Some(caps) = pane.provider().map(|provider| provider.caps) else {
+            return menu;
+        };
+        if pane.is_stale() {
+            return menu;
+        }
         (
             pane.selected_entries(),
-            pane.provider.caps,
+            caps,
             pane.profile.scheme.clone(),
             pane.site_id() == crate::queue::LOCAL_SITE_ID,
         )
@@ -2780,11 +3974,12 @@ fn build_context_menu(
     };
     let count = selected.len();
     let single = (count == 1).then(|| selected[0].clone());
+    let count_text = count.to_string();
     let plural = |verb: &str| {
         if count == 1 {
-            format!("{verb} “{}”", selected[0].name)
+            tf(&format!("file_pane.menu.{verb}_one"), &[("name", &selected[0].name)])
         } else {
-            format!("{verb} {count} Items")
+            tf(&format!("file_pane.menu.{verb}_other"), &[("count", &count_text)])
         }
     };
     let weak = pane.downgrade();
@@ -2794,9 +3989,24 @@ fn build_context_menu(
     // The pane-to-pane transfer is a download or an upload depending on
     // which side of the split it starts from.
     let mut menu = menu;
+    if pane.read(cx).tree_search.is_some() {
+        menu = menu
+            .item(
+                PopupMenuItem::new(t("file_pane.search.reveal"))
+                    .action(Box::new(RevealInFolder))
+                    .on_click({
+                        let pane = weak.clone();
+                        move |_, window, cx| {
+                            pane.update(cx, |this, cx| this.reveal_in_folder(&RevealInFolder, window, cx))
+                                .ok();
+                        }
+                    }),
+            )
+            .separator();
+    }
     if !is_local {
         menu = menu
-            .item(PopupMenuItem::new(plural("Download")).on_click({
+            .item(PopupMenuItem::new(plural("download")).on_click({
                 let pane = weak.clone();
                 let selected = selected.clone();
                 move |_, window, cx| {
@@ -2807,7 +4017,7 @@ fn build_context_menu(
                 }
             }));
         if let Some(entry) = single.clone() {
-            menu = menu.item(PopupMenuItem::new("Download As…").on_click({
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.download_as")).on_click({
                 let pane = weak.clone();
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
@@ -2817,7 +4027,7 @@ fn build_context_menu(
                 }
             }));
         }
-        menu = menu.item(PopupMenuItem::new("Download To…").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.download_to")).on_click({
             let pane = weak.clone();
             let selected = selected.clone();
             move |_, window, cx| {
@@ -2827,32 +4037,41 @@ fn build_context_menu(
                 .ok();
             }
         }));
-    } else {
-        menu = menu.item(PopupMenuItem::new(plural("Upload")).on_click({
-            let pane = weak.clone();
-            let selected = selected.clone();
-            move |_, _, cx| {
-                pane.update(cx, |_, cx| {
-                    cx.emit(PaneEvent::CopyRequested(selected.clone()))
-                })
-                .ok();
-            }
-        }));
     }
-    // Transfer to the other pane with move semantics (sources are deleted
-    // after each file arrives safely).
-    menu = menu.item(PopupMenuItem::new("Move to Other Pane…").on_click({
-        let pane = weak.clone();
-        let selected = selected.clone();
-        move |_, _, cx| {
-            pane.update(cx, |_, cx| {
-                cx.emit(PaneEvent::MoveRequested(selected.clone()))
-            })
-            .ok();
-        }
-    }));
+    // Pane-to-pane transfers; a move deletes each source once it arrived
+    // safely. The actions only label the shortcuts, the click handlers act
+    // on the selection captured here.
+    menu = menu
+        .item(
+            PopupMenuItem::new(t("file_pane.menu.copy_to_other"))
+                .action(Box::new(CopyToOtherPane))
+                .on_click({
+                    let pane = weak.clone();
+                    let selected = selected.clone();
+                    move |_, _, cx| {
+                        pane.update(cx, |_, cx| {
+                            cx.emit(PaneEvent::CopyRequested(selected.clone()))
+                        })
+                        .ok();
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(t("file_pane.menu.move_to_other"))
+                .action(Box::new(MoveToOtherPane))
+                .on_click({
+                    let pane = weak.clone();
+                    let selected = selected.clone();
+                    move |_, _, cx| {
+                        pane.update(cx, |_, cx| {
+                            cx.emit(PaneEvent::MoveRequested(selected.clone()))
+                        })
+                        .ok();
+                    }
+                }),
+        );
     if row_entry.is_dir {
-        menu = menu.item(PopupMenuItem::new("Open in new tab").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.open_new_tab")).on_click({
             let pane = weak.clone();
             let path = row_entry.path.clone();
             move |_, _, cx| {
@@ -2879,7 +4098,7 @@ fn build_context_menu(
     menu = menu
         .separator()
         .item(
-            PopupMenuItem::new("Rename…")
+            PopupMenuItem::new(t("file_pane.menu.rename"))
                 .disabled(!can_rename)
                 .on_click({
                     let pane = weak.clone();
@@ -2893,7 +4112,7 @@ fn build_context_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("Duplicate")
+            PopupMenuItem::new(t("file_pane.menu.duplicate"))
                 .disabled(!can_duplicate)
                 .on_click({
                     let pane = weak.clone();
@@ -2911,11 +4130,11 @@ fn build_context_menu(
             .clone()
             .filter(|entry| !entry.is_dir && !entry.is_bucket)
         {
-            menu = menu.item(PopupMenuItem::new("Edit in External Editor").on_click({
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.edit_external")).on_click({
                 let pane = weak.clone();
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
-                        this.edit_external(entry.clone(), window, cx)
+                        this.open_files(vec![entry.clone()], window, cx)
                     })
                     .ok();
                 }
@@ -2923,7 +4142,7 @@ fn build_context_menu(
         }
     }
     if let Some(entry) = single.clone().filter(|entry| entry.is_dir && !entry.is_bucket) {
-        menu = menu.item(PopupMenuItem::new("Calculate Folder Size").on_click({
+        menu = menu.item(PopupMenuItem::new(t("file_pane.menu.folder_size")).on_click({
             let pane = weak.clone();
             move |_, window, cx| {
                 pane.update(cx, |this, cx| {
@@ -2945,7 +4164,7 @@ fn build_context_menu(
         {
             let pane = weak.clone();
             let entry = entry.clone();
-            menu = menu.item(PopupMenuItem::new("Open Presigned URL").on_click(
+            menu = menu.item(PopupMenuItem::new(t("file_pane.menu.open_presigned")).on_click(
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.open_presigned(
@@ -2960,11 +4179,11 @@ fn build_context_menu(
             ));
         }
         let pane = weak.clone();
-        menu = menu.submenu("Copy Presigned URL", window, cx, move |menu, _, _| {
+        menu = menu.submenu(t("file_pane.menu.copy_presigned"), window, cx, move |menu, _, _| {
             PRESIGN_EXPIRIES.into_iter().fold(menu, |menu, (label, secs)| {
                 let pane = pane.clone();
                 let entry = entry.clone();
-                menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(t(label)).on_click(move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.copy_presigned(
                             entry.clone(),
@@ -2990,7 +4209,7 @@ fn build_context_menu(
             let current = entry.storage_class.clone();
             let pane = weak.clone();
             let class_entry = entry.clone();
-            menu = menu.submenu("Storage Class", window, cx, move |menu, _, _| {
+            menu = menu.submenu(t("file_pane.menu.storage_class"), window, cx, move |menu, _, _| {
                 S3_STORAGE_CLASSES.into_iter().fold(menu, |menu, class| {
                     let pane = pane.clone();
                     let entry = class_entry.clone();
@@ -3007,7 +4226,7 @@ fn build_context_menu(
                 })
             });
             let pane = weak.clone();
-            menu = menu.submenu("ACL", window, cx, move |menu, _, _| {
+            menu = menu.submenu(t("file_pane.menu.acl"), window, cx, move |menu, _, _| {
                 S3_ACLS.into_iter().fold(menu, |menu, acl| {
                     let pane = pane.clone();
                     let entry = entry.clone();
@@ -3023,7 +4242,7 @@ fn build_context_menu(
     if supports_permissions(&scheme) {
         if let Some(entry) = single.clone() {
             let pane = weak.clone();
-            menu = menu.separator().item(PopupMenuItem::new("Permissions…").on_click(
+            menu = menu.separator().item(PopupMenuItem::new(t("file_pane.menu.permissions")).on_click(
                 move |_, window, cx| {
                     pane.update(cx, |this, cx| {
                         this.permissions_dialog(entry.clone(), window, cx)
@@ -3035,7 +4254,7 @@ fn build_context_menu(
     }
 
     menu.separator()
-        .item(PopupMenuItem::new(format!("{}…", plural("Delete"))).on_click({
+        .item(PopupMenuItem::new(plural("delete")).on_click({
             let pane = weak;
             move |_, window, cx| {
                 pane.update(cx, |this, cx| {
@@ -3056,6 +4275,11 @@ impl Render for FilePane {
         }
 
         let entry_rows = self.entries.len();
+        if self.selection.is_empty() {
+            self.drag_selection = None;
+        } else if self.drag_selection.as_ref().is_none_or(|(known, _)| *known != self.selection) {
+            self.drag_selection = Some((self.selection.clone(), self.selected_entries().into()));
+        }
 
         let weak = cx.entity().downgrade();
         let bounds_probe = canvas(
@@ -3070,6 +4294,8 @@ impl Render for FilePane {
         let pane_dir = self.path.clone();
         let pane_dir_ext = pane_dir.clone();
         let tree_panel = self.render_tree_panel(cx);
+        let list_state = self.render_list_state(cx);
+        let connected = self.provider().is_some();
 
         v_flex()
             .size_full()
@@ -3087,7 +4313,8 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
-            .on_action(cx.listener(Self::activate))
+            .on_action(cx.listener(Self::activate_action))
+            .on_action(cx.listener(Self::enter_folder))
             .on_action(cx.listener(Self::go_up_action))
             .on_action(cx.listener(Self::go_back_action))
             .on_action(cx.listener(Self::go_forward_action))
@@ -3100,6 +4327,14 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::search_action))
             .on_action(cx.listener(Self::toggle_tree))
             .on_action(cx.listener(Self::edit_path))
+            .on_action(cx.listener(Self::copy_to_other_pane))
+            .on_action(cx.listener(Self::move_to_other_pane))
+            .on_action(cx.listener(Self::reconnect))
+            .on_action(cx.listener(Self::search_tree_action))
+            .on_action(cx.listener(Self::reveal_in_folder))
+            .on_action(cx.listener(Self::download_action))
+            .on_action(cx.listener(Self::download_to_action))
+            .on_action(cx.listener(Self::upload_action))
             // Typing a printable character starts type-to-search.
             .on_key_down(cx.listener(Self::on_pane_key_down))
             // Column resize: the header handle sets `resizing`; the pane
@@ -3174,11 +4409,11 @@ impl Render for FilePane {
                             .small()
                             .ghost()
                             .selected(self.tree_visible)
-                            .tooltip(if self.tree_visible {
-                                "Hide folder tree"
+                            .tooltip(t(if self.tree_visible {
+                                "file_pane.tooltip.hide_tree"
                             } else {
-                                "Show folder tree"
-                            })
+                                "file_pane.tooltip.show_tree"
+                            }))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_tree(&ToggleTree, window, cx);
                             }))
@@ -3189,7 +4424,7 @@ impl Render for FilePane {
                             .ghost()
                             .small()
                             .disabled(self.back_stack.is_empty())
-                            .tooltip("Back")
+                            .tooltip(t("file_pane.tooltip.back"))
                             .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
                     )
                     .child(
@@ -3198,7 +4433,7 @@ impl Render for FilePane {
                             .ghost()
                             .small()
                             .disabled(self.forward_stack.is_empty())
-                            .tooltip("Forward")
+                            .tooltip(t("file_pane.tooltip.forward"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.go_forward(window, cx)),
                             ),
@@ -3211,13 +4446,21 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, window, cx| this.go_up(window, cx))),
                     )
                     .child(div().flex_1().min_w_0().child(self.render_path_bar(cx)))
+                    .when(self.slow_loading, |el| {
+                        el.child(
+                            Spinner::new()
+                                .small()
+                                .color(cx.theme().muted_foreground),
+                        )
+                    })
                     .child(
                         Button::new("upload")
                             .icon(Icon::new(IconName::ArrowUp))
-                            .label("Upload…")
+                            .label(t("file_pane.upload.label"))
                             .ghost()
                             .small()
-                            .tooltip("Upload files or full folders into this directory")
+                            .disabled(!connected)
+                            .tooltip(t("file_pane.upload.tooltip"))
                             .on_click(cx.listener(|this, _, window, cx| this.upload(window, cx))),
                     )
                     .child(
@@ -3225,7 +4468,8 @@ impl Render for FilePane {
                             .icon(Icon::default().path("icons/folder-plus.svg"))
                             .ghost()
                             .small()
-                            .tooltip("New folder")
+                            .disabled(!connected)
+                            .tooltip(t("file_pane.new_folder.title"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.new_folder_dialog(window, cx)
@@ -3237,9 +4481,21 @@ impl Render for FilePane {
                             .icon(Icon::default().path("icons/rotate-cw.svg"))
                             .ghost()
                             .small()
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh_action(&Refresh, window, cx)
+                            })),
                     ),
             )
+            .children(self.path_error.clone().map(|message| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(message)
+            }))
             // Folder tree + header/list/status column. Side-by-side (narrow)
             // panes stack the tree above the list (v_flex); otherwise it sits
             // to the left (h_flex).
@@ -3256,6 +4512,7 @@ impl Render for FilePane {
                     .when(tree_on_top, |el| el.w_full().min_h_0())
                     .when(!tree_on_top, |el| el.h_full().min_w_0())
                     .overflow_hidden()
+            .children(self.render_connection_banner(cx))
             .child(
                 h_flex()
                     .id("list-header")
@@ -3294,7 +4551,7 @@ impl Render for FilePane {
                                 });
                             let weak = weak.clone();
                             menu.separator().item(
-                                PopupMenuItem::new("Show hidden files")
+                                PopupMenuItem::new(t("file_pane.menu.show_hidden"))
                                     .checked(show_hidden)
                                     .on_click(move |_, window, cx| {
                                         weak.update(cx, |this, cx| {
@@ -3314,8 +4571,16 @@ impl Render for FilePane {
                             .truncate()
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| this.set_sort(None, cx)))
-                            .child(format!("Name{}", self.sort_marker(None))),
+                            .child(format!("{}{}", t("file_pane.column.name"), self.sort_marker(None))),
                     )
+                    .when(self.tree_search.is_some(), |el| {
+                        el.child(
+                            div()
+                                .w(px(LOCATION_WIDTH))
+                                .flex_shrink_0()
+                                .child(t("file_pane.search.folder")),
+                        )
+                    })
                     .children(self.columns.iter().enumerate().map(|(ix, column)| {
                         let column = *column;
                         div()
@@ -3412,22 +4677,12 @@ impl Render for FilePane {
                                 range.map(|ix| this.render_row(ix, cx)).collect()
                             }),
                         )
-                        .track_scroll(self.scroll_handle.clone())
+                        .track_scroll(&self.scroll_handle)
                         .size_full(),
                     )
                     .child(bounds_probe)
                     .children(self.render_rubber_band(cx))
-                    .when(self.loading && self.entries.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_2()
-                                .left_2()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Loading…"),
-                        )
-                    }),
+                    .children(list_state),
             )
             .when(self.search_active, |el| {
                 let matches = self
@@ -3462,16 +4717,36 @@ impl Render for FilePane {
                         )
                         .child(div().flex_1().child(Input::new(&self.search_input).small()))
                         .child(
+                            Button::new("search-subfolders")
+                                .label(t("file_pane.search.subfolders"))
+                                .ghost()
+                                .xsmall()
+                                .selected(self.tree_scope)
+                                .tooltip(t("file_pane.search.subfolders_hint"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_tree_scope(window, cx)
+                                })),
+                        )
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .whitespace_nowrap()
-                                .child(if matches == 1 {
-                                    "1 match".to_string()
-                                } else {
-                                    format!("{matches} matches")
+                                .child(match &self.tree_search {
+                                    Some(search) => Self::tree_search_status(search, matches),
+                                    None if matches == 1 => t("file_pane.search.one_match"),
+                                    None => tf("file_pane.search.matches", &[("count", &matches.to_string())]),
                                 }),
                         )
+                        .when(self.tree_search.as_ref().is_some_and(|search| search.running), |el| {
+                            el.child(
+                                Button::new("stop-search")
+                                    .label(t("file_pane.search.stop"))
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| this.stop_tree_search(cx))),
+                            )
+                        })
                         .child(
                             Button::new("close-search")
                                 .icon(Icon::new(IconName::Close))
@@ -3483,19 +4758,83 @@ impl Render for FilePane {
                         ),
                 )
             })
-            .children(self.error.clone().map(|error| {
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .text_color(gpui::rgb(0xdc2626))
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(error)
-            }))
             )
             })
     }
+}
+
+/// A search hit as a row. Metadata the walk didn't fetch stays empty.
+fn hit_entry(hit: Hit) -> FsEntry {
+    FsEntry {
+        is_hidden: hit.name.starts_with('.'),
+        name: hit.name.into(),
+        path: hit.path,
+        is_dir: hit.is_dir,
+        is_symlink: false,
+        is_bucket: false,
+        is_parent: false,
+        size: hit.size,
+        modified: hit.modified,
+        permissions: None,
+        storage_class: None,
+        region: None,
+    }
+}
+
+/// Whether a failed listing means the connection is gone rather than this
+/// folder being unreadable. Expired credentials count: reconnecting renews them.
+fn is_connection_loss(error: &anyhow::Error) -> bool {
+    const EXPIRED: [&str; 4] = ["expiredtoken", "expired token", "token has expired", "requestexpired"];
+    let text = format!("{error:#}").to_lowercase();
+    is_outage(error)
+        || crate::errors::classify(error) == Class::AuthFailed
+        || EXPIRED.iter().any(|needle| text.contains(needle))
+}
+
+/// File types the OS runs, installs or hands to an interpreter when "opened".
+const RUNNABLE_EXTENSIONS: &[&str] = &[
+    // Windows.
+    "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "mst", "cpl", "hta", "jar", "ps1",
+    "psm1", "vb", "vbs", "vbe", "js", "jse", "ws", "wsf", "wsc", "wsh", "lnk", "inf", "reg",
+    "scf", "url", "application", "appref-ms", "gadget", "msc", "chm", "xll",
+    // macOS.
+    "command", "tool", "app", "pkg", "mpkg", "dmg", "terminal", "scpt", "scptd", "applescript",
+    "workflow", "action", "osax", "prefpane", "webloc", "inetloc", "fileloc",
+    // Linux and scripts.
+    "sh", "bash", "zsh", "csh", "ksh", "fish", "run", "bin", "appimage", "desktop", "deb", "rpm",
+    "py", "pyw", "pl", "rb", "php", "lua",
+];
+
+/// Whether opening this file with the OS handler could run code. Windows
+/// ignores trailing dots and spaces and `:stream` suffixes, so they are
+/// stripped first. An executable file without an extension also counts.
+pub(crate) fn can_run_code(name: &str, mode: Option<u32>) -> bool {
+    let name = name.split(':').next().unwrap_or(name).trim_end_matches(['.', ' ']);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            RUNNABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        _ => mode.is_some_and(|mode| mode & 0o111 != 0),
+    }
+}
+
+/// Up to five quoted names, then how many more there are.
+fn name_list(files: &[FsEntry]) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<String> = files.iter().take(SHOWN).map(|file| format!("“{}”", file.name)).collect();
+    let names = names.join(", ");
+    match files.len().saturating_sub(SHOWN) {
+        0 => names,
+        more => tf("file_pane.names_more", &[("names", &names), ("count", &more.to_string())]).to_string(),
+    }
+}
+
+/// The rows the fuzzy filter keeps (`..` always stays).
+fn filter_rows(rows: &[FsEntry], query: &str) -> Vec<FsEntry> {
+    rows.iter()
+        .filter(|entry| entry.is_parent || fuzzy_match(&entry.name, query))
+        .cloned()
+        .collect()
 }
 
 /// Case-insensitive fuzzy (subsequence) match: every query character must
@@ -3518,7 +4857,10 @@ async fn list_dir(
         .into_iter()
         .filter_map(|entry| {
             let is_hidden = entry.name.starts_with('.');
-            if entry.name.is_empty() || (!show_hidden && is_hidden) {
+            if entry.name.is_empty()
+                || (!show_hidden && is_hidden)
+                || entry.name.ends_with(PARTIAL_SUFFIX)
+            {
                 return None;
             }
             Some(FsEntry {
@@ -3539,6 +4881,50 @@ async fn list_dir(
         .collect();
     // Ordering is the pane's job (`apply_sort`), not the loader's.
     Ok(entries)
+}
+
+/// The first rows of a folder, sorted among themselves, while its complete
+/// listing is still on the way. Stops reading after [`PREVIEW_ROWS`].
+async fn preview_rows(
+    provider: Provider,
+    path: String,
+    show_hidden: bool,
+    sort: Sort,
+) -> anyhow::Result<Vec<FsEntry>> {
+    let (op, rel) = provider.op_for(&path)?;
+    let prefix = path.strip_suffix(rel.as_str()).unwrap_or_default().to_string();
+    let mut lister = op.lister(&rel).await?;
+    let mut rows = Vec::new();
+    while rows.len() < PREVIEW_ROWS {
+        let Some(entry) = lister.next().await else { break };
+        let entry = entry?;
+        let name = entry.name().trim_end_matches('/');
+        let is_hidden = name.starts_with('.');
+        if entry.path().trim_matches('/') == rel.trim_matches('/')
+            || name.is_empty()
+            || (is_hidden && !show_hidden)
+            || name.ends_with(PARTIAL_SUFFIX)
+        {
+            continue;
+        }
+        let meta = entry.metadata();
+        rows.push(FsEntry {
+            name: name.to_string().into(),
+            path: format!("{prefix}{}", entry.path()),
+            is_dir: meta.is_dir(),
+            is_symlink: false,
+            is_bucket: false,
+            is_parent: false,
+            is_hidden,
+            size: meta.content_length(),
+            modified: meta.last_modified().and_then(crate::provider::to_datetime),
+            permissions: None,
+            storage_class: None,
+            region: None,
+        });
+    }
+    sort.sort_rows(&mut rows);
+    Ok(rows)
 }
 
 /// Temp folder that remote Quick Look previews download into, stable per
@@ -3582,10 +4968,8 @@ fn supports_permissions(scheme: &str) -> bool {
     scheme == "sftp" || (cfg!(unix) && scheme == "fs")
 }
 
-/// Local directory → browse path on the reserved local site (root-relative,
-/// trailing `/` unless it *is* the root).
-pub(crate) fn local_dir_path(dir: &Path) -> String {
-    crate::localfs::dir_browse_path(dir)
+fn unreachable_volume_message(count: usize) -> String {
+    tf("file_pane.unreachable_volume", &[("count", &count.to_string())]).to_string()
 }
 
 /// `report.pdf` → `report copy.pdf`, then `report copy 2.pdf`, … — first
@@ -3614,20 +4998,250 @@ fn parent_of(path: &str) -> String {
     }
 }
 
-/// Path-bar input → OpenDAL dir path. Accepts both plain paths and the
-/// URL form the bar displays (`scheme://site/path`) — the authority part is
-/// informational; only the path after it navigates.
-fn parse_path_input(input: &str) -> String {
+/// What the path bar's text points at.
+#[derive(Debug, PartialEq)]
+enum PathInput {
+    /// A directory on this pane's site (OpenDAL dir path).
+    Here(String),
+    /// A URL on another site or server, as `scheme://authority`.
+    Elsewhere(String),
+}
+
+/// Path-bar input → target. Plain paths browse this site. URLs browse it
+/// only when their authority is this site: the name the bar displays
+/// (`scheme://site/path`), the server host, or (S3) the bucket.
+fn parse_path_input(input: &str, profile: &SiteProfile) -> PathInput {
     let input = input.trim();
-    if let Some(ix) = input.find("://") {
-        let rest = &input[ix + 3..];
-        match rest.find('/') {
-            Some(slash) => normalize_path(&rest[slash + 1..]),
-            None => String::new(),
-        }
-    } else {
-        normalize_path(input)
+    let Some((scheme, rest)) = input.split_once("://") else {
+        return PathInput::Here(normalize_path(input));
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let elsewhere = || PathInput::Elsewhere(format!("{scheme}://{authority}"));
+    let is_fs = profile.scheme == "fs";
+    if is_fs && scheme.eq_ignore_ascii_case("file") {
+        return if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+            PathInput::Here(normalize_path(path))
+        } else {
+            elsewhere()
+        };
     }
+    if !scheme.eq_ignore_ascii_case(&profile.scheme) {
+        return elsewhere();
+    }
+    // Exact, as the bar displays it; a case-insensitive match could shadow
+    // an S3 bucket of the same name.
+    if authority == profile.name {
+        return PathInput::Here(normalize_path(path));
+    }
+    if profile.scheme == "s3" {
+        let root = profile
+            .options
+            .get("root")
+            .map(|root| root.trim_matches('/'))
+            .unwrap_or("");
+        return match profile.options.get("bucket").filter(|bucket| !bucket.is_empty()) {
+            // Bucket-root site: the bucket is the first browse segment.
+            None => PathInput::Here(normalize_path(&format!("{authority}/{path}"))),
+            Some(bucket) if bucket == authority => {
+                let path = path.trim_start_matches('/');
+                if root.is_empty() {
+                    PathInput::Here(normalize_path(path))
+                } else if let Some(rest) = path.strip_prefix(root).filter(|rest| {
+                    rest.is_empty() || rest.starts_with('/')
+                }) {
+                    PathInput::Here(normalize_path(rest))
+                } else {
+                    elsewhere()
+                }
+            }
+            Some(_) => elsewhere(),
+        };
+    }
+    let site_host = profile.options.get("endpoint").map(|endpoint| url_host(endpoint));
+    if site_host.is_some_and(|host| !host.is_empty() && host.eq_ignore_ascii_case(url_host(authority))) {
+        PathInput::Here(normalize_path(path))
+    } else {
+        elsewhere()
+    }
+}
+
+/// Host part of a URL or authority: `ssh://user@host:22/x` → `host`.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    host.split(':').next().unwrap_or(host)
+}
+
+/// Indices of the non-`..` rows whose paths are in `paths`.
+fn select_paths(entries: &[FsEntry], paths: &HashSet<String>) -> BTreeSet<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_parent && paths.contains(&entry.path))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// "1 item" / "N items".
+fn items_label(count: usize) -> SharedString {
+    if count == 1 {
+        t("file_pane.items.one")
+    } else {
+        tf("file_pane.items.other", &[("count", &count.to_string())])
+    }
+}
+
+/// The conflict policy for transfers started from a pane
+/// (`transfers.default_conflict_policy`).
+pub fn default_conflict_policy(cx: &App) -> ConflictPolicy {
+    cx.global::<AppState>().config.transfers.default_conflict_policy.into()
+}
+
+/// What one `submit_jobs` call hands the queue.
+enum Submission {
+    Job(NewJob),
+    Batch(NewBatch),
+}
+
+impl Submission {
+    /// How many requested entries this submission stands for.
+    fn entries(&self) -> usize {
+        match self {
+            Self::Job(_) => 1,
+            Self::Batch(batch) => batch.files.len(),
+        }
+    }
+}
+
+/// Group plain-file copies or moves that share sites, destination folder,
+/// conflict policy and move mode into one batch job each. Folders
+/// (recursive) and renamed copies stay separate jobs, and so does a
+/// lone file. Order of first appearance is kept.
+fn plan_submissions(jobs: Vec<NewJob>) -> Vec<Submission> {
+    type Key = (i64, i64, String, ConflictPolicy, bool);
+    let mut plan: Vec<Result<NewJob, Key>> = Vec::new();
+    let mut groups: Vec<(Key, Vec<NewJob>)> = Vec::new();
+    for job in jobs {
+        let batchable = !job.src.ends_with('/') && job.dst_name.is_none();
+        if !batchable {
+            plan.push(Ok(job));
+            continue;
+        }
+        let key = (job.src_site_id, job.dst_site_id, job.dst_dir.clone(), job.conflict_policy, job.move_source);
+        match groups.iter_mut().find(|(known, _)| *known == key) {
+            Some((_, members)) => members.push(job),
+            None => {
+                plan.push(Err(key.clone()));
+                groups.push((key, vec![job]));
+            }
+        }
+    }
+    plan.into_iter()
+        .flat_map(|slot| match slot {
+            Ok(job) => vec![Submission::Job(job)],
+            Err(key) => {
+                let members = groups
+                    .iter()
+                    .position(|(known, _)| *known == key)
+                    .map(|ix| groups.swap_remove(ix).1)
+                    .unwrap_or_default();
+                match <[NewJob; 1]>::try_from(members) {
+                    Ok([job]) => vec![Submission::Job(job)],
+                    Err(members) => vec![Submission::Batch(batch_of(members))],
+                }
+            }
+        })
+        .collect()
+}
+
+/// One batch job for several plain-file copies with a common route.
+fn batch_of(members: Vec<NewJob>) -> NewBatch {
+    let first = &members[0];
+    let label = |dir: String| if dir.is_empty() { "/".to_string() } else { dir };
+    NewBatch {
+        src_site_id: first.src_site_id,
+        dst_site_id: first.dst_site_id,
+        src_label: label(parent_of(&first.src)),
+        dst_label: label(first.dst_dir.clone()),
+        conflict_policy: first.conflict_policy,
+        move_source: first.move_source,
+        files: members
+            .iter()
+            .map(|job| BatchFile {
+                src: job.src.clone(),
+                dst: format!("{}{}", job.dst_dir, job.src.rsplit('/').next().unwrap_or(&job.src)),
+                size: None,
+            })
+            .collect(),
+    }
+}
+
+fn queued_message(count: usize) -> SharedString {
+    if count == 1 {
+        t("file_pane.queued.one")
+    } else {
+        tf("file_pane.queued.other", &[("count", &count.to_string())])
+    }
+}
+
+/// Marks the "queued" note so a newer one replaces it instead of stacking.
+struct QueuedNote;
+
+/// The one route from any started transfer to the queue: every upload,
+/// download, drop and pane copy reports here.
+fn queued_notification(count: usize) -> Notification {
+    Notification::success(queued_message(count))
+        .id::<QueuedNote>()
+        .action(|_, _, cx| {
+            Button::new("show-transfers")
+                .label(t("file_pane.queued.show"))
+                .small()
+                .primary()
+                .on_click(cx.listener(|note, _, window, cx| {
+                    note.dismiss(window, cx);
+                    window.dispatch_action(Box::new(crate::app::ShowTransfers), cx);
+                }))
+        })
+}
+
+/// How a multi-item delete ended when it stopped early.
+struct DeleteStopped {
+    deleted: usize,
+    failed: String,
+    error: anyhow::Error,
+    /// Items after the failed one, which were not attempted.
+    remaining: Vec<FsEntry>,
+}
+
+impl DeleteStopped {
+    /// Notification title and body: what was deleted, what failed and why,
+    /// and what was left untouched.
+    fn report(&self) -> (SharedString, String) {
+        let total = self.deleted + 1 + self.remaining.len();
+        let title = tf(
+            "file_pane.delete.stopped_title",
+            &[("deleted", &self.deleted.to_string()), ("total", &total.to_string())],
+        );
+        let reason = humanize(&self.error).title;
+        let mut body = tf("file_pane.delete.stopped_failed", &[("name", &self.failed), ("reason", &reason)]).to_string();
+        if !self.remaining.is_empty() {
+            body.push(' ');
+            body.push_str(&tf("file_pane.delete.stopped_remaining", &[("names", &name_list(&self.remaining))]));
+        }
+        (title, body)
+    }
+}
+
+/// Show a failed operation in plain words: the humanized title, with the
+/// next step as the message when there is one.
+fn notify_error(error: &anyhow::Error, window: &mut Window, cx: &mut App) {
+    let human = humanize(error);
+    let note = match human.hint {
+        Some(hint) => Notification::error(hint).title(human.title),
+        None => Notification::error(human.title),
+    };
+    window.push_notification(note, cx);
 }
 
 /// User input → OpenDAL dir path: no leading `/`, trailing `/` unless root.
@@ -3661,6 +5275,78 @@ mod tests {
             storage_class: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn sorting_with_cached_keys_matches_the_comparator() {
+        let names = ["b", "A", "c", "B10", "a2"];
+        let mut rows: Vec<FsEntry> = names.iter().map(|name| entry(name)).collect();
+        let sort = Sort { column: None, ascending: false };
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| sort.compare(a, b));
+        sort.sort_rows(&mut rows);
+        let order = |rows: &[FsEntry]| rows.iter().map(|e| e.name.to_string()).collect::<Vec<_>>();
+        assert_eq!(order(&rows), order(&expected));
+    }
+
+    #[tokio::test]
+    async fn a_preview_stops_early_and_skips_hidden_rows() {
+        let dir = std::env::temp_dir().join(format!("kessel-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for ix in 0..PREVIEW_ROWS + 5 {
+            std::fs::write(dir.join(format!("f{ix:05}.txt")), b"").unwrap();
+        }
+        std::fs::write(dir.join(".hidden"), b"").unwrap();
+        let mut profile = site("fs", "preview", &[]);
+        profile.options.insert("root".into(), dir.to_string_lossy().to_string());
+        let provider = Provider::connect(&profile, &Default::default()).unwrap();
+        let rows = preview_rows(provider, String::new(), false, Sort::default()).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rows.len(), PREVIEW_ROWS);
+        assert!(rows.iter().all(|row| !row.is_hidden));
+        assert!(rows.windows(2).all(|pair| pair[0].name <= pair[1].name));
+    }
+
+    #[test]
+    fn a_stopped_delete_names_the_failure_and_what_is_left() {
+        crate::i18n::init("en");
+        let stopped = DeleteStopped {
+            deleted: 2,
+            failed: "c.txt".into(),
+            error: anyhow::Error::new(opendal::Error::new(opendal::ErrorKind::PermissionDenied, "no")),
+            remaining: vec![entry("d.txt"), entry("e.txt")],
+        };
+        let (title, body) = stopped.report();
+        assert_eq!(title, "Deleted 2 of 5 items");
+        assert!(body.contains("“c.txt”"), "{body}");
+        assert!(body.contains("permission"), "{body}");
+        assert!(body.contains("“d.txt”, “e.txt”"), "{body}");
+    }
+
+    #[test]
+    fn only_connection_failures_keep_the_listing() {
+        let opendal = |kind| anyhow::Error::new(opendal::Error::new(kind, "listing failed"));
+        assert!(is_connection_loss(&anyhow::anyhow!("read: connection reset by peer")));
+        assert!(is_connection_loss(&anyhow::anyhow!("operation timed out")));
+        assert!(is_connection_loss(&anyhow::anyhow!("ExpiredToken: the token has expired")));
+        assert!(is_connection_loss(&anyhow::anyhow!("530 Login incorrect")));
+        assert!(!is_connection_loss(&opendal(opendal::ErrorKind::NotFound)));
+        assert!(!is_connection_loss(&opendal(opendal::ErrorKind::PermissionDenied)));
+    }
+
+    #[test]
+    fn files_the_os_would_execute_are_recognized() {
+        for name in ["setup.EXE", "run.command", "a.pdf.bat", "evil.bat. ", "x.cmd:stream", "go.sh"] {
+            assert!(can_run_code(name, None), "{name}");
+        }
+        for name in ["report.pdf", "notes.txt", ".bashrc", "README", "archive.tar.gz"] {
+            assert!(!can_run_code(name, None), "{name}");
+        }
+        // The mode only decides for names without an extension.
+        assert!(can_run_code("deploy", Some(0o755)));
+        assert!(!can_run_code("deploy", Some(0o644)));
+        assert!(!can_run_code("notes.txt", Some(0o755)));
     }
 
     #[test]
@@ -3698,5 +5384,82 @@ mod tests {
         entries.sort_by(|a, b| sort.compare(a, b));
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, ["zdir", "big", "small"]);
+    }
+
+    fn site(scheme: &str, name: &str, options: &[(&str, &str)]) -> SiteProfile {
+        SiteProfile {
+            id: 7,
+            name: name.to_string(),
+            scheme: scheme.to_string(),
+            options: options
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_file_copies_share_one_batch() {
+        let job = |src: &str, move_source: bool| NewJob {
+            src_site_id: 1,
+            dst_site_id: 2,
+            src: src.into(),
+            dst_dir: "out/".into(),
+            dst_name: None,
+            conflict_policy: ConflictPolicy::Skip,
+            move_source,
+        };
+        let plan = plan_submissions(vec![
+            job("a/one.txt", false),
+            job("a/tree/", false),
+            job("a/two.txt", false),
+            job("a/moved.txt", true),
+            job("a/moved2.txt", true),
+        ]);
+        assert_eq!(plan.len(), 3);
+        let Submission::Batch(batch) = &plan[0] else { panic!("files first, as a batch") };
+        assert_eq!(batch.files.len(), 2);
+        assert_eq!(batch.files[1].dst, "out/two.txt");
+        assert_eq!(batch.src_label, "a/");
+        assert!(matches!(&plan[1], Submission::Job(j) if j.src == "a/tree/"));
+        assert!(matches!(&plan[2], Submission::Batch(b) if b.move_source && b.files.len() == 2));
+        // A lone file stays a plain job.
+        assert!(matches!(plan_submissions(vec![job("x.txt", false)])[0], Submission::Job(_)));
+    }
+
+    #[test]
+    fn path_input_only_browses_its_own_site() {
+        let prod = site("sftp", "Prod", &[("endpoint", "ssh://prod.example.com:22")]);
+        let here = |path: &str| PathInput::Here(path.to_string());
+        assert_eq!(parse_path_input("/var/www", &prod), here("var/www/"));
+        assert_eq!(parse_path_input("sftp://Prod/var/", &prod), here("var/"));
+        assert_eq!(parse_path_input("sftp://me@prod.example.com/srv", &prod), here("srv/"));
+        assert_eq!(
+            parse_path_input("sftp://staging.example.com/srv", &prod),
+            PathInput::Elsewhere("sftp://staging.example.com".to_string())
+        );
+        assert_eq!(
+            parse_path_input("s3://Prod/x", &prod),
+            PathInput::Elsewhere("s3://Prod".to_string())
+        );
+
+        let bucket = site("s3", "Assets", &[("bucket", "assets"), ("root", "/public/")]);
+        assert_eq!(parse_path_input("s3://assets/public/img", &bucket), here("img/"));
+        assert!(matches!(parse_path_input("s3://assets/private", &bucket), PathInput::Elsewhere(_)));
+        let account = site("s3", "AWS", &[]);
+        assert_eq!(parse_path_input("s3://logs/2026/", &account), here("logs/2026/"));
+
+        let local = site("fs", "Local", &[]);
+        assert_eq!(parse_path_input("file:///Users/ada", &local), here("Users/ada/"));
+    }
+
+    #[test]
+    fn selection_follows_paths_across_rebuilds() {
+        let mut parent = entry("..");
+        parent.is_parent = true;
+        let entries = vec![parent, entry("b"), entry("a"), entry("c")];
+        let paths: HashSet<String> = ["a", "c", "..", "gone"].map(String::from).into();
+        assert_eq!(select_paths(&entries, &paths), BTreeSet::from([2, 3]));
     }
 }

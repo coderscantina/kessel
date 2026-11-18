@@ -7,7 +7,8 @@
 
       kessel-<version>-x86_64.exe          the app itself, signed if a
                                            certificate is configured
-      kessel-<version>-x86_64.zip          the same executable, zipped
+      kessel-<version>-x86_64.zip          the same executable, zipped with
+                                           the licence notices
       …and a .sha256 next to each
 
     The bare .exe is what the in-app updater downloads and swaps in place
@@ -80,6 +81,10 @@ if ($env:KESSEL_WIN_CERT) {
     $signArgs = @('/sha1', $env:KESSEL_WIN_CERT_THUMBPRINT)
 }
 
+if ($env:KESSEL_WIN_CERT -and -not (Test-Path $env:KESSEL_WIN_CERT)) {
+    throw "KESSEL_WIN_CERT points at a missing file: $env:KESSEL_WIN_CERT"
+}
+
 if ($signArgs) {
     $signtool = Find-SignTool
     if (-not $signtool) { throw 'signtool.exe not found — install the Windows SDK signing tools' }
@@ -88,6 +93,8 @@ if ($signArgs) {
     if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
     & $signtool verify /pa $exe
     if ($LASTEXITCODE -ne 0) { throw 'signature verification failed' }
+} elseif ($env:KESSEL_REQUIRE_SIGNING) {
+    throw 'Release builds must be signed: set KESSEL_WIN_CERT or KESSEL_WIN_CERT_THUMBPRINT'
 } else {
     Write-Warning 'No signing certificate configured (KESSEL_WIN_CERT / KESSEL_WIN_CERT_THUMBPRINT) — SmartScreen will warn users on first run.'
 }
@@ -96,7 +103,15 @@ if ($signArgs) {
 # Zipped *after* signing so both artifacts carry the same signed bytes.
 $zip = Join-Path $dist $zipName
 Remove-Item $zip -ErrorAction SilentlyContinue
-Compress-Archive -Path $exe -DestinationPath $zip
+# The licence notices (kessel's own and the bundled Lucide icons') travel
+# with the zip; the bare .exe stays a single file for the updater.
+$licenses = Join-Path $dist 'licenses'
+Remove-Item $licenses -Recurse -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $licenses | Out-Null
+Copy-Item 'LICENSE' (Join-Path $licenses 'LICENSE')
+Copy-Item 'assets\icons\LICENSE' (Join-Path $licenses 'LICENSE-lucide-icons')
+Compress-Archive -Path $exe, "$licenses\*" -DestinationPath $zip
+Remove-Item $licenses -Recurse
 
 foreach ($artifact in @($exe, $zip)) {
     $hash = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLower()

@@ -379,7 +379,7 @@ impl Render for ThemeBrowser {
                                 range.map(|ix| this.render_row(ix, cx)).collect()
                             }),
                         )
-                        .track_scroll(self.scroll_handle.clone())
+                        .track_scroll(&self.scroll_handle)
                         .flex_1()
                         .min_h_0()
                         .into_any_element()

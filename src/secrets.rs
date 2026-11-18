@@ -22,6 +22,20 @@ impl SecretStore {
         Ok(serde_json::from_str(&entry.get_password()?)?)
     }
 
+    /// Like [`load`](Self::load), but a missing entry is `None` instead of
+    /// an error. Any other keychain failure (locked, denied, corrupt) stays
+    /// an error so callers never mistake it for "no secrets".
+    pub fn load_optional(
+        handle: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let entry = Entry::new(SERVICE, handle)?;
+        match entry.get_password() {
+            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn delete(handle: &str) -> Result<()> {
         let entry = Entry::new(SERVICE, handle)?;
         entry.delete_credential()?;

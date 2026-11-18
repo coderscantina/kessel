@@ -43,6 +43,7 @@ pub fn install(cx: &mut App) {
     #[cfg(target_os = "macos")]
     menus.push(Menu {
         name: "kessel".into(),
+        disabled: false,
         items: vec![
             MenuItem::action(t("menu.app.about"), About),
             MenuItem::action(t("menu.app.check_updates"), CheckForUpdates),
@@ -62,6 +63,13 @@ pub fn install(cx: &mut App) {
         MenuItem::action(t("menu.file.bookmarks"), OpenBookmarks),
         MenuItem::action(t("menu.file.new_folder"), file_pane::NewFolder),
         MenuItem::separator(),
+        MenuItem::action(t("menu.file.upload"), file_pane::Upload),
+        MenuItem::action(t("menu.file.download"), file_pane::Download),
+        MenuItem::action(t("menu.file.download_to"), file_pane::DownloadTo),
+        MenuItem::separator(),
+        MenuItem::action(t("menu.file.rename"), file_pane::RenameSelected),
+        MenuItem::action(t("menu.file.delete"), file_pane::DeleteSelected),
+        MenuItem::separator(),
         MenuItem::action(t("menu.file.synchronize"), SyncPanes),
     ];
     if !cfg!(target_os = "macos") {
@@ -74,11 +82,13 @@ pub fn install(cx: &mut App) {
     menus.extend([
         Menu {
             name: t("menu.file"),
+            disabled: false,
             items: file_items,
         },
         // Standard OS actions so text fields get the native Edit behavior.
         Menu {
             name: t("menu.edit"),
+            disabled: false,
             items: vec![
                 MenuItem::os_action(t("menu.edit.undo"), input::Undo, OsAction::Undo),
                 MenuItem::os_action(t("menu.edit.redo"), input::Redo, OsAction::Redo),
@@ -95,6 +105,7 @@ pub fn install(cx: &mut App) {
         },
         Menu {
             name: t("menu.view"),
+            disabled: false,
             items: vec![
                 MenuItem::action(t("menu.view.command_bar"), ToggleCommandBar),
                 MenuItem::separator(),
@@ -114,6 +125,7 @@ pub fn install(cx: &mut App) {
         },
         Menu {
             name: t("menu.go"),
+            disabled: false,
             items: vec![
                 MenuItem::action(t("menu.go.back"), file_pane::GoBack),
                 MenuItem::action(t("menu.go.forward"), file_pane::GoForward),
@@ -136,6 +148,7 @@ pub fn install(cx: &mut App) {
     }
     menus.push(Menu {
         name: t("menu.help"),
+        disabled: false,
         items: help_items,
     });
 

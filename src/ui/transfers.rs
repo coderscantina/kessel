@@ -4,30 +4,102 @@
 //! truth and this view is pure presentation.
 //!
 //! Beyond the live queue it offers a per-job file drill-down (chevron or
-//! context menu), queue priorities, a global pause, and a History tab
-//! reading the `transfer_history` audit trail.
+//! context menu), a failed-files list with "Retry failed", queue
+//! priorities, a global pause, and a History tab reading the
+//! `transfer_history` audit trail. Both lists are virtualized.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{div, px, App, Context, EventEmitter, WeakEntity, Window};
+use gpui::{
+    actions, div, list, px, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, SharedString, WeakEntity, Window,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::notification::Notification;
 use gpui_component::progress::Progress;
 use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
 };
 
 use crate::app::AppState;
+use crate::errors::humanize_text;
+use crate::i18n::{t, tf};
 use crate::queue::{
-    ConflictInfo, ConflictPolicy, HistoryEntry, JobSnapshot, JobState, QueueSnapshot,
-    TaskSnapshot,
+    ConflictInfo, ConflictPolicy, HistoryEntry, JobSnapshot, JobState, QueueHandle,
+    QueueSnapshot, TaskSnapshot, LOCAL_SITE_ID,
 };
 use crate::ui::{human_duration, human_size, human_time};
 
-/// Cap on rows fetched for the per-job drill-down and the history list.
-const TASK_LIMIT: i64 = 200;
-const HISTORY_LIMIT: i64 = 200;
+actions!(
+    transfers,
+    [
+        SelectNextJob,
+        SelectPrevJob,
+        ToggleJobFiles,
+        PauseResumeJob,
+        RetryJob,
+        ResolveJobConflicts,
+        CancelJob,
+        ReturnToPane
+    ]
+);
+
+/// Rows fetched per page for the per-job drill-down and the history list.
+const PAGE: i64 = 200;
+
+/// ETAs beyond this are noise from a rate that hasn't settled yet.
+const MAX_ETA_SECS: u64 = 100 * 3600;
+
+/// "1 file" / "3 files": `{key}.one` or `{key}.other` with `{count}` filled in.
+pub fn plural(key: &str, count: u64) -> SharedString {
+    let form = if count == 1 { "one" } else { "other" };
+    tf(&format!("{key}.{form}"), &[("count", &count.to_string())])
+}
+
+/// Seconds until `total - done` bytes are through at `bps`; `None` when the
+/// rate is unknown, nothing is left, or the estimate is too far out to mean
+/// anything.
+pub fn eta_secs(bps: u64, done: u64, total: u64) -> Option<u64> {
+    if bps == 0 || total <= done {
+        return None;
+    }
+    Some((total - done).div_ceil(bps)).filter(|secs| *secs <= MAX_ETA_SECS)
+}
+
+/// "less than a minute left", "about 3 min left", "about 2 h 5 min left".
+pub fn eta_text(secs: u64) -> SharedString {
+    if secs < 60 {
+        return t("transfers.eta.under_minute");
+    }
+    let minutes = (secs + 30) / 60;
+    if minutes < 60 {
+        return tf("transfers.eta.minutes", &[("count", &minutes.to_string())]);
+    }
+    let (hours, minutes) = ((minutes / 60).to_string(), minutes % 60);
+    if minutes == 0 {
+        tf("transfers.eta.hours", &[("hours", &hours)])
+    } else {
+        tf(
+            "transfers.eta.hours_minutes",
+            &[("hours", &hours), ("minutes", &minutes.to_string())],
+        )
+    }
+}
+
+/// "4.2 MB/s, about 3 min left", or just the speed when the ETA is unknown.
+pub fn rate_text(bps: u64, done: u64, total: u64) -> String {
+    let speed = format!("{}/s", human_size(bps));
+    match eta_secs(bps, done, total) {
+        Some(eta) => format!("{speed}, {}", eta_text(eta)),
+        None => speed,
+    }
+}
 
 /// Aggregate over all non-terminal jobs, for the pane footer and the global
 /// status bar.
@@ -38,8 +110,6 @@ pub struct TransferStats {
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub bps: u64,
-    /// Seconds until the remaining bytes are through at the current rate.
-    pub eta_secs: Option<u64>,
 }
 
 impl TransferStats {
@@ -50,25 +120,26 @@ impl TransferStats {
         (self.bytes_done as f32 / self.bytes_total as f32) * 100.0
     }
 
-    /// One line: "2 transfers · 45.1 MB / 1.2 GB · 12.3 MB/s · ETA 1m 20s"
+    /// One line: "2 transfers · 45.1 MB of 1.2 GB · 12.3 MB/s, about 2 min left"
     pub fn summary(&self) -> String {
-        let mut text = format!(
-            "{} transfer{} · {} / {}",
-            self.active,
-            if self.active == 1 { "" } else { "s" },
-            human_size(self.bytes_done),
-            human_size(self.bytes_total),
-        );
+        let mut parts = vec![
+            plural("transfers.count", self.active as u64).to_string(),
+            tf(
+                "transfers.bytes_of",
+                &[
+                    ("done", &human_size(self.bytes_done)),
+                    ("total", &human_size(self.bytes_total)),
+                ],
+            )
+            .to_string(),
+        ];
         if self.bps > 0 {
-            text.push_str(&format!(" · {}/s", human_size(self.bps)));
-        }
-        if let Some(eta) = self.eta_secs {
-            text.push_str(&format!(" · ETA {}", human_duration(eta)));
+            parts.push(rate_text(self.bps, self.bytes_done, self.bytes_total));
         }
         if self.conflicts > 0 {
-            text.push_str(&format!(" · {} conflict(s)", self.conflicts));
+            parts.push(plural("transfers.conflicts", self.conflicts).to_string());
         }
-        text
+        parts.join(" · ")
     }
 }
 
@@ -77,153 +148,336 @@ pub enum TransfersEvent {
     JobFinished(JobSnapshot),
 }
 
+/// Things the panel asks the app to do; a separate event type so the app's
+/// existing `TransfersEvent` match stays exhaustive.
+#[derive(Debug, Clone)]
+pub enum TransfersRequest {
+    /// A job just parked its first conflict. The app shows the transfers
+    /// dock and calls [`TransfersPanel::prompt_conflicts`].
+    ConflictParked { job_id: i64 },
+    /// Show a finished job's destination folder in a file pane.
+    ShowInPane { site_id: i64, dir: String },
+    /// Escape in the panel: the keyboard goes back to the active file pane.
+    ReturnToPane,
+}
+
+/// A fetched list and whether it's still loading or failed.
+enum Fetched<T> {
+    Loading,
+    Ready(T),
+    Failed(String),
+}
+
+/// An unfolded per-file list of one job.
+struct Drill {
+    /// Only the failed files, opened from "Done, N failed".
+    failed_only: bool,
+    limit: i64,
+    tasks: Fetched<Vec<TaskSnapshot>>,
+}
+
 pub struct TransfersPanel {
+    focus_handle: FocusHandle,
+    /// Job the keyboard acts on.
+    selected_job: Option<i64>,
     snapshot: QueueSnapshot,
-    /// Jobs whose per-file task list is unfolded.
-    expanded: HashSet<i64>,
-    /// Fetched drill-down rows per expanded job.
-    tasks: HashMap<i64, Vec<TaskSnapshot>>,
+    jobs_list: ListState,
+    drills: HashMap<i64, Drill>,
+    /// Jobs whose failed files show their raw error text.
+    details: HashSet<i64>,
+    /// Jobs that already asked for a decision on their parked conflicts.
+    conflict_prompted: HashSet<i64>,
     /// History tab instead of the live queue.
     show_history: bool,
-    history: Vec<HistoryEntry>,
+    history: Fetched<Vec<HistoryEntry>>,
+    history_limit: i64,
+    history_list: ListState,
+}
+
+impl Focusable for TransfersPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl EventEmitter<TransfersEvent> for TransfersPanel {}
+impl EventEmitter<TransfersRequest> for TransfersPanel {}
 
-/// Show the next conflict with an explicit per-file or whole-transfer decision.
-fn open_resolve_dialog(job_id: i64, window: &mut Window, cx: &mut Context<TransfersPanel>) {
+/// Show the next conflict with a per-file or whole-transfer decision.
+fn open_resolve_dialog(job_id: i64, window: &mut Window, cx: &mut App) {
     let state = cx.global::<AppState>();
     let pool = state.db.clone();
     let queue = state.queue.clone();
     let fetch = state
         .runtime
         .spawn(async move { crate::queue::store::job_conflicts(&pool, job_id, 100).await });
-    cx.spawn_in(window, async move |_, cx| {
-        let conflicts = match fetch.await {
-            Ok(Ok(conflicts)) => conflicts,
-            error => {
-                cx.update(|window, cx| {
-                    window.push_notification(format!("Could not load conflicts: {error:?}"), cx);
-                })
+    window
+        .spawn(cx, async move |cx| {
+            let conflicts = match fetch.await {
+                Ok(Ok(conflicts)) => conflicts,
+                Ok(Err(error)) => return notify_failure("transfers.conflict.load_failed", &format!("{error:#}"), cx),
+                Err(error) => return notify_failure("transfers.conflict.load_failed", &error.to_string(), cx),
+            };
+            cx.update(|window, cx| open_resolve_dialog_with(job_id, conflicts, queue, window, cx))
                 .ok();
-                return;
-            }
-        };
-        cx.update(|window, cx| {
-            open_resolve_dialog_with(job_id, conflicts, queue, window, cx);
         })
-        .ok();
+        .detach();
+}
+
+fn notify_failure(title_key: &str, raw: &str, cx: &mut gpui::AsyncWindowContext) {
+    let human = humanize_text(raw);
+    let title = t(title_key);
+    cx.update(|window, cx| {
+        window.push_notification(Notification::error(human.title).title(title), cx);
     })
-    .detach();
+    .ok();
+}
+
+/// "4.2 MB, modified 2026-11-07 10:12" for one side of a conflict.
+fn conflict_side(size: Option<u64>, modified: Option<&str>) -> String {
+    let size = size.map(human_size).unwrap_or_else(|| t("transfers.conflict.unknown_size").to_string());
+    match parse_rfc3339(modified) {
+        Some(time) => tf("transfers.conflict.side", &[("size", &size), ("modified", &human_time(Some(time)))]).to_string(),
+        None => size,
+    }
+}
+
+fn parse_rfc3339(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    raw.and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|time| time.with_timezone(&chrono::Utc))
 }
 
 fn open_resolve_dialog_with(
     job_id: i64,
     conflicts: Vec<ConflictInfo>,
-    queue: crate::queue::QueueHandle,
+    queue: QueueHandle,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if conflicts.is_empty() {
-        window.push_notification("No conflicts waiting in this transfer.", cx);
+    let Some(conflict) = conflicts.first().cloned() else {
+        window.push_notification(t("transfers.conflict.none_left"), cx);
         return;
-    }
-    let task_id = conflicts[0].id;
-    const CHOICES: &[(&str, &str, ConflictPolicy)] = &[
-        (
-            "Overwrite",
-            "Replace the existing files with the source files.",
-            ConflictPolicy::Overwrite,
-        ),
-        (
-            "Overwrite if newer",
-            "Replace only when the source is newer. Missing dates require a decision.",
-            ConflictPolicy::OverwriteNewer,
-        ),
-        (
-            "Skip",
-            "Leave the existing files as they are.",
-            ConflictPolicy::Skip,
-        ),
-        (
-            "Resume",
-            "Use only for a known partial copy. Appends when supported; otherwise replaces. Equal or larger files are skipped.",
-            ConflictPolicy::Resume,
-        ),
-        (
-            "Keep both",
-            "Write the new files under a unique name, e.g. \"file (1).txt\".",
-            ConflictPolicy::Rename,
-        ),
-    ];
+    };
+    let remaining: Vec<ConflictInfo> = conflicts[1..].to_vec();
+    let apply_all = Rc::new(Cell::new(false));
+    let show_more = Rc::new(Cell::new(false));
+
+    let decide: Rc<dyn Fn(ConflictPolicy, &mut Window, &mut App)> = {
+        let apply_all = apply_all.clone();
+        Rc::new(move |policy, window, cx| {
+            window.close_dialog(cx);
+            if apply_all.get() {
+                queue.resolve(job_id, policy);
+                return;
+            }
+            queue.resolve_task(conflict.id, policy);
+            if !remaining.is_empty() {
+                open_resolve_dialog_with(job_id, remaining.clone(), queue.clone(), window, cx);
+            }
+        })
+    };
+
+    let name = conflict.dst.trim_end_matches('/').rsplit('/').next().unwrap_or(&conflict.dst).to_string();
+    let src_time = parse_rfc3339(conflict.src_modified.as_deref());
+    let dst_time = parse_rfc3339(conflict.dst_modified.as_deref());
+    let newer = match (src_time, dst_time) {
+        (Some(src), Some(dst)) if src > dst => Some(true),
+        (Some(src), Some(dst)) if src < dst => Some(false),
+        _ => None,
+    };
+    let incoming = conflict_side(conflict.src_size, conflict.src_modified.as_deref());
+    let existing = conflict_side(conflict.dst_size, conflict.dst_modified.as_deref());
+    let others = conflicts.len() as u64 - 1;
+
     window.open_dialog(cx, move |dialog, _, cx| {
-        let queue = queue.clone();
-        let conflict = &conflicts[0];
-        let details = |label: &str, size: Option<u64>, modified: Option<&str>| {
-            let size = size.map(human_size).unwrap_or_else(|| "Unknown size".into());
-            let modified = modified
-                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-                .map(|time| human_time(Some(time.with_timezone(&chrono::Utc))))
-                .unwrap_or_else(|| "Unknown date".into());
-            format!("{label}: {size} · {modified}")
+        let side = |label: SharedString, value: &str, is_newer: bool| {
+            h_flex()
+                .gap_2()
+                .child(div().w(px(72.)).flex_shrink_0().text_color(cx.theme().muted_foreground).child(label))
+                .child(div().flex_1().child(value.to_string()))
+                .when(is_newer, |this| this.child(div().text_color(cx.theme().muted_foreground).child(t("transfers.conflict.newer"))))
         };
-        let comparison = v_flex().gap_1().text_xs()
-            .child(div().child(conflict.dst.clone()))
-            .child(details("Incoming", conflict.src_size, conflict.src_modified.as_deref()))
-            .child(details("Existing", conflict.dst_size, conflict.dst_modified.as_deref()));
+        let choice = |id: &'static str, key: &str, policy: ConflictPolicy| {
+            let decide = decide.clone();
+            Button::new(id)
+                .label(t(key))
+                .small()
+                .on_click(move |_, window, cx| decide(policy, window, cx))
+        };
+        let more = show_more.get();
         dialog
-            .title("File already exists")
-            .w(px(580.))
+            .title(t("transfers.conflict.title"))
+            .w(px(480.))
             .child(
                 v_flex()
-                    .gap_2()
-                    .child("Choose for this file, or apply a rule to every conflict in this transfer, including future conflicts.")
-                    .when(!conflicts.is_empty(), |this| {
+                    .gap_3()
+                    .child(tf("transfers.conflict.body", &[("name", &name)]))
+                    .child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .text_sm()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted)
+                            .child(side(t("transfers.conflict.incoming"), &incoming, newer == Some(true)))
+                            .child(side(t("transfers.conflict.existing"), &existing, newer == Some(false))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(choice("conflict-replace", "transfers.conflict.replace", ConflictPolicy::Overwrite).primary())
+                            .child(choice("conflict-skip", "transfers.conflict.skip", ConflictPolicy::Skip).outline())
+                            .child(choice("conflict-keep-both", "transfers.conflict.keep_both", ConflictPolicy::Rename).outline()),
+                    )
+                    .child({
+                        let apply_all = apply_all.clone();
+                        let label = if others > 0 {
+                            tf("transfers.conflict.apply_all_count", &[("count", &others.to_string())])
+                        } else {
+                            t("transfers.conflict.apply_all")
+                        };
+                        Checkbox::new("conflict-apply-all")
+                            .label(label)
+                            .checked(apply_all.get())
+                            .on_click(move |checked, window, _| {
+                                apply_all.set(*checked);
+                                window.refresh();
+                            })
+                    })
+                    .child({
+                        let show_more = show_more.clone();
+                        Button::new("conflict-more")
+                            .label(t("transfers.conflict.more"))
+                            .icon(Icon::new(if more { IconName::ChevronDown } else { IconName::ChevronRight }))
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, window, _| {
+                                show_more.set(!show_more.get());
+                                window.refresh();
+                            })
+                    })
+                    .when(more, |this| {
                         this.child(
                             v_flex()
-                                .p_2()
-                                .gap_1()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted)
-                                .child(comparison),
+                                .gap_2()
+                                .children([
+                                    ("conflict-newer", "transfers.conflict.replace_newer", "transfers.conflict.replace_newer_hint", ConflictPolicy::OverwriteNewer),
+                                    ("conflict-resume", "transfers.conflict.resume", "transfers.conflict.resume_hint", ConflictPolicy::Resume),
+                                ]
+                                .map(|(id, key, hint, policy)| {
+                                    h_flex()
+                                        .gap_2()
+                                        .child(choice(id, key, policy).outline().flex_shrink_0())
+                                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(t(hint)))
+                                })),
                         )
-                    })
-                    .children(CHOICES.iter().map(|(label, explain, policy)| {
-                        let queue = queue.clone();
-                        let policy = *policy;
-                        let remaining = conflicts[1..].to_vec();
-                        v_flex()
-                            .gap_0p5()
-                            .child({
-                                let all_queue = queue.clone();
-                                h_flex().gap_2()
-                                    .child(Button::new(*label)
-                                        .label(format!("{label}: this file"))
-                                        .outline().small()
-                                        .on_click(move |_, window, cx| {
-                                            queue.resolve_task(task_id, policy);
-                                            window.close_dialog(cx);
-                                            if !remaining.is_empty() {
-                                                open_resolve_dialog_with(job_id, remaining.clone(), queue.clone(), window, cx);
-                                            }
-                                        }))
-                                    .child(Button::new(gpui::SharedString::from(format!("all-{label}")))
-                                        .label("Entire transfer")
-                                        .ghost().small()
-                                        .on_click(move |_, window, cx| {
-                                            all_queue.resolve(job_id, policy);
-                                            window.close_dialog(cx);
-                                        }))
-                            })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(*explain),
-                            )
-                    })),
+                    }),
             )
     });
+}
+
+/// Bring a parked conflict to the user's attention: open the dialog, or
+/// when another dialog is up, a notification with a Resolve action.
+fn prompt_conflict(job: &JobSnapshot, window: &mut Window, cx: &mut App) {
+    let job_id = job.id;
+    if !window.has_active_dialog(cx) {
+        open_resolve_dialog(job_id, window, cx);
+        return;
+    }
+    let note = Notification::warning(tf("transfers.conflict.note", &[("name", file_name(&job.src))]))
+        .id1::<TransfersRequest>(job_id as usize)
+        .title(t("transfers.conflict.note_title"))
+        .action(move |_, _, cx| {
+            let note = cx.entity().downgrade();
+            Button::new("resolve-conflict")
+                .label(t("transfers.conflict.resolve"))
+                .primary()
+                .small()
+                .on_click(move |_, window, cx| {
+                    note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                    open_resolve_dialog(job_id, window, cx);
+                })
+        });
+    window.push_notification(note, cx);
+}
+
+/// The last segment of a browse path for a compact job title; the root
+/// reads as "/".
+fn short_path(path: &str) -> &str {
+    match file_name(path) {
+        "" => "/",
+        name => name,
+    }
+}
+
+/// Last segment of a browse path, without the trailing `/` of a folder.
+fn file_name(path: &str) -> &str {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Where a finished download to the local site landed: the file a
+/// single-file job wrote (also after a "Keep both" rename), or the copied
+/// folder. Falls back to the destination folder when that is gone, and for
+/// batch jobs.
+fn local_target(job: &JobSnapshot) -> PathBuf {
+    let root = crate::localfs::root();
+    let written = match &job.dst_file {
+        Some(file) => file.clone(),
+        None => format!("{}{}", job.dst, file_name(&job.src)),
+    };
+    let item = crate::localfs::full_path(&root, &written);
+    if item.exists() {
+        item
+    } else {
+        crate::localfs::full_path(&root, &job.dst)
+    }
+}
+
+/// Show `path` selected in Finder / Explorer; elsewhere open its folder.
+fn reveal(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn();
+    if let Err(error) = result {
+        tracing::error!(%error, path = %path.display(), "revealing in the file manager failed");
+    }
+}
+
+fn reveal_label() -> SharedString {
+    t(if cfg!(target_os = "macos") {
+        "transfers.reveal_finder"
+    } else if cfg!(target_os = "windows") {
+        "transfers.reveal_explorer"
+    } else {
+        "transfers.reveal_folder"
+    })
+}
+
+/// A finished download sitting on this machine.
+fn is_local_download(job: &JobSnapshot) -> bool {
+    job.state == JobState::Done && job.dst_site_id == LOCAL_SITE_ID
+}
+
+/// Whether "Open" may hand the download to the OS. Programs and scripts only
+/// offer reveal, so a downloaded file never runs from a queue row.
+fn can_open_download(job: &JobSnapshot) -> bool {
+    let target = job.dst_file.as_deref().unwrap_or(&job.src);
+    is_local_download(job) && !crate::ui::file_pane::can_run_code(file_name(target), None)
+}
+
+/// SQLite `datetime('now')` (UTC) in local time.
+fn history_time(raw: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .map(|time| human_time(Some(time.and_utc())))
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 impl TransfersPanel {
@@ -238,50 +492,176 @@ impl TransfersPanel {
                     break;
                 }
                 let snapshot = rx.borrow_and_update().clone();
-                let alive = this.update(cx, |panel: &mut TransfersPanel, cx| {
-                    // Jobs that just crossed into Done: emit so open folders
-                    // showing their destination pick up the new files.
-                    let finished: Vec<JobSnapshot> = snapshot
-                        .jobs
-                        .iter()
-                        .filter(|job| {
-                            job.state == JobState::Done
-                                && panel
-                                    .snapshot
-                                    .jobs
-                                    .iter()
-                                    .find(|old| old.id == job.id)
-                                    .is_none_or(|old| old.state != JobState::Done)
-                        })
-                        .cloned()
-                        .collect();
-                    panel.snapshot = snapshot;
-                    // Keep unfolded drill-downs and the history tab fresh.
-                    let expanded: Vec<i64> = panel.expanded.iter().copied().collect();
-                    for job_id in expanded {
-                        panel.fetch_tasks(job_id, cx);
-                    }
-                    if panel.show_history && !finished.is_empty() {
-                        panel.fetch_history(cx);
-                    }
-                    for job in finished {
-                        cx.emit(TransfersEvent::JobFinished(job));
-                    }
-                    cx.notify();
-                });
-                if alive.is_err() {
+                if this.update(cx, |panel, cx| panel.apply_snapshot(snapshot, cx)).is_err() {
                     break;
                 }
             }
         })
         .detach();
 
+        let snapshot = handle.latest();
+        let jobs_list = ListState::new(snapshot.jobs.len(), ListAlignment::Top, px(200.));
         Self {
-            snapshot: handle.latest(),
-            expanded: HashSet::new(),
-            tasks: HashMap::new(),
+            focus_handle: cx.focus_handle(),
+            selected_job: None,
+            snapshot,
+            jobs_list,
+            drills: HashMap::new(),
+            details: HashSet::new(),
+            conflict_prompted: HashSet::new(),
             show_history: false,
-            history: Vec::new(),
+            history: Fetched::Loading,
+            history_limit: PAGE,
+            history_list: ListState::new(0, ListAlignment::Top, px(200.)),
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: QueueSnapshot, cx: &mut Context<Self>) {
+        // Jobs that just crossed into Done: emit so open folders showing
+        // their destination pick up the new files.
+        let finished: Vec<JobSnapshot> = snapshot
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.state == JobState::Done
+                    && self
+                        .snapshot
+                        .jobs
+                        .iter()
+                        .find(|old| old.id == job.id)
+                        .is_none_or(|old| old.state != JobState::Done)
+            })
+            .cloned()
+            .collect();
+        let mut parked = Vec::new();
+        for job in &snapshot.jobs {
+            if job.files_conflict == 0 {
+                self.conflict_prompted.remove(&job.id);
+            } else if self.conflict_prompted.insert(job.id) {
+                parked.push(job.id);
+            }
+        }
+        let old_count = self.snapshot.jobs.len();
+        self.snapshot = snapshot;
+        let alive: HashSet<i64> = self.snapshot.jobs.iter().map(|job| job.id).collect();
+        self.drills.retain(|id, _| alive.contains(id));
+        self.details.retain(|id| alive.contains(id));
+        self.conflict_prompted.retain(|id| alive.contains(id));
+        self.sync_list(old_count);
+
+        // Keep unfolded drill-downs and the history tab fresh.
+        let drilled: Vec<i64> = self.drills.keys().copied().collect();
+        for job_id in drilled {
+            self.fetch_tasks(job_id, cx);
+        }
+        if self.show_history && !finished.is_empty() {
+            self.fetch_history(cx);
+        }
+        for job in finished {
+            cx.emit(TransfersEvent::JobFinished(job));
+        }
+        for job_id in parked {
+            cx.emit(TransfersRequest::ConflictParked { job_id });
+        }
+        cx.notify();
+    }
+
+    // --- keyboard ---
+
+    /// Row of the job the keyboard acts on, falling back to the first job
+    /// when the selected one has left the queue.
+    fn selected_ix(&self) -> Option<usize> {
+        let jobs = &self.snapshot.jobs;
+        let selected = self.selected_job.and_then(|id| jobs.iter().position(|job| job.id == id));
+        selected.or((!jobs.is_empty()).then_some(0))
+    }
+
+    fn selected_snapshot(&self) -> Option<&JobSnapshot> {
+        self.snapshot.jobs.get(self.selected_ix()?)
+    }
+
+    fn step_job(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.selected_ix() else { return };
+        let last = self.snapshot.jobs.len() as isize - 1;
+        let next = if self.selected_job.is_none() { current } else {
+            (current as isize + delta).clamp(0, last) as usize
+        };
+        self.selected_job = Some(self.snapshot.jobs[next].id);
+        self.jobs_list.scroll_to_reveal_item(next);
+        cx.notify();
+    }
+
+    fn select_next_job(&mut self, _: &SelectNextJob, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_job(1, cx);
+    }
+
+    fn select_prev_job(&mut self, _: &SelectPrevJob, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_job(-1, cx);
+    }
+
+    fn toggle_job_files(&mut self, _: &ToggleJobFiles, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_snapshot().map(|job| job.id) {
+            self.toggle_drill(id, false, cx);
+        }
+    }
+
+    fn pause_resume_job(&mut self, _: &PauseResumeJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        match job.state {
+            JobState::Active | JobState::Queued => queue.pause(job.id),
+            JobState::Paused => queue.resume(job.id),
+            _ => {}
+        }
+    }
+
+    fn retry_job(&mut self, _: &RetryJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        match job.state {
+            JobState::Failed | JobState::Cancelled => queue.retry(job.id),
+            JobState::Done if job.files_failed > 0 => queue.retry_failed(job.id),
+            _ => {}
+        }
+    }
+
+    fn resolve_job_conflicts(&mut self, _: &ResolveJobConflicts, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(job) = self.selected_snapshot().filter(|job| job.files_conflict > 0) {
+            open_resolve_dialog(job.id, window, cx);
+        }
+    }
+
+    /// Cancel a running job; a finished one leaves the queue view.
+    fn cancel_job(&mut self, _: &CancelJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        if job.state.is_terminal() {
+            queue.remove(job.id);
+        } else if job.state != JobState::Cancelling {
+            queue.cancel(job.id);
+        }
+    }
+
+    fn return_to_pane(&mut self, _: &ReturnToPane, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TransfersRequest::ReturnToPane);
+    }
+
+    /// Tell the job list its rows changed; heights vary, so they remeasure.
+    fn sync_list(&self, old_count: usize) {
+        let count = self.snapshot.jobs.len();
+        if count == old_count {
+            self.jobs_list.remeasure_items(0..count);
+        } else {
+            self.jobs_list.splice(0..old_count, count);
+        }
+    }
+
+    /// Ask for a decision on a job's parked conflicts: opens the resolve
+    /// dialog, or a notification with a Resolve action while another dialog
+    /// is open. Called by the app on [`TransfersRequest::ConflictParked`].
+    pub fn prompt_conflicts(&mut self, job_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(job) = self.snapshot.jobs.iter().find(|job| job.id == job_id && job.files_conflict > 0) {
+            prompt_conflict(job, window, cx);
         }
     }
 
@@ -296,41 +676,75 @@ impl TransfersPanel {
         if jobs.is_empty() {
             return None;
         }
-        let bytes_done: u64 = jobs.iter().map(|j| j.bytes_done).sum();
-        let bytes_total: u64 = jobs.iter().map(|j| j.bytes_total).sum();
-        let bps = self.snapshot.total_bps;
         Some(TransferStats {
             active: jobs.len(),
             conflicts: jobs.iter().map(|j| j.files_conflict).sum(),
-            bytes_done,
-            bytes_total,
-            bps,
-            eta_secs: (bps > 0 && bytes_total > bytes_done)
-                .then(|| (bytes_total - bytes_done).div_ceil(bps)),
+            bytes_done: jobs.iter().map(|j| j.bytes_done).sum(),
+            bytes_total: jobs.iter().map(|j| j.bytes_total).sum(),
+            bps: self.snapshot.total_bps,
         })
     }
 
-    fn toggle_expanded(&mut self, job_id: i64, cx: &mut Context<Self>) {
-        if self.expanded.remove(&job_id) {
-            self.tasks.remove(&job_id);
-        } else {
-            self.expanded.insert(job_id);
+    /// Fold or unfold a job's file list; `failed_only` opens just the
+    /// failed files (switching an open list over instead of closing it).
+    fn toggle_drill(&mut self, job_id: i64, failed_only: bool, cx: &mut Context<Self>) {
+        match self.drills.get_mut(&job_id) {
+            Some(drill) if drill.failed_only == failed_only => {
+                self.drills.remove(&job_id);
+            }
+            Some(drill) => drill.failed_only = failed_only,
+            None => {
+                self.drills.insert(
+                    job_id,
+                    Drill {
+                        failed_only,
+                        limit: PAGE,
+                        tasks: Fetched::Loading,
+                    },
+                );
+                self.fetch_tasks(job_id, cx);
+            }
+        }
+        self.sync_list(self.snapshot.jobs.len());
+        cx.notify();
+    }
+
+    fn show_more_tasks(&mut self, job_id: i64, cx: &mut Context<Self>) {
+        if let Some(drill) = self.drills.get_mut(&job_id) {
+            drill.limit += PAGE;
             self.fetch_tasks(job_id, cx);
         }
+    }
+
+    fn toggle_details(&mut self, job_id: i64, cx: &mut Context<Self>) {
+        if !self.details.remove(&job_id) {
+            self.details.insert(job_id);
+        }
+        self.sync_list(self.snapshot.jobs.len());
         cx.notify();
     }
 
     fn fetch_tasks(&mut self, job_id: i64, cx: &mut Context<Self>) {
+        let Some(limit) = self.drills.get(&job_id).map(|drill| drill.limit) else {
+            return;
+        };
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
         let fetch = state
             .runtime
-            .spawn(async move { crate::queue::store::job_tasks(&pool, job_id, TASK_LIMIT).await });
+            .spawn(async move { crate::queue::store::job_tasks(&pool, job_id, limit).await });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(tasks)) = fetch.await else { return };
+            let tasks = match fetch.await {
+                Ok(Ok(tasks)) => Fetched::Ready(tasks),
+                Ok(Err(error)) => Fetched::Failed(humanize_text(&format!("{error:#}")).title),
+                Err(error) => Fetched::Failed(error.to_string()),
+            };
             this.update(cx, |this, cx| {
-                if this.expanded.contains(&job_id) {
-                    this.tasks.insert(job_id, tasks);
+                let Some(drill) = this.drills.get_mut(&job_id) else { return };
+                // A failed refresh keeps the rows already on screen.
+                if matches!(tasks, Fetched::Ready(_)) || !matches!(drill.tasks, Fetched::Ready(_)) {
+                    drill.tasks = tasks;
+                    this.sync_list(this.snapshot.jobs.len());
                     cx.notify();
                 }
             })
@@ -340,20 +754,39 @@ impl TransfersPanel {
     }
 
     fn fetch_history(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.history, Fetched::Ready(_)) {
+            self.history = Fetched::Loading;
+        }
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
+        let limit = self.history_limit;
         let fetch = state
             .runtime
-            .spawn(async move { crate::queue::store::history(&pool, HISTORY_LIMIT).await });
+            .spawn(async move { crate::queue::store::history(&pool, limit).await });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(history)) = fetch.await else { return };
+            let history = match fetch.await {
+                Ok(Ok(history)) => Fetched::Ready(history),
+                Ok(Err(error)) => Fetched::Failed(humanize_text(&format!("{error:#}")).title),
+                Err(error) => Fetched::Failed(error.to_string()),
+            };
             this.update(cx, |this, cx| {
+                let old = this.history_rows();
                 this.history = history;
+                this.history_list.splice(0..old, this.history_rows());
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// History list rows: the entries plus a "Load more" row when the last
+    /// page came back full.
+    fn history_rows(&self) -> usize {
+        match &self.history {
+            Fetched::Ready(entries) => entries.len() + usize::from(entries.len() as i64 >= self.history_limit),
+            _ => 0,
+        }
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -364,147 +797,210 @@ impl TransfersPanel {
         cx.notify();
     }
 
+    /// Status word with its tone: "Done, 2 failed" in warning, "Failed" in
+    /// danger; a healthy row stays quiet.
+    fn status(&self, job: &JobSnapshot, cx: &App) -> (SharedString, gpui::Hsla) {
+        let theme = cx.theme();
+        if job.files_conflict > 0 {
+            return (t("transfers.state.waiting_decision"), theme.warning);
+        }
+        if let Some(found) = job.discovering {
+            return (
+                tf("transfers.state.discovering", &[("count", &found.to_string())]),
+                theme.muted_foreground,
+            );
+        }
+        match job.state {
+            JobState::Active => (t("transfers.state.active"), theme.muted_foreground),
+            JobState::Queued => (t("transfers.state.queued"), theme.muted_foreground),
+            JobState::Paused => (t("transfers.state.paused"), theme.muted_foreground),
+            JobState::Cancelling => (t("transfers.state.cancelling"), theme.muted_foreground),
+            JobState::Cancelled => (t("transfers.state.cancelled"), theme.muted_foreground),
+            JobState::Failed => (t("transfers.state.failed"), theme.danger),
+            JobState::Done if job.files_failed > 0 => (
+                tf("transfers.state.done_failed", &[("count", &job.files_failed.to_string())]),
+                theme.warning,
+            ),
+            JobState::Done => (t("transfers.state.done"), theme.success),
+        }
+    }
+
+    /// The muted line under a job's title: kind, sites, counts and rate.
+    fn detail_line(job: &JobSnapshot) -> String {
+        let kind = match (job.direction(), job.move_source) {
+            ("upload", false) => "transfers.kind.upload",
+            ("upload", true) => "transfers.kind.move_upload",
+            ("download", false) => "transfers.kind.download",
+            ("download", true) => "transfers.kind.move_download",
+            (_, false) => "transfers.kind.copy",
+            (_, true) => "transfers.kind.move",
+        };
+        let mut parts = vec![
+            t(kind).to_string(),
+            format!("{} → {}", job.src_site, job.dst_site),
+        ];
+        if job.state.is_terminal() {
+            parts.push(plural("transfers.files", job.files_done).to_string());
+            parts.push(human_size(job.bytes_done));
+        } else {
+            parts.push(
+                tf(
+                    "transfers.files_of",
+                    &[("done", &job.files_done.to_string()), ("total", &plural("transfers.files", job.files_total))],
+                )
+                .to_string(),
+            );
+            parts.push(
+                tf(
+                    "transfers.bytes_of",
+                    &[("done", &human_size(job.bytes_done)), ("total", &human_size(job.bytes_total))],
+                )
+                .to_string(),
+            );
+        }
+        if job.files_skipped > 0 {
+            parts.push(tf("transfers.skipped", &[("count", &job.files_skipped.to_string())]).to_string());
+        }
+        if job.state == JobState::Active && job.bps > 0 {
+            parts.push(rate_text(job.bps, job.bytes_done, job.bytes_total));
+        }
+        if job.priority != 0 {
+            parts.push(tf("transfers.priority", &[("priority", &job.priority.to_string())]).to_string());
+        }
+        parts.join(" · ")
+    }
+
+    fn render_job_at(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        match self.snapshot.jobs.get(ix).cloned() {
+            Some(job) => self.render_job(&job, cx).into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
     fn render_job(&self, job: &JobSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let queue = cx.global::<AppState>().queue.clone();
         let id = job.id;
-
-        let (icon, label) = match (job.direction(), job.move_source) {
-            ("upload", false) => (IconName::ArrowUp, "Upload"),
-            ("upload", true) => (IconName::ArrowUp, "Move (upload)"),
-            ("download", false) => (IconName::ArrowDown, "Download"),
-            ("download", true) => (IconName::ArrowDown, "Move (download)"),
-            (_, false) => (IconName::ArrowRight, "Copy"),
-            (_, true) => (IconName::ArrowRight, "Move"),
+        let key = id as usize;
+        let icon = match job.direction() {
+            "upload" => IconName::ArrowUp,
+            "download" => IconName::ArrowDown,
+            _ => IconName::ArrowRight,
         };
         let percent = if job.bytes_total > 0 {
             (job.bytes_done as f32 / job.bytes_total as f32) * 100.0
-        } else if job.state == JobState::Done {
-            100.0
         } else {
             0.0
         };
-
-        let mut detail = format!(
-            "{label} · {} → {} · {}/{} file(s) · {} / {}",
-            job.src_site,
-            job.dst_site,
-            job.files_done,
-            job.files_total,
-            human_size(job.bytes_done),
-            human_size(job.bytes_total),
-        );
-        if job.files_skipped > 0 {
-            detail.push_str(&format!(" · {} skipped", job.files_skipped));
-        }
-        if job.state == JobState::Active && job.bps > 0 {
-            detail.push_str(&format!(" · {}/s", human_size(job.bps)));
-            if job.bytes_total > job.bytes_done {
-                let eta = (job.bytes_total - job.bytes_done).div_ceil(job.bps);
-                detail.push_str(&format!(" · ETA {}", human_duration(eta)));
-            }
-        }
-        if job.priority != 0 {
-            detail.push_str(&format!(" · priority {}", job.priority));
-        }
-        if job.state != JobState::Active {
-            detail.push_str(&format!(" · {}", job.state.as_str()));
-        }
+        let (status, tone) = self.status(job, cx);
+        let drill = self.drills.get(&id);
+        let is_expanded = drill.is_some();
+        let failed_open = drill.is_some_and(|drill| drill.failed_only);
+        let local_download = is_local_download(job);
+        let keyboard_row = self.selected_job == Some(id);
 
         let controls = h_flex()
             .gap_1()
             .when(job.files_conflict > 0, |this| {
                 this.child(
-                    Button::new(("resolve", id as usize))
-                        .label(format!("Resolve {} conflict(s)…", job.files_conflict))
+                    Button::new(("resolve", key))
+                        .label(plural("transfers.resolve_conflicts", job.files_conflict))
                         .warning()
                         .xsmall()
-                        .on_click(cx.listener(move |_, _, window, cx| {
-                            open_resolve_dialog(id, window, cx);
-                        })),
+                        .on_click(move |_, window, cx| open_resolve_dialog(id, window, cx)),
                 )
             })
-            .when(
-                job.state == JobState::Active || job.state == JobState::Queued,
-                |this| {
+            .when(local_download, |this| {
+                let open = local_target(job);
+                let shown = open.clone();
+                this.when(can_open_download(job), |this| {
                     this.child(
-                        Button::new(("pause", id as usize))
-                            .label("Pause")
+                        Button::new(("open", key))
+                            .label(t("transfers.open"))
                             .ghost()
                             .xsmall()
-                            .on_click({
-                                let queue = queue.clone();
-                                move |_, _, _| queue.pause(id)
-                            }),
+                            .on_click(move |_, _, _| crate::ui::open_path_or_url(&open.to_string_lossy())),
                     )
-                },
-            )
+                })
+                .child(
+                    Button::new(("reveal", key))
+                        .icon(Icon::new(IconName::FolderOpen))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(reveal_label())
+                        .on_click(move |_, _, _| reveal(&shown)),
+                )
+            })
+            .when(job.state == JobState::Done && job.files_failed > 0, |this| {
+                let queue = queue.clone();
+                this.child(
+                    Button::new(("retry-failed", key))
+                        .label(t("transfers.retry_failed"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, _| queue.retry_failed(id)),
+                )
+            })
+            .when(matches!(job.state, JobState::Failed | JobState::Cancelled), |this| {
+                let queue = queue.clone();
+                this.child(
+                    Button::new(("retry", key))
+                        .label(t("transfers.retry"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, _| queue.retry(id)),
+                )
+            })
+            .when(matches!(job.state, JobState::Active | JobState::Queued), |this| {
+                let queue = queue.clone();
+                this.child(
+                    Button::new(("pause", key))
+                        .label(t("transfers.pause"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, _| queue.pause(id)),
+                )
+            })
             .when(job.state == JobState::Paused, |this| {
+                let queue = queue.clone();
                 this.child(
-                    Button::new(("resume", id as usize))
-                        .label("Resume")
+                    Button::new(("resume", key))
+                        .label(t("transfers.resume"))
                         .ghost()
                         .xsmall()
-                        .on_click({
-                            let queue = queue.clone();
-                            move |_, _, _| queue.resume(id)
-                        }),
+                        .on_click(move |_, _, _| queue.resume(id)),
                 )
             })
-            .when(
-                matches!(job.state, JobState::Failed | JobState::Cancelled),
-                |this| {
-                    this.child(
-                        Button::new(("retry", id as usize))
-                            .label("Retry")
-                            .ghost()
-                            .xsmall()
-                            .on_click({
-                                let queue = queue.clone();
-                                move |_, _, _| queue.retry(id)
-                            }),
-                    )
-                },
-            )
-            .when(!job.state.is_terminal(), |this| {
-                this.child(
-                    Button::new(("cancel", id as usize))
-                        .icon(Icon::new(IconName::CircleX))
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Cancel")
-                        .on_click({
-                            let queue = queue.clone();
-                            move |_, _, _| queue.cancel(id)
-                        }),
-                )
-            })
-            .when(job.state.is_terminal(), |this| {
-                this.child(
-                    Button::new(("remove", id as usize))
-                        .icon(Icon::new(IconName::Close))
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Remove from list")
-                        .on_click({
-                            let queue = queue.clone();
-                            move |_, _, _| queue.remove(id)
-                        }),
-                )
+            .when(job.state != JobState::Cancelling, |this| {
+                let queue = queue.clone();
+                let terminal = job.state.is_terminal();
+                this.child(Button::new(("dismiss", key))
+                    .icon(Icon::new(if terminal { IconName::Close } else { IconName::CircleX }))
+                    .ghost()
+                    .xsmall()
+                    .tooltip(t(if terminal { "transfers.remove" } else { "transfers.cancel" }))
+                    .on_click(move |_, _, _| {
+                        if terminal {
+                            queue.remove(id)
+                        } else {
+                            queue.cancel(id)
+                        }
+                    }))
             });
 
-        let is_expanded = self.expanded.contains(&id);
         let weak = cx.entity().downgrade();
         let menu_job = job.clone();
+        let has_problem = job.error.is_some() || job.files_failed > 0;
 
         v_flex()
-            .id(("job", id as usize))
+            .id(("job", key))
+            .w_full()
             .gap_1()
+            .px_3()
             .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            .context_menu(move |menu, _, cx| {
-                build_job_menu(menu, &menu_job, is_expanded, weak.clone(), cx)
-            })
+            .when(keyboard_row, |this| this.bg(cx.theme().list_active))
+            .context_menu(move |menu, _, cx| build_job_menu(menu, &menu_job, is_expanded, weak.clone(), cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -512,195 +1008,276 @@ impl TransfersPanel {
                     .child(
                         h_flex()
                             .gap_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .child(
-                                Button::new(("expand", id as usize))
-                                    .icon(Icon::new(if is_expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    }))
+                                Button::new(("expand", key))
+                                    .icon(Icon::new(if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight }))
                                     .ghost()
                                     .xsmall()
-                                    .tooltip("Show files")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_expanded(id, cx);
-                                    })),
+                                    .tooltip(t(if is_expanded { "transfers.hide_files" } else { "transfers.show_files" }))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_drill(id, false, cx))),
                             )
-                            .child(Icon::new(icon).small().text_color(
-                                if job.state == JobState::Failed {
-                                    cx.theme().danger
-                                } else {
-                                    cx.theme().muted_foreground
-                                },
-                            ))
-                            .child(div().truncate().text_sm().child(format!(
-                                "/{} → /{}",
-                                job.src, job.dst
-                            ))),
+                            .child(Icon::new(icon).small().text_color(cx.theme().muted_foreground))
+                            .child({
+                                let full: SharedString = format!("/{} → /{}", job.src, job.dst).into();
+                                div()
+                                    .id(("job-title", key))
+                                    .truncate()
+                                    .text_sm()
+                                    .child(format!("{} → {}", short_path(&job.src), short_path(&job.dst)))
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                                    })
+                            }),
                     )
                     .child(controls),
             )
-            .child(Progress::new().value(percent))
+            .when(!job.state.is_terminal(), |this| {
+                this.child(Progress::new(("job-progress", key)).value(percent))
+            })
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(detail),
-            )
-            .when_some(job.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(error),
-                )
-            })
-            .when(is_expanded, |this| this.child(self.render_tasks(job, cx)))
-    }
-
-    /// The unfolded per-file task list of one job.
-    fn render_tasks(&self, job: &JobSnapshot, cx: &Context<Self>) -> impl IntoElement {
-        let tasks = self.tasks.get(&job.id);
-        let shown = tasks.map(|tasks| tasks.len()).unwrap_or(0);
-        let remaining = (job.files_total as usize).saturating_sub(shown);
-        v_flex()
-            .pl_6()
-            .pt_1()
-            .gap_0p5()
-            .when(tasks.is_none(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Loading files…"),
-                )
-            })
-            .children(tasks.into_iter().flatten().map(|task| {
-                let name = task.src.rsplit('/').next().unwrap_or(&task.src).to_string();
-                let progress = match task.total_bytes {
-                    Some(total) if task.state == "active" => {
-                        format!("{} / {}", human_size(task.bytes_done), human_size(total))
-                    }
-                    Some(total) => human_size(total),
-                    None => String::new(),
-                };
                 h_flex()
                     .gap_2()
                     .text_xs()
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .flex_shrink_0()
-                            .text_color(match task.state.as_str() {
-                                "failed" => cx.theme().danger,
-                                "conflict" => cx.theme().warning,
-                                "done" => cx.theme().success,
-                                _ => cx.theme().muted_foreground,
-                            })
-                            .child(task.state.clone()),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(name))
-                    .child(
-                        div()
-                            .text_color(cx.theme().muted_foreground)
-                            .whitespace_nowrap()
-                            .child(progress),
-                    )
-                    .when_some(task.error.clone(), |this, error| {
+                    .child(div().flex_shrink_0().text_color(tone).child(status))
+                    .child(div().min_w_0().truncate().text_color(cx.theme().muted_foreground).child(Self::detail_line(job))),
+            )
+            .when(has_problem, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .text_xs()
+                        .when_some(job.error.clone(), |this, error| {
+                            this.child(div().min_w_0().text_color(tone).child(error))
+                        })
+                        .when(job.files_failed > 0, |this| {
+                            this.child(
+                                Button::new(("failed-files", key))
+                                    .label(t(if failed_open { "transfers.hide_failed" } else { "transfers.show_failed" }))
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_drill(id, true, cx))),
+                            )
+                        }),
+                )
+            })
+            .when_some(drill, |this, drill| this.child(self.render_tasks(job, drill, cx)))
+    }
+
+    /// The unfolded per-file list of one job: loading, failed and empty
+    /// states, the rows, and a "Show more" row when there are more.
+    fn render_tasks(&self, job: &JobSnapshot, drill: &Drill, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = job.id;
+        let key = id as usize;
+        let details = self.details.contains(&id);
+        let muted = cx.theme().muted_foreground;
+        let body = match &drill.tasks {
+            Fetched::Loading => div().text_color(muted).child(t("transfers.files_loading")).into_any_element(),
+            Fetched::Failed(reason) => h_flex()
+                .gap_2()
+                .child(div().text_color(cx.theme().danger).child(tf("transfers.files_failed_load", &[("reason", reason)])))
+                .child(
+                    Button::new(("tasks-retry", key))
+                        .label(t("transfers.retry"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| this.fetch_tasks(id, cx))),
+                )
+                .into_any_element(),
+            Fetched::Ready(tasks) => {
+                let rows: Vec<&TaskSnapshot> = tasks
+                    .iter()
+                    .filter(|task| !drill.failed_only || task.state == "failed")
+                    .collect();
+                let expected = if drill.failed_only { job.files_failed } else { job.files_total };
+                let fetched_all = (tasks.len() as i64) < drill.limit;
+                let remaining = if fetched_all { 0 } else { expected.saturating_sub(rows.len() as u64) };
+                let any_errors = rows.iter().any(|task| task.error.is_some());
+                v_flex()
+                    .gap_0p5()
+                    .when(rows.is_empty(), |this| this.child(div().text_color(muted).child(t("transfers.files_empty"))))
+                    .children(rows.into_iter().map(|task| self.render_task(task, details, cx)))
+                    .when(remaining > 0, |this| {
                         this.child(
-                            div()
-                                .max_w(px(320.))
-                                .truncate()
-                                .text_color(cx.theme().danger)
-                                .child(error),
+                            h_flex()
+                                .gap_2()
+                                .child(div().text_color(muted).child(plural("transfers.more_files", remaining)))
+                                .child(
+                                    Button::new(("tasks-more", key))
+                                        .label(t("transfers.show_more"))
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(move |this, _, _, cx| this.show_more_tasks(id, cx))),
+                                ),
                         )
                     })
-            }))
-            .when(remaining > 0, |this| {
+                    .when(any_errors, |this| {
+                        this.child(
+                            div().child(
+                                Button::new(("details", key))
+                                    .label(t(if details { "transfers.hide_details" } else { "transfers.show_details" }))
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_details(id, cx))),
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
+        };
+        v_flex().pl_6().pt_1().text_xs().child(body)
+    }
+
+    fn render_task(&self, task: &TaskSnapshot, details: bool, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let (state, tone) = match task.state.as_str() {
+            "failed" => (t("transfers.task.failed"), theme.danger),
+            "conflict" => (t("transfers.task.conflict"), theme.warning),
+            "done" => (t("transfers.task.done"), theme.success),
+            "active" => (t("transfers.task.active"), theme.muted_foreground),
+            "paused" => (t("transfers.task.paused"), theme.muted_foreground),
+            "skipped" => (t("transfers.task.skipped"), theme.muted_foreground),
+            "cancelled" => (t("transfers.task.cancelled"), theme.muted_foreground),
+            _ => (t("transfers.task.queued"), theme.muted_foreground),
+        };
+        let size = match task.total_bytes {
+            Some(total) if task.state == "active" => tf(
+                "transfers.bytes_of",
+                &[("done", &human_size(task.bytes_done)), ("total", &human_size(total))],
+            )
+            .to_string(),
+            Some(total) => human_size(total),
+            None => String::new(),
+        };
+        let human = task.error.as_deref().map(humanize_text);
+        v_flex()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(88.)).flex_shrink_0().text_color(tone).child(state))
+                    .child(div().flex_1().min_w_0().truncate().child(file_name(&task.src).to_string()))
+                    .child(div().text_color(theme.muted_foreground).whitespace_nowrap().child(size))
+                    .when_some(human.as_ref().map(|human| human.title.clone()), |this, reason| {
+                        this.child(div().max_w(px(320.)).truncate().text_color(tone).child(reason))
+                    }),
+            )
+            .when_some(human.filter(|_| details), |this, human| {
                 this.child(
                     div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("…and {remaining} more")),
+                        .pl(px(96.))
+                        .text_color(theme.muted_foreground)
+                        .font_family("monospace")
+                        .child(human.details),
                 )
             })
     }
 
-    fn render_history(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_history_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Fetched::Ready(entries) = &self.history else {
+            return div().into_any_element();
+        };
+        let Some(entry) = entries.get(ix) else {
+            return div()
+                .px_3()
+                .py_2()
+                .child(
+                    Button::new("history-more")
+                        .label(t("transfers.load_more"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history_limit += PAGE;
+                            this.fetch_history(cx);
+                        })),
+                )
+                .into_any_element();
+        };
+        let theme = cx.theme();
+        let (outcome, tone) = match entry.outcome.as_str() {
+            "done" if entry.files_failed > 0 => (
+                tf("transfers.state.done_failed", &[("count", &entry.files_failed.to_string())]),
+                theme.warning,
+            ),
+            "done" => (t("transfers.state.done"), theme.success),
+            "failed" => (t("transfers.state.failed"), theme.danger),
+            _ => (t("transfers.state.cancelled"), theme.muted_foreground),
+        };
+        let mut parts = vec![
+            history_time(&entry.finished_at),
+            format!("{} → {}", entry.src_site, entry.dst_site),
+            plural("transfers.files", entry.files.max(0) as u64).to_string(),
+            human_size(entry.bytes),
+        ];
+        if let Some(ms) = entry.duration_ms {
+            parts.push(human_duration((ms / 1000).max(0) as u64));
+        }
         v_flex()
-            .id("history-scroll")
-            .flex_1()
-            .min_h_0()
+            .w_full()
+            .gap_0p5()
             .px_3()
-            .overflow_y_scroll()
-            .when(self.history.is_empty(), |this| {
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().flex_shrink_0().text_color(tone).child(outcome))
+                    .child(div().min_w_0().truncate().child(format!("/{} → /{}", entry.src, entry.dst))),
+            )
+            .child(div().text_xs().text_color(theme.muted_foreground).child(parts.join(" · ")))
+            .when_some(entry.error.clone(), |this, error| {
+                this.child(div().text_xs().text_color(tone).child(error))
+            })
+            .into_any_element()
+    }
+
+    /// A centered one-line state (loading, empty, failed) for a whole tab.
+    fn render_placeholder(&self, text: SharedString, retry: bool, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .py_8()
+            .gap_2()
+            .items_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
+            .when(retry, |this| {
                 this.child(
-                    div()
-                        .py_8()
-                        .text_center()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No finished transfers yet."),
+                    Button::new("history-retry")
+                        .label(t("transfers.retry"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| this.fetch_history(cx))),
                 )
             })
-            .children(self.history.iter().map(|entry| {
-                let outcome_color = match entry.outcome.as_str() {
-                    "done" => cx.theme().success,
-                    "failed" => cx.theme().danger,
-                    _ => cx.theme().muted_foreground,
-                };
-                let mut detail = format!(
-                    "{} · {} → {} · {} file(s) · {}",
-                    entry.finished_at,
-                    entry.src_site,
-                    entry.dst_site,
-                    entry.files,
-                    human_size(entry.bytes),
-                );
-                if let Some(ms) = entry.duration_ms {
-                    detail.push_str(&format!(" · {}", human_duration((ms / 1000) as u64)));
-                }
-                v_flex()
-                    .gap_0p5()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(72.))
-                                    .flex_shrink_0()
-                                    .text_sm()
-                                    .text_color(outcome_color)
-                                    .child(entry.outcome.clone()),
-                            )
-                            .child(div().truncate().text_sm().child(format!(
-                                "/{} → /{}",
-                                entry.src, entry.dst
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(detail),
-                    )
-                    .when_some(entry.error.clone(), |this, error| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().danger)
-                                .child(error),
-                        )
-                    })
-            }))
+            .into_any_element()
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
+        match &self.history {
+            Fetched::Loading => self.render_placeholder(t("transfers.history_loading"), false, cx),
+            Fetched::Failed(reason) => self.render_placeholder(
+                tf("transfers.history_failed", &[("reason", reason)]),
+                true,
+                cx,
+            ),
+            Fetched::Ready(entries) if entries.is_empty() => {
+                self.render_placeholder(t("transfers.history_empty"), false, cx)
+            }
+            Fetched::Ready(_) => list(
+                self.history_list.clone(),
+                cx.processor(|this, ix: usize, _, cx| this.render_history_row(ix, cx)),
+            )
+            .flex_1()
+            .size_full()
+            .into_any_element(),
+        }
     }
 }
 
-/// Right-click menu on one job row.
+/// Right-click menu on one job row, most frequent actions first.
 fn build_job_menu(
     menu: gpui_component::menu::PopupMenu,
     job: &JobSnapshot,
@@ -713,66 +1290,60 @@ fn build_job_menu(
     let mut menu = menu;
 
     if job.files_conflict > 0 {
-        let panel = panel.clone();
         menu = menu.item(
-            PopupMenuItem::new(format!("Resolve {} Conflict(s)…", job.files_conflict)).on_click(
-                move |_, window, cx| {
-                    panel
-                        .update(cx, |_, cx| open_resolve_dialog(id, window, cx))
-                        .ok();
-                },
-            ),
+            PopupMenuItem::new(plural("transfers.resolve_conflicts", job.files_conflict))
+                .on_click(move |_, window, cx| open_resolve_dialog(id, window, cx)),
         );
     }
-    if matches!(job.state, JobState::Active | JobState::Queued) {
-        let queue = queue.clone();
-        menu = menu.item(PopupMenuItem::new("Pause").on_click(move |_, _, _| queue.pause(id)));
+    if is_local_download(job) {
+        let open = local_target(job);
+        let shown = open.clone();
+        if can_open_download(job) {
+            menu = menu.item(
+                PopupMenuItem::new(t("transfers.open"))
+                    .on_click(move |_, _, _| crate::ui::open_path_or_url(&open.to_string_lossy())),
+            );
+        }
+        menu = menu.item(PopupMenuItem::new(reveal_label()).on_click(move |_, _, _| reveal(&shown)));
     }
-    if job.state == JobState::Paused {
+    if job.state == JobState::Done {
+        let panel = panel.clone();
+        let request = TransfersRequest::ShowInPane {
+            site_id: job.dst_site_id,
+            dir: job.dst.clone(),
+        };
+        menu = menu.item(PopupMenuItem::new(t("transfers.show_in_pane")).on_click(move |_, _, cx| {
+            panel.update(cx, |_, cx| cx.emit(request.clone())).ok();
+        }));
+    }
+    if job.state == JobState::Done && job.files_failed > 0 {
         let queue = queue.clone();
-        menu = menu.item(PopupMenuItem::new("Resume").on_click(move |_, _, _| queue.resume(id)));
+        menu = menu.item(PopupMenuItem::new(t("transfers.retry_failed")).on_click(move |_, _, _| queue.retry_failed(id)));
     }
     if matches!(job.state, JobState::Failed | JobState::Cancelled) {
         let queue = queue.clone();
-        menu = menu.item(PopupMenuItem::new("Retry").on_click(move |_, _, _| queue.retry(id)));
+        menu = menu.item(PopupMenuItem::new(t("transfers.retry")).on_click(move |_, _, _| queue.retry(id)));
     }
-    if !job.state.is_terminal() {
+    if matches!(job.state, JobState::Active | JobState::Queued) {
         let queue = queue.clone();
-        menu = menu.item(PopupMenuItem::new("Cancel").on_click(move |_, _, _| queue.cancel(id)));
+        menu = menu.item(PopupMenuItem::new(t("transfers.pause")).on_click(move |_, _, _| queue.pause(id)));
     }
-
-    menu = menu.separator();
-    {
-        let panel = panel.clone();
-        let label = if is_expanded { "Hide Files" } else { "Show Files" };
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-            panel
-                .update(cx, |this, cx| this.toggle_expanded(id, cx))
-                .ok();
-        }));
+    if job.state == JobState::Paused {
+        let queue = queue.clone();
+        menu = menu.item(PopupMenuItem::new(t("transfers.resume")).on_click(move |_, _, _| queue.resume(id)));
     }
-    if !job.state.is_terminal() {
-        let top = cx
-            .global::<AppState>()
-            .queue
-            .latest()
-            .jobs
-            .iter()
-            .map(|job| job.priority)
-            .max()
-            .unwrap_or(0);
-        {
-            let queue = queue.clone();
-            menu = menu.item(
-                PopupMenuItem::new("Run First")
-                    .disabled(job.priority > top || (job.priority == top && top != 0))
-                    .on_click(move |_, _, _| queue.set_priority(id, top + 1)),
-            );
-        }
+    if !job.state.is_terminal() && job.state != JobState::Cancelling {
+        let top = queue.latest().jobs.iter().map(|job| job.priority).max().unwrap_or(0);
+        let first = queue.clone();
+        menu = menu.item(
+            PopupMenuItem::new(t("transfers.run_first"))
+                .disabled(job.priority > top || (job.priority == top && top != 0))
+                .on_click(move |_, _, _| first.set_priority(id, top + 1)),
+        );
         if job.priority != 0 {
             let queue = queue.clone();
             menu = menu.item(
-                PopupMenuItem::new("Reset Priority")
+                PopupMenuItem::new(t("transfers.reset_priority"))
                     .on_click(move |_, _, _| queue.set_priority(id, 0)),
             );
         }
@@ -780,48 +1351,56 @@ fn build_job_menu(
 
     menu = menu.separator();
     {
-        let src = format!("/{}", job.src);
-        menu = menu.item(PopupMenuItem::new("Copy Source Path").on_click(move |_, _, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(src.clone()));
+        let panel = panel.clone();
+        let label = t(if is_expanded { "transfers.hide_files" } else { "transfers.show_files" });
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            panel.update(cx, |this, cx| this.toggle_drill(id, false, cx)).ok();
         }));
     }
     {
-        let dst = format!("/{}", job.dst);
-        menu = menu.item(
-            PopupMenuItem::new("Copy Destination Path").on_click(move |_, _, cx| {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(dst.clone()));
-            }),
-        );
+        let path = format!("/{}", job.dst);
+        menu = menu.item(PopupMenuItem::new(t("transfers.copy_destination")).on_click(move |_, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+        }));
     }
 
-    if job.state.is_terminal() {
-        let queue = queue.clone();
-        menu = menu.separator().item(
-            PopupMenuItem::new("Remove from List").on_click(move |_, _, _| queue.remove(id)),
-        );
+    menu = menu.separator();
+    let queue = queue.clone();
+    if job.state == JobState::Cancelling {
+        menu
+    } else if job.state.is_terminal() {
+        menu.item(PopupMenuItem::new(t("transfers.remove")).on_click(move |_, _, _| queue.remove(id)))
+    } else {
+        menu.item(PopupMenuItem::new(t("transfers.cancel")).on_click(move |_, _, _| queue.cancel(id)))
     }
-    menu
 }
 
 impl Render for TransfersPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let jobs = self.snapshot.jobs.clone();
+        let jobs = &self.snapshot.jobs;
         let has_finished = jobs.iter().any(|j| j.state.is_terminal());
-        let any_pausable = jobs
-            .iter()
-            .any(|j| matches!(j.state, JobState::Active | JobState::Queued));
+        let any_pausable = jobs.iter().any(|j| matches!(j.state, JobState::Active | JobState::Queued));
         let any_paused = jobs.iter().any(|j| j.state == JobState::Paused);
+        let no_jobs = jobs.is_empty();
         let queue = cx.global::<AppState>().queue.clone();
         let stats = self.stats();
+        let live = !self.show_history;
 
         v_flex()
             .size_full()
             .overflow_hidden()
-            // Match the sidebar so the docked panels read as one surface.
             .bg(cx.theme().sidebar)
+            .key_context("TransfersPanel")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next_job))
+            .on_action(cx.listener(Self::select_prev_job))
+            .on_action(cx.listener(Self::toggle_job_files))
+            .on_action(cx.listener(Self::pause_resume_job))
+            .on_action(cx.listener(Self::retry_job))
+            .on_action(cx.listener(Self::resolve_job_conflicts))
+            .on_action(cx.listener(Self::cancel_job))
+            .on_action(cx.listener(Self::return_to_pane))
             .child(
-                // Panel toolbar: identity + close live in the dock's tab strip
-                // above; this row carries only the queue's actions.
                 h_flex()
                     .px_3()
                     .py_1()
@@ -829,31 +1408,31 @@ impl Render for TransfersPanel {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().flex_1())
-                    .when(!self.show_history && any_pausable, |this| {
+                    .when(live && any_pausable, |this| {
                         let queue = queue.clone();
                         this.child(
                             Button::new("pause-all")
-                                .label("Pause all")
+                                .label(t("transfers.pause_all"))
                                 .ghost()
                                 .xsmall()
                                 .on_click(move |_, _, _| queue.pause_all()),
                         )
                     })
-                    .when(!self.show_history && any_paused, |this| {
+                    .when(live && any_paused, |this| {
                         let queue = queue.clone();
                         this.child(
                             Button::new("resume-all")
-                                .label("Resume all")
+                                .label(t("transfers.resume_all"))
                                 .ghost()
                                 .xsmall()
                                 .on_click(move |_, _, _| queue.resume_all()),
                         )
                     })
-                    .when(!self.show_history && has_finished, |this| {
+                    .when(live && has_finished, |this| {
                         let queue = queue.clone();
                         this.child(
                             Button::new("clear-finished")
-                                .label("Clear finished")
+                                .label(t("transfers.clear_finished"))
                                 .ghost()
                                 .xsmall()
                                 .on_click(move |_, _, _| queue.clear_finished()),
@@ -861,32 +1440,24 @@ impl Render for TransfersPanel {
                     })
                     .child(
                         Button::new("toggle-history")
-                            .label(if self.show_history { "Queue" } else { "History" })
+                            .label(t(if self.show_history { "transfers.queue" } else { "transfers.history" }))
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
                     ),
             )
             .child(if self.show_history {
-                self.render_history(cx).into_any_element()
-            } else if jobs.is_empty() {
-                div()
-                    .flex_1()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("No transfers yet — drop files onto a pane to get started.")
-                    .into_any_element()
+                self.render_history(cx)
+            } else if no_jobs {
+                self.render_placeholder(t("transfers.empty"), false, cx)
             } else {
-                v_flex()
-                    .id("transfers-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .px_3()
-                    .overflow_y_scroll()
-                    .children(jobs.iter().map(|job| self.render_job(job, cx)))
-                    .into_any_element()
+                list(
+                    self.jobs_list.clone(),
+                    cx.processor(|this, ix: usize, _, cx| this.render_job_at(ix, cx)),
+                )
+                .flex_1()
+                .size_full()
+                .into_any_element()
             })
             .when_some(stats, |this, stats| {
                 this.child(
@@ -896,18 +1467,36 @@ impl Render for TransfersPanel {
                         .gap_3()
                         .border_t_1()
                         .border_color(cx.theme().border)
-                        .child(
-                            div()
-                                .w(px(160.))
-                                .child(Progress::new().value(stats.percent())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(stats.summary()),
-                        ),
+                        .child(div().w(px(160.)).child(Progress::new("queue-progress").value(stats.percent())))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(stats.summary())),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eta_is_hidden_when_unknown_or_absurd() {
+        assert_eq!(eta_secs(0, 0, 100), None);
+        assert_eq!(eta_secs(10, 100, 100), None);
+        assert_eq!(eta_secs(1, 0, 1 << 40), None);
+        assert_eq!(eta_secs(10, 0, 95), Some(10));
+    }
+
+    #[test]
+    fn eta_and_plurals_read_plainly() {
+        crate::i18n::init("en");
+        assert_eq!(eta_text(20), "less than a minute left");
+        assert_eq!(eta_text(170), "about 3 min left");
+        assert_eq!(eta_text(7200), "about 2 h left");
+        assert_eq!(eta_text(7500), "about 2 h 5 min left");
+        assert_eq!(plural("transfers.files", 1), "1 file");
+        assert_eq!(plural("transfers.files", 3), "3 files");
+        let mb = 1024 * 1024;
+        assert_eq!(rate_text(4 * mb, 0, 4 * mb * 180), "4.0 MB/s, about 3 min left");
+        assert_eq!(rate_text(4 * mb, 0, 0), "4.0 MB/s");
     }
 }

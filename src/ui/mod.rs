@@ -1,5 +1,6 @@
 pub mod bookmarks;
 pub mod command_bar;
+pub mod connect;
 pub mod file_icons;
 pub mod file_pane;
 pub mod logs;

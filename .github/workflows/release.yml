@@ -1,9 +1,9 @@
 name: Release
 
 # CalVer releases: scripts/release.sh tags main as vYY.M.D (e.g. v26.7.10),
-# this workflow builds and signs each platform's artifact, then publishes them
-# in one GitHub release together with the per-platform manifests the in-app
-# update checker reads (latest.json on macOS, latest-windows.json on Windows).
+# this workflow builds and signs the macOS artifact, then publishes it in a
+# GitHub release together with the latest.json manifest the in-app update
+# checker reads.
 on:
   push:
     tags:
@@ -57,6 +57,7 @@ jobs:
       - name: Bundle, sign, notarize, package
         env:
           KESSEL_BIN: target/universal/kessel
+          KESSEL_REQUIRE_SIGNING: "1"
           KESSEL_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -89,55 +90,9 @@ jobs:
             target/dist/latest.json
           if-no-files-found: error
 
-  windows:
-    name: Build Windows release
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Unset both when no certificate is configured, so the packaging script
-      # takes its unsigned path with a warning instead of failing.
-      - name: Build, sign and package
-        shell: pwsh
-        env:
-          KESSEL_WIN_CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
-          KESSEL_WIN_CERT: ${{ secrets.WINDOWS_CERT_PATH }}
-          KESSEL_WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-        run: scripts/package-windows.ps1
-
-      - name: Write update manifest
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          $exe = "kessel-$version-x86_64.exe"
-          $sha = Get-Content "target/dist/$exe.sha256"
-          $manifest = [ordered]@{
-            version  = $version
-            tag      = $env:GITHUB_REF_NAME
-            url      = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$exe"
-            sha256   = $sha
-            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-          }
-          $manifest | ConvertTo-Json | Set-Content target/dist/latest-windows.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: |
-            target/dist/kessel-*-x86_64.exe
-            target/dist/kessel-*-x86_64.exe.sha256
-            target/dist/kessel-*-x86_64.zip
-            target/dist/kessel-*-x86_64.zip.sha256
-            target/dist/latest-windows.json
-          if-no-files-found: error
-
   publish:
     name: Publish the GitHub release
-    needs: [macos, windows]
+    needs: [macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -68,6 +68,7 @@ enum SettingId {
     Verify,
     PreserveTimestamps,
     SkipHidden,
+    ConflictPolicy,
     LogFilter,
 }
 
@@ -161,6 +162,12 @@ const SETTINGS: &[Setting] = &[
         desc: "prefs.skip_hidden.desc",
     },
     Setting {
+        id: SettingId::ConflictPolicy,
+        category: Category::Transfers,
+        name: "prefs.conflict_policy",
+        desc: "prefs.conflict_policy.desc",
+    },
+    Setting {
         id: SettingId::LogFilter,
         category: Category::Advanced,
         name: "prefs.log_filter",
@@ -216,6 +223,7 @@ pub struct PreferencesPanel {
     icon_theme: Choice,
     locale: Choice,
     sidebar: Choice,
+    conflict_policy: Choice,
     parallel: Entity<SliderState>,
     bandwidth: Entity<SliderState>,
     retries: Entity<InputState>,
@@ -356,6 +364,27 @@ impl PreferencesPanel {
         )
         .detach();
 
+        let conflict_policy = Choice::new(
+            &[
+                ("ask".into(), t("prefs.conflict_policy.ask")),
+                ("replace".into(), t("transfers.conflict.replace")),
+                ("skip".into(), t("transfers.conflict.skip")),
+                ("keep_both".into(), t("transfers.conflict.keep_both")),
+                ("replace_if_newer".into(), t("transfers.conflict.replace_newer")),
+            ],
+            cfg.transfers.default_conflict_policy.as_str(),
+            window,
+            cx,
+        );
+        cx.subscribe_in(
+            &conflict_policy.select,
+            window,
+            |this, _, _: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                this.save_choice("transfers", "default_conflict_policy", &this.conflict_policy, cx);
+            },
+        )
+        .detach();
+
         let parallel = cx.new(|_| {
             SliderState::new()
                 .min(1.)
@@ -364,7 +393,7 @@ impl PreferencesPanel {
                 .default_value(cfg.transfers.max_parallel as f32)
         });
         cx.subscribe(&parallel, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             save(
                 cx,
                 "transfers",
@@ -384,7 +413,7 @@ impl PreferencesPanel {
                 .default_value(cfg.transfers.bandwidth_limit as f32 / MB)
         });
         cx.subscribe(&bandwidth, |_, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             save(
                 cx,
                 "transfers",
@@ -433,6 +462,7 @@ impl PreferencesPanel {
             icon_theme,
             locale,
             sidebar,
+            conflict_policy,
             parallel,
             bandwidth,
             retries,
@@ -509,6 +539,9 @@ impl PreferencesPanel {
                 "transfers",
                 "skip_hidden",
             ),
+            SettingId::ConflictPolicy => {
+                Select::new(&self.conflict_policy.select).small().into_any_element()
+            }
             SettingId::LogFilter => Input::new(&self.log_filter).small().into_any_element(),
         }
     }

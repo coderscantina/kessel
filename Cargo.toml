@@ -8,9 +8,19 @@ homepage = "https://www.coderscantina.com"
 license = "MIT"
 
 [dependencies]
-# GUI — both published on crates.io; gpui-component 0.5 depends on gpui ^0.2.2
-gpui = "0.2"
-gpui-component = "0.5"
+# GUI — both published on crates.io. gpui-component 0.6 pins `gpui-pre` (a
+# crates.io snapshot of zed's gpui newer than the 0.2 release), so kessel
+# imports the same crate under the `gpui` name to keep one gpui in the tree.
+gpui = { package = "gpui-pre", version = "0.3.6" }
+gpui-component = "0.6"
+# The native platform backends moved out of gpui into gpui_platform; its
+# `application()` picks the right one for the target. Features mirror the
+# defaults gpui itself had before the split.
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.6", features = [
+  "font-kit",
+  "wayland",
+  "x11",
+] }
 
 # Async runtime (OpenDAL + sqlx are async). gpui has its own executor; kessel
 # owns a dedicated tokio runtime (held in AppState) for all I/O work.
@@ -37,7 +47,6 @@ opendal = { version = "0.58", features = [
   "services-gdrive",
   "services-dropbox",
   "services-onedrive",
-  "layers-throttle",
   "layers-tracing",
 ] }
 
@@ -56,6 +65,12 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 # `http` request parts are what reqsign 0.20 signs; same major as reqwest/reqsign use.
 http = "1"
+
+# FTP rename side channel (OpenDAL's FTP service has no rename). Same client
+# and TLS stack the service itself builds on, so nothing new is compiled.
+suppaftp = { version = "8", default-features = false, features = ["async-std-rustls-ring"] }
+futures-rustls = "0.26"
+rustls-native-certs = "0.8"
 
 # Local state
 sqlx = { version = "0.9", features = [
@@ -82,6 +97,9 @@ futures = "0.3"
 # set mtime, so the fs backend gets a native escape hatch.
 filetime = "0.2"
 
+# Local deletes from the file pane go to the OS trash / Recycle Bin.
+trash = "5.3"
+
 # Secrets — OS keychain only, never SQLite. keyring 4's default `v1` feature
 # wires up each platform's native store (macOS Keychain, Windows Credential
 # Manager, Linux Secret Service) with the right backend sub-features.
@@ -96,6 +114,7 @@ sha1 = "0.10"
 base64 = "0.22"
 rand = "0.10"
 url = "2"
+quick-xml = "0.41"
 
 # Zed theme / icon-theme extension downloads: the Zed API serves each
 # extension as a gzipped tar, which the theme browser unpacks into
@@ -159,13 +178,15 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["block2"] }
 block2 = "0.6"
+# renamex_np, to swap the app bundle atomically during an update.
+libc = "0.2"
 
 # Win32 bindings for the native drag-out session (an OLE data object over the
 # shell's file-promise protocol). Same major gpui already builds against, so
 # feature unification adds no compile weight — only the Com_Marshal module is
 # new here.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Storage_FileSystem",
@@ -181,7 +202,7 @@ windows = { version = "0.61", features = [
 ] }
 # `#[implement]` expands to `::windows_core::…` paths, so the COM data object
 # needs windows-core named directly (gpui pins the same version).
-windows-core = "0.61"
+windows-core = "0.62"
 
 # Windows resource section: the app icon Explorer and the taskbar show, plus
 # the version/company strings the file properties dialog reads. Compiled into
@@ -201,3 +222,8 @@ opt-level = 3
 # With the macOS 27 toolchain its output is rejected by dyld ("mis-aligned
 # LINKEDIT string pool"), so leave build-time artifacts unstripped.
 strip = false
+
+# OpenDAL 0.58 hands `host:port` to TLS as the server name, which rustls rejects,
+# so every FTPS connection fails. Drop this patch once upstream passes the host.
+[patch.crates-io]
+opendal-service-ftp = { path = "patches/opendal-service-ftp" }

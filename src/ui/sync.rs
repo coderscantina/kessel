@@ -1,21 +1,21 @@
-//! The Synchronize dialog: pick direction and mode, review the planned
-//! actions, then hand the copies to the transfer queue (and, in mirror mode,
-//! delete extraneous destination entries).
+//! The Synchronize dialog: pick direction and mode, review every planned
+//! action (per row and per kind), then run the selection: one queue job for
+//! the copies and, in mirror mode, deletes once that job succeeded.
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, Context, Entity, SharedString, Window};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui::{div, px, uniform_list, AnyElement, Context, Entity, Hsla, SharedString, Window};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
-    StyledExt as _, WindowExt as _,
+    StyledExt as _, Theme, WindowExt as _,
 };
 
 use crate::app::AppState;
 use crate::i18n::{t, tf};
 use crate::provider::{Provider, SiteProfile};
-use crate::queue::{ConflictPolicy, NewJob};
-use crate::sync::{dst_dir_for, plan, PlanKind, SyncMode, SyncPlan};
+use crate::sync::{plan, PlanKind, SyncMode, SyncPlan, SyncReport, SyncWork};
 use crate::ui::human_size;
 
 /// One side of the comparison, captured from a pane when the dialog opens.
@@ -29,8 +29,74 @@ pub struct SyncSide {
 enum State {
     Idle,
     Planning,
-    Planned(SyncPlan),
+    Planned(Review),
     Error(SharedString),
+}
+
+/// A computed plan, the sides it was computed for, and which items the user
+/// keeps (parallel to `plan.items`).
+struct Review {
+    plan: SyncPlan,
+    selected: Vec<bool>,
+    src: SyncSide,
+    dst: SyncSide,
+    /// Start was pressed with deletions ticked; waiting for the user to
+    /// confirm them.
+    confirming_deletes: bool,
+}
+
+impl Review {
+    fn new(plan: SyncPlan, src: SyncSide, dst: SyncSide) -> Self {
+        let selected = plan
+            .items
+            .iter()
+            .map(|item| item.kind.selected_by_default())
+            .collect();
+        Self {
+            plan,
+            selected,
+            src,
+            dst,
+            confirming_deletes: false,
+        }
+    }
+
+    /// (selected, total) items of one kind.
+    fn tally(&self, kind: PlanKind) -> (usize, usize) {
+        self.plan
+            .items
+            .iter()
+            .zip(&self.selected)
+            .filter(|(item, _)| item.kind == kind)
+            .fold((0, 0), |(on, total), (_, selected)| (on + usize::from(*selected), total + 1))
+    }
+
+    fn selected_deletes(&self) -> usize {
+        self.tally(PlanKind::Delete).0
+    }
+
+    fn set_kind(&mut self, kind: PlanKind, on: bool) {
+        for (item, selected) in self.plan.items.iter().zip(&mut self.selected) {
+            if item.kind == kind {
+                *selected = on;
+            }
+        }
+    }
+
+    /// Bytes the selected copies will transfer.
+    fn selected_bytes(&self) -> u64 {
+        self.plan
+            .items
+            .iter()
+            .zip(&self.selected)
+            .filter(|(item, on)| **on && item.kind != PlanKind::Delete && !item.is_dir)
+            .map(|(item, _)| item.size)
+            .sum()
+    }
+
+    fn any_selected(&self) -> bool {
+        self.selected.iter().any(|on| *on)
+    }
 }
 
 type StringSelect = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -127,10 +193,12 @@ impl SyncDialog {
 
         let state = cx.global::<AppState>();
         let defaults = state.config.layers.clone();
+        let (src_profile, dst_profile) = (src.profile.clone(), dst.profile.clone());
+        let (src_dir, dst_dir) = (src.dir.clone(), dst.dir.clone());
         let task = state.runtime.spawn(async move {
-            let src_provider = Provider::connect(&src.profile, &defaults)?;
-            let dst_provider = Provider::connect(&dst.profile, &defaults)?;
-            plan(&src_provider, &src.dir, &dst_provider, &dst.dir, mode).await
+            let src_provider = Provider::connect(&src_profile, &defaults)?;
+            let dst_provider = Provider::connect(&dst_profile, &defaults)?;
+            plan(&src_provider, &src_dir, &dst_provider, &dst_dir, mode).await
         });
         cx.spawn(async move |this, cx| {
             let result = match task.await {
@@ -142,8 +210,11 @@ impl SyncDialog {
                     return; // superseded by a newer Analyze / settings change
                 }
                 this.state = match result {
-                    Ok(plan) => State::Planned(plan),
-                    Err(error) => State::Error(format!("{error:#}").into()),
+                    Ok(plan) => State::Planned(Review::new(plan, src, dst)),
+                    Err(error) => {
+                        tracing::error!(error = %format!("{error:#}"), "sync planning failed");
+                        State::Error(crate::errors::humanize(&error).title.into())
+                    }
                 };
                 cx.notify();
             })
@@ -152,163 +223,264 @@ impl SyncDialog {
         .detach();
     }
 
-    /// Enqueue the plan's copies on the transfer queue and run its deletes on
-    /// the runtime. Returns how many transfers were queued.
-    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let State::Planned(sync_plan) = &self.state else {
-            return;
-        };
-        let sync_plan = sync_plan.clone();
-        let (src, dst) = self.oriented(cx);
-        let state = cx.global::<AppState>();
-        let queue = state.queue.clone();
-
-        let mut queued = 0usize;
-        let mut deletes: Vec<(String, bool)> = Vec::new();
-        let mut empty_dirs: Vec<String> = Vec::new();
-        for item in &sync_plan.items {
-            match item.kind {
-                PlanKind::Copy | PlanKind::Update if item.is_dir => {
-                    empty_dirs.push(format!("{}{}", dst.dir, item.rel));
-                }
-                PlanKind::Copy | PlanKind::Update => {
-                    queue.enqueue(NewJob {
-                        src_site_id: src.profile.id,
-                        dst_site_id: dst.profile.id,
-                        src: format!("{}{}", src.dir, item.rel),
-                        dst_dir: dst_dir_for(&dst.dir, &item.rel),
-                        dst_name: None,
-                        conflict_policy: ConflictPolicy::Overwrite,
-                        move_source: false,
-                    });
-                    queued += 1;
-                }
-                PlanKind::Delete => {
-                    deletes.push((format!("{}{}", dst.dir, item.rel), item.is_dir));
-                }
+    /// Start the selection, first asking for confirmation when it deletes.
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let State::Planned(review) = &mut self.state {
+            if review.selected_deletes() > 0 && !review.confirming_deletes {
+                review.confirming_deletes = true;
+                cx.notify();
+                return;
             }
         }
-
-        if !deletes.is_empty() || !empty_dirs.is_empty() {
-            let defaults = state.config.layers.clone();
-            let dst_profile = dst.profile.clone();
-            state.runtime.spawn(async move {
-                let provider = match Provider::connect(&dst_profile, &defaults) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        tracing::error!(%error, "sync: connecting for deletes failed");
-                        return;
-                    }
-                };
-                for dir in empty_dirs {
-                    if let Err(error) = provider.create_dir(&dir).await {
-                        tracing::warn!(%error, dir, "sync: creating directory failed");
-                    }
-                }
-                let mut deleted = 0usize;
-                for (path, is_dir) in deletes {
-                    match provider.delete(&path, is_dir).await {
-                        Ok(()) => deleted += 1,
-                        Err(error) => tracing::error!(%error, path, "sync: delete failed"),
-                    }
-                }
-                tracing::info!(deleted, "sync: extraneous entries removed");
-            });
-        }
-
-        if queued > 0 {
-            window.push_notification(
-                tf("sync.queued", &[("count", &queued.to_string())]).to_string(),
-                cx,
-            );
-        }
-        gpui_component::WindowExt::close_dialog(window, cx);
+        self.apply(window, cx);
     }
 
-    fn render_plan(&self, sync_plan: &SyncPlan, cx: &Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        if sync_plan.is_empty() {
-            return div()
+    /// Run the reviewed selection in the background and report the outcome
+    /// as a notification once the copies settled and deletes ran.
+    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let State::Planned(review) = &self.state else {
+            return;
+        };
+        let work = SyncWork::from_plan(&review.plan, &review.selected, &review.src.dir, &review.dst.dir);
+        let src_site_id = review.src.profile.id;
+        let dst_profile = review.dst.profile.clone();
+        let src_label = side_name(&review.src);
+        let dst_label = side_name(&review.dst);
+        let files = work.copies.len();
+
+        let state = cx.global::<AppState>();
+        let queue = state.queue.clone();
+        let defaults = state.config.layers.clone();
+        let task = state.runtime.spawn(async move {
+            let dst = Provider::connect(&dst_profile, &defaults)?;
+            anyhow::Ok(crate::sync::run(&queue, src_site_id, &dst, src_label, dst_label, work).await)
+        });
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let message = match task.await {
+                Ok(Ok(report)) => report_message(&report),
+                Ok(Err(error)) => tf(
+                    "sync.report.failed",
+                    &[("reason", &crate::errors::humanize(&error).title)],
+                )
+                .to_string(),
+                Err(join_error) => format!("{join_error}"),
+            };
+            cx.update_window(handle, |_, window, cx| window.push_notification(message, cx))
+                .ok();
+        })
+        .detach();
+
+        if files > 0 {
+            window.push_notification(tf("sync.started", &[("count", &files.to_string())]).to_string(), cx);
+        }
+        window.close_dialog(cx);
+    }
+
+    fn render_review(&self, review: &Review, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        if review.plan.is_empty() {
+            return h_flex()
+                .gap_2()
+                .items_center()
                 .text_sm()
-                .text_color(cx.theme().success)
+                .child(Icon::new(IconName::Check).small().text_color(theme.success))
                 .child(t("sync.in_sync"))
                 .into_any_element();
         }
-        let (copies, updates, deletes) = sync_plan.counts();
-        let summary = tf(
-            "sync.plan.summary",
-            &[
-                ("copies", &copies.to_string()),
-                ("updates", &updates.to_string()),
-                ("deletes", &deletes.to_string()),
-                ("bytes", &human_size(sync_plan.transfer_bytes())),
-            ],
-        );
+        if review.confirming_deletes {
+            return div()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(tf(
+                    "sync.confirm.body",
+                    &[
+                        ("count", &review.selected_deletes().to_string()),
+                        ("site", &side_name(&review.dst)),
+                    ],
+                ))
+                .into_any_element();
+        }
 
-        const MAX_ROWS: usize = 400;
-        let rows: Vec<AnyElement> = sync_plan
-            .items
-            .iter()
-            .take(MAX_ROWS)
-            .enumerate()
-            .map(|(ix, item)| {
-                let (tag, color) = match item.kind {
-                    PlanKind::Copy => (t("sync.plan.copy"), cx.theme().success),
-                    PlanKind::Update => (t("sync.plan.update"), cx.theme().warning),
-                    PlanKind::Delete => (t("sync.plan.delete"), cx.theme().danger),
-                };
+        let kinds = PlanKind::ALL.into_iter().filter_map(|kind| {
+            let (on, total) = review.tally(kind);
+            (total > 0).then(|| {
+                let color = kind_color(kind, theme);
                 h_flex()
-                    .id(("sync-row", ix))
                     .gap_2()
-                    .px_1()
-                    .text_xs()
+                    .items_center()
+                    .text_sm()
+                    .child(
+                        Checkbox::new(("sync-kind", kind as usize))
+                            .checked(on == total)
+                            .disabled(matches!(kind, PlanKind::Conflict | PlanKind::UnsafePath))
+                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                if let State::Planned(review) = &mut this.state {
+                                    review.set_kind(kind, *checked);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(div().flex_1().text_color(color).child(kind_label(kind)))
                     .child(
                         div()
-                            .w(px(64.))
-                            .flex_shrink_0()
-                            .text_color(color)
-                            .child(tag),
+                            .text_color(if kind == PlanKind::Delete && on > 0 {
+                                theme.danger
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(tf(
+                                "sync.kind.count",
+                                &[("selected", &on.to_string()), ("total", &total.to_string())],
+                            )),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(SharedString::from(item.rel.clone())),
-                    )
-                    .when(!item.is_dir && item.kind != PlanKind::Delete, |el| {
-                        el.child(div().text_color(muted).child(human_size(item.size)))
-                    })
-                    .into_any_element()
             })
-            .collect();
+        });
+
+        let rows = uniform_list(
+            "sync-plan",
+            review.plan.items.len(),
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                let State::Planned(review) = &this.state else {
+                    return Vec::new();
+                };
+                range.map(|ix| render_row(review, ix, cx)).collect()
+            }),
+        )
+        .h(px(240.));
 
         v_flex()
             .gap_2()
-            .child(div().text_sm().child(summary))
             .child(
-                v_flex()
-                    .id("sync-plan")
-                    .max_h(px(260.))
-                    .overflow_y_scroll()
-                    .gap_0p5()
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t("sync.rule")),
+            )
+            .child(v_flex().gap_1().children(kinds))
+            .child(
+                div()
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(theme.border)
                     .rounded_md()
                     .p_1()
-                    .children(rows)
-                    .when(sync_plan.items.len() > MAX_ROWS, |el| {
-                        el.child(
-                            div()
-                                .px_1()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("+ {}", sync_plan.items.len() - MAX_ROWS)),
-                        )
-                    }),
+                    .child(rows),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(tf(
+                        "sync.transfer_size",
+                        &[("bytes", &human_size(review.selected_bytes()))],
+                    )),
             )
             .into_any_element()
     }
+}
+
+fn render_row(review: &Review, ix: usize, cx: &mut Context<SyncDialog>) -> AnyElement {
+    let item = &review.plan.items[ix];
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    h_flex()
+        .id(("sync-row", ix))
+        .gap_2()
+        .px_1()
+        .h(px(24.))
+        .items_center()
+        .text_xs()
+        .child(
+            Checkbox::new(("sync-item", ix))
+                .checked(review.selected[ix])
+                .disabled(matches!(item.kind, PlanKind::Conflict | PlanKind::UnsafePath))
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    if let State::Planned(review) = &mut this.state {
+                        review.selected[ix] = *checked;
+                        cx.notify();
+                    }
+                })),
+        )
+        .child(
+            div()
+                .w(px(88.))
+                .flex_shrink_0()
+                .text_color(kind_color(item.kind, theme))
+                .child(row_tag(item.kind)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(SharedString::from(item.rel.clone())),
+        )
+        .when(!item.is_dir && !matches!(item.kind, PlanKind::Delete | PlanKind::Conflict | PlanKind::UnsafePath), |el| {
+            el.child(div().text_color(muted).child(human_size(item.size)))
+        })
+        .into_any_element()
+}
+
+fn kind_color(kind: PlanKind, theme: &Theme) -> Hsla {
+    match kind {
+        PlanKind::Copy => theme.success,
+        PlanKind::Update => theme.info,
+        PlanKind::DestNewer => theme.warning,
+        PlanKind::Unsure => theme.muted_foreground,
+        PlanKind::Delete => theme.danger,
+        PlanKind::Conflict | PlanKind::UnsafePath => theme.warning,
+    }
+}
+
+fn kind_label(kind: PlanKind) -> SharedString {
+    t(match kind {
+        PlanKind::Copy => "sync.kind.copy",
+        PlanKind::Update => "sync.kind.update",
+        PlanKind::DestNewer => "sync.kind.dest_newer",
+        PlanKind::Unsure => "sync.kind.unsure",
+        PlanKind::Delete => "sync.kind.delete",
+        PlanKind::Conflict => "sync.kind.conflict",
+        PlanKind::UnsafePath => "sync.kind.unsafe_path",
+    })
+}
+
+fn row_tag(kind: PlanKind) -> SharedString {
+    t(match kind {
+        PlanKind::Copy => "sync.plan.copy",
+        PlanKind::Update => "sync.plan.update",
+        PlanKind::DestNewer => "sync.plan.dest_newer",
+        PlanKind::Unsure => "sync.plan.unsure",
+        PlanKind::Delete => "sync.plan.delete",
+        PlanKind::Conflict => "sync.plan.conflict",
+        PlanKind::UnsafePath => "sync.plan.unsafe_path",
+    })
+}
+
+/// The closing notification: what was copied and deleted, or what failed
+/// and whether deletes were held back because of it.
+fn report_message(report: &SyncReport) -> String {
+    let counts = [
+        ("copied", report.copied.to_string()),
+        ("deleted", report.deleted.to_string()),
+        ("failed", report.failed.to_string()),
+        ("reason", report.reason.clone().unwrap_or_default()),
+    ];
+    let args: Vec<(&str, &str)> = counts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut message = match (report.failed, &report.reason) {
+        (0, None) => tf("sync.report.done", &args).to_string(),
+        // Stopped without a failed file, e.g. the copy job was cancelled.
+        (0, Some(_)) => tf("sync.report.failed", &args).to_string(),
+        _ => tf("sync.report.partial", &args).to_string(),
+    };
+    if report.skipped > 0 {
+        message.push(' ');
+        message.push_str(&tf("sync.report.skipped", &[("count", &report.skipped.to_string())]));
+    }
+    if report.deletes_skipped {
+        message.push(' ');
+        message.push_str(&t("sync.report.deletes_skipped"));
+    }
+    message
 }
 
 /// "label — /path" for the direction picker.
@@ -341,7 +513,7 @@ impl Render for SyncDialog {
                 .child(Icon::new(IconName::LoaderCircle).small())
                 .child(t("sync.analyzing"))
                 .into_any_element(),
-            State::Planned(sync_plan) => self.render_plan(&sync_plan.clone(), cx),
+            State::Planned(review) => self.render_review(review, cx),
             State::Error(error) => div()
                 .text_sm()
                 .text_color(cx.theme().danger)
@@ -349,8 +521,12 @@ impl Render for SyncDialog {
                 .into_any_element(),
         };
 
-        let can_start = matches!(&self.state, State::Planned(plan) if !plan.is_empty());
+        let can_start = matches!(&self.state, State::Planned(review) if review.any_selected());
         let planning = matches!(self.state, State::Planning);
+        let confirm_count = match &self.state {
+            State::Planned(review) if review.confirming_deletes => Some(review.selected_deletes()),
+            _ => None,
+        };
 
         v_flex()
             .gap_3()
@@ -367,23 +543,46 @@ impl Render for SyncDialog {
                 h_flex()
                     .gap_2()
                     .justify_end()
-                    .child(
-                        Button::new("sync-analyze")
-                            .label(t("sync.analyze"))
-                            .outline()
-                            .small()
-                            .loading(planning)
-                            .disabled(planning)
-                            .on_click(cx.listener(|this, _, _, cx| this.analyze(cx))),
-                    )
+                    .when(confirm_count.is_some(), |row| {
+                        row.child(
+                            Button::new("sync-confirm-back")
+                                .label(t("sync.confirm.back"))
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let State::Planned(review) = &mut this.state {
+                                        review.confirming_deletes = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
+                    .when(confirm_count.is_none(), |row| {
+                        row.child(
+                            Button::new("sync-analyze")
+                                .label(t("sync.analyze"))
+                                .outline()
+                                .small()
+                                .loading(planning)
+                                .disabled(planning)
+                                .on_click(cx.listener(|this, _, _, cx| this.analyze(cx))),
+                        )
+                    })
                     .child(
                         Button::new("sync-start")
-                            .label(t("sync.start"))
-                            .primary()
+                            .label(match confirm_count {
+                                Some(count) => tf("sync.confirm.start", &[("count", &count.to_string())]),
+                                None => t("sync.start"),
+                            })
+                            .with_variant(if confirm_count.is_some() {
+                                ButtonVariant::Danger
+                            } else {
+                                ButtonVariant::Primary
+                            })
                             .small()
                             .disabled(!can_start)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply(window, cx);
+                                this.start(window, cx);
                             })),
                     ),
             )

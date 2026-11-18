@@ -2,8 +2,8 @@
 //!
 //! Every backend is an [`opendal::Operator`]; kessel's job here is only to
 //! (a) build the Operator from a site profile plus keychain secrets, and
-//! (b) compose the per-site middleware stack (retry / timeout / throttle /
-//! concurrency / logging) that makes transfers resilient.
+//! (b) compose the per-site middleware stack (retry / timeout / concurrency /
+//! logging) that makes transfers resilient.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
-use opendal::layers::{
-    ConcurrentLimitLayer, LoggingLayer, RetryLayer, ThrottleLayer, TimeoutLayer, TracingLayer,
-};
+use futures::StreamExt as _;
+use opendal::layers::{ConcurrentLimitLayer, LoggingLayer, RetryLayer, TimeoutLayer, TracingLayer};
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
@@ -47,10 +46,8 @@ pub struct RetryConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThrottleConfig {
-    /// bytes per second
+    /// bytes per second, enforced by the transfer queue
     pub bandwidth: u32,
-    /// burst size in bytes
-    pub burst: u32,
 }
 
 impl LayerConfig {
@@ -93,11 +90,13 @@ pub struct SiteProfile {
 pub struct Capabilities {
     pub rename: bool,
     pub copy: bool,
-    pub recursive_delete: bool,
     pub presign: bool,
     pub write_can_append: bool,
     /// S3-style backends have no real directories; paths are prefixes.
     pub virtual_dirs: bool,
+    /// A fresh write goes to a temporary name that closing the writer renames
+    /// onto the target, whatever was written. Only appends write in place.
+    pub write_renames_on_close: bool,
 }
 
 /// One entry as seen by the browser UI: a name plus its full browse path.
@@ -116,6 +115,8 @@ pub struct RemoteEntry {
     pub is_bucket: bool,
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    /// The backend's version tag for this file, where it reports one.
+    pub etag: Option<String>,
     /// Unix permission bits (`mode & 0o7777`): filled inline for local fs,
     /// via [`Provider::sftp_permissions`] for sftp.
     pub permissions: Option<u32>,
@@ -127,6 +128,8 @@ pub struct RemoteEntry {
 #[derive(Clone)]
 pub struct Provider {
     pub site_id: i64,
+    /// The site's display name, for messages about it.
+    pub site_name: String,
     pub caps: Capabilities,
     /// The site's backend scheme, for provider-specific UI (columns, menus).
     /// opendal 0.58 dropped the `Scheme` enum in favour of string schemes.
@@ -135,6 +138,8 @@ pub struct Provider {
     /// for the side channels OpenDAL can't express (ListBuckets, storage
     /// class, ACL, sftp chmod).
     options: Arc<HashMap<String, String>>,
+    /// Bounds the side channels OpenDAL's timeout layer doesn't cover.
+    side_channel_timeout: Duration,
     backend: Backend,
 }
 
@@ -149,6 +154,8 @@ enum Backend {
         options: HashMap<String, String>,
         layers: LayerConfig,
         bucket_ops: Arc<Mutex<HashMap<String, Operator>>>,
+        /// Each bucket's own region once looked up; `None` when S3 didn't say.
+        regions: Arc<Mutex<HashMap<String, Option<String>>>>,
     },
 }
 
@@ -174,6 +181,7 @@ impl Provider {
         }
 
         let layers = profile.layers.merged_over(default_layers);
+        let side_channel_timeout = Duration::from_secs(layers.timeout_secs.unwrap_or(DEFAULT_SIDE_CHANNEL_TIMEOUT_SECS));
 
         // No bucket on an S3 site means "browse the whole account": defer
         // per-bucket operators until navigation. Capabilities are per-scheme,
@@ -185,13 +193,16 @@ impl Provider {
                 .with_context(|| format!("building operator for site `{}`", profile.name))?;
             return Ok(Self {
                 site_id: profile.id,
+                site_name: profile.name.clone(),
                 caps: Self::capabilities(&probe_op),
                 scheme: scheme.to_string(),
                 options: Arc::new(options.clone()),
+                side_channel_timeout,
                 backend: Backend::S3Root {
                     options,
                     layers,
                     bucket_ops: Arc::default(),
+                    regions: Arc::default(),
                 },
             });
         }
@@ -206,15 +217,17 @@ impl Provider {
         let caps = Self::capabilities(&op);
         Ok(Self {
             site_id: profile.id,
+            site_name: profile.name.clone(),
             caps,
             scheme: scheme.to_string(),
             options: resolved,
+            side_channel_timeout,
             backend: Backend::Single(op),
         })
     }
 
-    // The layer stack is the core value proposition: retry, timeout,
-    // throttle and observability are OpenDAL's, not ours.
+    // The layer stack is the core value proposition: retry, timeout and
+    // observability are OpenDAL's, not ours.
     fn apply_layers(mut op: Operator, layers: &LayerConfig) -> Operator {
         // Timeout goes inside retry, so a stalled attempt is retried instead
         // of ending the whole operation. The one knob also bounds each IO
@@ -237,13 +250,10 @@ impl Provider {
                     .with_jitter(),
             );
         }
-        if let Some(throttle) = &layers.throttle {
-            op = op.layer(ThrottleLayer::new(throttle.bandwidth, throttle.burst));
-        }
         if let Some(limit) = layers.concurrent_limit {
             op = op.layer(ConcurrentLimitLayer::new(limit));
         }
-        op.layer(LoggingLayer::default()).layer(TracingLayer::new())
+        op.layer(LoggingLayer::new(QuietNotFound)).layer(TracingLayer::new())
     }
 
     /// Resolve a browse path to the Operator serving it plus the
@@ -263,10 +273,51 @@ impl Provider {
         }
     }
 
+    /// [`Self::op_for`] on the bucket's own region: account-root S3 sites look
+    /// it up the first time a path reaches a bucket.
+    pub async fn route(&self, path: &str) -> Result<(Operator, String)> {
+        self.resolve_bucket_region(path).await;
+        self.op_for(path)
+    }
+
+    /// Remember the region of the bucket `path` lies in. A failed lookup is
+    /// tried again next time; until then the site's own region applies.
+    async fn resolve_bucket_region(&self, path: &str) {
+        let Backend::S3Root { options, bucket_ops, regions, .. } = &self.backend else {
+            return;
+        };
+        let bucket = path.split('/').next().unwrap_or("");
+        if bucket.is_empty()
+            || !follows_bucket_region(options)
+            || regions.lock().unwrap().contains_key(bucket)
+        {
+            return;
+        }
+        match crate::s3::bucket_region(options, bucket).await {
+            Ok(region) => {
+                regions.lock().unwrap().insert(bucket.to_string(), region);
+                bucket_ops.lock().unwrap().remove(bucket);
+            }
+            Err(error) => tracing::debug!(%bucket, error = %format!("{error:#}"), "bucket region lookup failed"),
+        }
+    }
+
+    /// The options a side channel signs with for `bucket`.
+    async fn bucket_options(&self, bucket: &str) -> HashMap<String, String> {
+        self.resolve_bucket_region(bucket).await;
+        let mut options = self.options.as_ref().clone();
+        if let Backend::S3Root { regions, .. } = &self.backend {
+            if let Some(Some(region)) = regions.lock().unwrap().get(bucket) {
+                use_bucket_region(&mut options, region);
+            }
+        }
+        options
+    }
+
     /// Delete one entry: recursive delete for directories (works on
     /// virtual-dir backends too), plain delete for files.
     pub async fn delete(&self, path: &str, is_dir: bool) -> Result<()> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         if is_dir {
             op.delete_with(&rel).recursive(true).await?;
         } else {
@@ -275,13 +326,44 @@ impl Provider {
         Ok(())
     }
 
+    /// Move one local entry to the OS trash (fs sites only). Remote deletes
+    /// have no trash and go through [`Provider::delete`].
+    pub async fn trash(&self, path: &str) -> Result<()> {
+        anyhow::ensure!(self.scheme == "fs", "only local files can go to the trash");
+        let full = self.fs_path(path.trim_end_matches('/'));
+        tokio::task::spawn_blocking(move || {
+            trash::delete(&full).with_context(|| format!("moving `{}` to the trash", full.display()))
+        })
+        .await
+        .context("trash task panicked")?
+    }
+
     /// Rename within one operator: server-side where the backend supports
-    /// it, otherwise a copy + delete fallback (files only).
+    /// it, otherwise a copy + delete fallback (files only). Refuses to
+    /// replace an existing destination.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let (op, from_rel) = self.op_for(from)?;
-        let (_, to_rel) = self.op_for(to)?;
+        let (op, from_rel) = self.route(from).await?;
+        let (_, to_rel) = self.route(to).await?;
+        match op.stat(&to_rel).await {
+            Ok(_) => {
+                // On a case-insensitive filesystem a case-only rename stats
+                // the source itself. Only then may it go ahead: the parent
+                // listing holds the source's spelling but not the new one.
+                let case_only = from_rel.to_lowercase() == to_rel.to_lowercase();
+                if !(case_only && !self.has_exact_sibling(&op, &to_rel).await?) {
+                    let name = to_rel.trim_end_matches('/').rsplit('/').next().unwrap_or(&to_rel);
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::AlreadyExists,
+                        format!("`{name}` already exists"),
+                    )
+                    .into());
+                }
+            }
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         if self.caps.rename {
-            op.rename(&from_rel, &to_rel).await?;
+            self.rename_on_server(&op, &from_rel, &to_rel).await?;
         } else if self.caps.copy {
             anyhow::ensure!(
                 !from_rel.ends_with('/'),
@@ -295,13 +377,83 @@ impl Provider {
         Ok(())
     }
 
-    /// Download one remote file into a local path (in memory; meant for
-    /// previews and external edits, not bulk transfers — those go through
-    /// the queue).
-    pub async fn read_to_file(&self, path: &str, dest: &std::path::Path) -> Result<()> {
+    /// The server this site talks to, when its options name one.
+    pub(crate) fn endpoint(&self) -> Option<&str> {
+        self.options.get("endpoint").map(String::as_str).filter(|endpoint| !endpoint.is_empty())
+    }
+
+    /// The account this site logs in to, when its options name one.
+    pub(crate) fn login(&self) -> Option<&str> {
+        self.options.get("user").map(String::as_str).filter(|user| !user.is_empty())
+    }
+
+    /// One server-side rename of operator paths (guarded by `caps.rename`).
+    /// OpenDAL has no FTP rename, so that goes through [`crate::ftp`].
+    pub(crate) async fn rename_on_server(&self, op: &Operator, from: &str, to: &str) -> opendal::Result<()> {
+        if self.scheme == "ftp" {
+            crate::ftp::rename(&self.options, from, to, self.side_channel_timeout).await
+        } else {
+            op.rename(from, to).await
+        }
+    }
+
+    /// Create an empty FTP file, which OpenDAL's writer can't do: it only
+    /// reaches the server once it has bytes to send.
+    pub(crate) async fn create_empty_ftp_file(&self, path: &str) -> Result<()> {
         let (op, rel) = self.op_for(path)?;
-        let data = op.read(&rel).await?;
-        tokio::fs::write(dest, data.to_bytes())
+        if let Some((parent, _)) = rel.rsplit_once('/') {
+            op.create_dir(&format!("{parent}/")).await?;
+        }
+        crate::ftp::create_empty(&self.options, &rel, self.side_channel_timeout).await?;
+        Ok(())
+    }
+
+    /// Whether the parent listing of `rel` has an entry spelled exactly like
+    /// it, telling a real second file from a case-insensitive alias.
+    async fn has_exact_sibling(&self, op: &Operator, rel: &str) -> Result<bool> {
+        let trimmed = rel.trim_end_matches('/');
+        let (parent, name) = match trimmed.rsplit_once('/') {
+            Some((parent, name)) => (format!("{parent}/"), name),
+            None => ("/".to_string(), trimmed),
+        };
+        let entries = op.list(&parent).await?;
+        Ok(contains_exact_name(
+            entries.iter().map(|entry| entry.name()),
+            name,
+        ))
+    }
+
+    /// Download one remote file into a local path, streamed in chunks. The
+    /// bytes land in a sibling `.part` file that replaces `dest` only once
+    /// complete, so a failed download never leaves a truncated `dest`.
+    /// Meant for previews and external edits; bulk transfers use the queue.
+    pub async fn read_to_file(&self, path: &str, dest: &std::path::Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (op, rel) = self.route(path).await?;
+        let mut part = dest.as_os_str().to_owned();
+        part.push(".part");
+        let part = std::path::PathBuf::from(part);
+
+        let result: Result<()> = async {
+            let mut stream = op.reader(&rel).await?.into_bytes_stream(..).await?;
+            let mut file = tokio::fs::File::create(&part)
+                .await
+                .with_context(|| format!("creating `{}`", part.display()))?;
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?)
+                    .await
+                    .with_context(|| format!("writing `{}`", part.display()))?;
+            }
+            file.flush().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(error);
+        }
+        tokio::fs::rename(&part, dest)
             .await
             .with_context(|| format!("writing `{}`", dest.display()))?;
         Ok(())
@@ -310,7 +462,7 @@ impl Provider {
     /// Recursive (file count, total bytes) under a directory. Backends whose
     /// listings lack sizes (e.g. local fs) get a stat per file.
     pub async fn dir_size(&self, path: &str) -> Result<(u64, u64)> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         let entries = op.list_with(&rel).recursive(true).await?;
         let mut files = 0u64;
         let mut bytes = 0u64;
@@ -341,7 +493,7 @@ impl Provider {
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<()> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         op.create_dir(&rel).await?;
         Ok(())
     }
@@ -357,8 +509,8 @@ impl Provider {
                 "server-side copy cannot cross buckets"
             );
         }
-        let (op, from_rel) = self.op_for(from)?;
-        let (_, to_rel) = self.op_for(to)?;
+        let (op, from_rel) = self.route(from).await?;
+        let (_, to_rel) = self.route(to).await?;
         op.copy(&from_rel, &to_rel).await?;
         Ok(())
     }
@@ -388,7 +540,7 @@ impl Provider {
 
     /// Presigned GET URL (guarded by `caps.presign`).
     pub async fn presign_read(&self, path: &str, expire: Duration) -> Result<String> {
-        let (op, rel) = self.op_for(path)?;
+        let (op, rel) = self.route(path).await?;
         let presigned = op.presign_read(&rel, expire).await?;
         Ok(presigned.uri().to_string())
     }
@@ -430,7 +582,8 @@ impl Provider {
     /// Storage class per entry name for one S3 directory level.
     pub async fn storage_classes(&self, dir: &str) -> Result<HashMap<String, String>> {
         let (bucket, prefix) = self.s3_location(dir)?;
-        let classes = crate::s3::storage_classes(&self.options, &bucket, &prefix).await?;
+        let options = self.bucket_options(&bucket).await;
+        let classes = crate::s3::storage_classes(&options, &bucket, &prefix).await?;
         Ok(classes
             .into_iter()
             .filter_map(|(key, class)| {
@@ -443,13 +596,15 @@ impl Provider {
     /// Change one object's S3 storage class (copy-in-place).
     pub async fn set_storage_class(&self, path: &str, class: &str) -> Result<()> {
         let (bucket, key) = self.s3_location(path)?;
-        crate::s3::set_storage_class(&self.options, &bucket, &key, class).await
+        let options = self.bucket_options(&bucket).await;
+        crate::s3::set_storage_class(&options, &bucket, &key, class).await
     }
 
     /// Apply a canned ACL to one S3 object.
     pub async fn set_acl(&self, path: &str, acl: &str) -> Result<()> {
         let (bucket, key) = self.s3_location(path)?;
-        crate::s3::set_acl(&self.options, &bucket, &key, acl).await
+        let options = self.bucket_options(&bucket).await;
+        crate::s3::set_acl(&options, &bucket, &key, acl).await
     }
 
     /// Regions for the given buckets (bucket-root S3 sites), fetched
@@ -548,12 +703,14 @@ impl Provider {
                             is_bucket: true,
                             size: 0,
                             modified: bucket.created,
+                            etag: None,
                             permissions: None,
                             storage_class: None,
                         })
                         .collect())
                 } else {
                     let (bucket, rest) = path.split_once('/').unwrap_or((path, ""));
+                    self.resolve_bucket_region(bucket).await;
                     let op = self.bucket_op(bucket)?;
                     list_operator(&op, rest, &format!("{bucket}/")).await
                 }
@@ -566,6 +723,7 @@ impl Provider {
             options,
             layers,
             bucket_ops,
+            regions,
         } = &self.backend
         else {
             unreachable!("bucket_op is only called in bucket-root mode");
@@ -576,6 +734,9 @@ impl Provider {
         }
         let mut options = options.clone();
         options.insert("bucket".to_string(), bucket.to_string());
+        if let Some(Some(region)) = regions.lock().unwrap().get(bucket) {
+            use_bucket_region(&mut options, region);
+        }
         let op = Self::apply_layers(
             Operator::via_iter("s3", options)
                 .with_context(|| format!("building operator for bucket `{bucket}`"))?,
@@ -588,10 +749,11 @@ impl Provider {
     fn capabilities(op: &Operator) -> Capabilities {
         let info = op.info();
         let cap = info.capability();
+        let ftp = info.scheme() == "ftp";
         Capabilities {
-            rename: cap.rename,
+            // OpenDAL can't rename on FTP; `rename_on_server` can.
+            rename: cap.rename || ftp,
             copy: cap.copy,
-            recursive_delete: cap.delete && cap.list_with_recursive,
             presign: cap.presign,
             write_can_append: cap.write_can_append,
             // Object stores report create_dir but directories are prefixes.
@@ -599,9 +761,34 @@ impl Provider {
                 info.scheme(),
                 "s3" | "gcs" | "azblob"
             ),
+            write_renames_on_close: ftp,
         }
     }
 }
+
+/// Whether buckets of this account-root site can live in other regions: true
+/// on AWS, where the endpoint follows the region. A custom endpoint is one
+/// fixed server whatever a bucket says.
+fn follows_bucket_region(options: &HashMap<String, String>) -> bool {
+    options.get("endpoint").is_none_or(|endpoint| {
+        endpoint.is_empty()
+            || url::Url::parse(endpoint)
+                .is_ok_and(|url| url.host_str().is_some_and(|host| host.ends_with(".amazonaws.com")))
+    })
+}
+
+/// Point operator options at `region`. Without an endpoint OpenDAL and
+/// [`crate::s3`] derive the matching regional one.
+fn use_bucket_region(options: &mut HashMap<String, String>, region: &str) {
+    options.insert("region".to_string(), region.to_string());
+    options.remove("endpoint");
+}
+
+/// Side-channel limit for sites without a configured timeout.
+const DEFAULT_SIDE_CHANNEL_TIMEOUT_SECS: u64 = 60;
+
+/// Stats in flight at once while filling metadata for a listing.
+const STAT_CONCURRENCY: usize = 16;
 
 /// List one operator path, mapping entries to browse paths under `prefix`
 /// (`""` for single-operator sites, `"bucket/"` in bucket-root mode).
@@ -619,7 +806,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
     let fs_root = (info.scheme() == "fs").then(|| info.root().to_string());
 
     let mut entries = Vec::new();
-    let mut stats = tokio::task::JoinSet::new();
+    let mut needs_stat = Vec::new();
     for entry in raw {
         if entry.path() == path {
             continue;
@@ -627,10 +814,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
         let meta = entry.metadata();
         let is_symlink = meta.mode() == opendal::EntryMode::Unknown;
         if meta.last_modified().is_none() || is_symlink {
-            let op = op.clone();
-            let rel = entry.path().to_string();
-            let ix = entries.len();
-            stats.spawn(async move { (ix, op.stat(&rel).await.ok()) });
+            needs_stat.push((entries.len(), entry.path().to_string()));
         }
         let permissions = fs_root.as_deref().and_then(|root| {
             let full = crate::localfs::full_path(root, entry.path());
@@ -644,16 +828,26 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
             is_bucket: false,
             size: meta.content_length(),
             modified: meta.last_modified().and_then(to_datetime),
+            etag: meta.etag().map(str::to_string),
             permissions,
             storage_class: None,
         });
     }
-    while let Some(joined) = stats.join_next().await {
+    // Bounded so a folder with thousands of entries doesn't fire thousands
+    // of stats at once.
+    let mut stats = futures::stream::iter(needs_stat)
+        .map(|(ix, rel)| {
+            let op = op.clone();
+            async move { (ix, op.stat(&rel).await.ok()) }
+        })
+        .buffer_unordered(STAT_CONCURRENCY);
+    while let Some((ix, meta)) = stats.next().await {
         // A failed stat (e.g. dangling symlink) keeps the bare list entry.
-        let Ok((ix, Some(meta))) = joined else { continue };
+        let Some(meta) = meta else { continue };
         let entry = &mut entries[ix];
         entry.size = meta.content_length();
         entry.modified = meta.last_modified().and_then(to_datetime);
+        entry.etag = meta.etag().map(str::to_string);
         if entry.is_symlink && meta.is_dir() {
             entry.is_dir = true;
             if !entry.path.ends_with('/') {
@@ -675,4 +869,88 @@ fn unix_mode(meta: &std::fs::Metadata) -> Option<u32> {
 #[cfg(not(unix))]
 fn unix_mode(_meta: &std::fs::Metadata) -> Option<u32> {
     None
+}
+
+/// Whether `names` (directory entries may end with `/`) has exactly `name`.
+fn contains_exact_name<'a>(names: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+    names
+        .into_iter()
+        .any(|candidate| candidate.trim_end_matches('/') == name)
+}
+
+#[cfg(test)]
+mod bucket_region_tests {
+    use super::*;
+
+    #[test]
+    fn only_aws_endpoints_follow_a_buckets_region() {
+        let with_endpoint = |endpoint: &str| HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+        assert!(follows_bucket_region(&HashMap::new()));
+        assert!(follows_bucket_region(&with_endpoint("https://s3.eu-central-1.amazonaws.com")));
+        assert!(!follows_bucket_region(&with_endpoint("https://minio.example.org")));
+    }
+
+    #[test]
+    fn a_bucket_operator_gets_the_regional_endpoint() {
+        let mut options = HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), "https://s3.us-east-1.amazonaws.com".to_string()),
+        ]);
+        use_bucket_region(&mut options, "eu-west-1");
+        assert_eq!(options["region"], "eu-west-1");
+        assert!(!options.contains_key("endpoint"));
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::contains_exact_name;
+
+    #[test]
+    fn exact_name_match_tells_a_second_file_from_a_case_alias() {
+        // Case-sensitive backend with both files: the listing has the new spelling.
+        assert!(contains_exact_name(["Report.txt", "report.txt"], "report.txt"));
+        // Case-insensitive fs: the listing only holds the source's spelling.
+        assert!(!contains_exact_name(["Report.txt"], "report.txt"));
+        // Directory entries carry a trailing slash.
+        assert!(contains_exact_name(["Photos/"], "Photos"));
+    }
+
+    #[tokio::test]
+    async fn an_ftp_site_renames_through_its_capability_flag() {
+        let server = crate::ftp::test_server::FakeFtp::start();
+        server.put("report.txt", b"content");
+        let profile = super::SiteProfile {
+            scheme: "ftp".into(),
+            options: [("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))].into(),
+            ..Default::default()
+        };
+        let provider = super::Provider::connect(&profile, &Default::default()).unwrap();
+
+        assert!(provider.caps.rename);
+        provider.rename("report.txt", "final.txt").await.unwrap();
+        assert_eq!(server.names(), ["final.txt"]);
+    }
+}
+
+/// OpenDAL's default logging, except a `stat` that finds nothing: kessel
+/// stats destinations before every write, so "not found" is the normal
+/// answer there and must not show up as a warning in the logs panel.
+#[derive(Clone, Copy, Debug)]
+struct QuietNotFound;
+
+impl opendal::layers::LoggingInterceptor for QuietNotFound {
+    fn log(
+        &self,
+        info: &opendal::raw::ServiceInfo,
+        operation: opendal::raw::Operation,
+        context: &[(&str, &str)],
+        message: &str,
+        err: Option<&opendal::Error>,
+    ) {
+        let expected = operation == opendal::raw::Operation::Stat
+            && err.is_some_and(|err| err.kind() == opendal::ErrorKind::NotFound);
+        let err = if expected { None } else { err };
+        opendal::layers::DefaultLoggingInterceptor.log(info, operation, context, message, err);
+    }
 }

@@ -12,6 +12,7 @@ use gpui_component::{h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable a
 
 use crate::app::AppState;
 use crate::i18n::{t, tf};
+use crate::bookmarks::{parse_quick_url, QUICK_CONNECT_SPACE};
 use crate::queue::LOCAL_SITE_ID;
 use crate::ui::{bookmark_color, bookmark_icon};
 
@@ -24,6 +25,8 @@ pub enum RunRequest {
     Bookmark(i64),
     /// Switch to a space.
     Space(i64),
+    /// Quick connect to a URL typed into the bar.
+    QuickConnect(String),
 }
 
 pub enum CommandBarEvent {
@@ -42,6 +45,7 @@ struct Entry {
 /// (i18n label key, action name) for every palette command. The action is
 /// dispatched through the focused view, exactly like its keyboard shortcut.
 const COMMANDS: &[(&str, &str)] = &[
+    ("cmdbar.command.quick_connect", "workspace::QuickConnect"),
     ("cmdbar.command.new_tab", "workspace::NewTab"),
     ("cmdbar.command.close_tab", "workspace::CloseTab"),
     ("cmdbar.command.next_tab", "workspace::NextTab"),
@@ -60,6 +64,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "workspace::FocusOtherPane",
     ),
     ("cmdbar.command.bookmarks", "workspace::OpenBookmarks"),
+    ("cmdbar.command.save_as_site", "workspace::SaveAsSite"),
     ("cmdbar.command.preferences", "workspace::OpenPreferences"),
     (
         "cmdbar.command.theme_browser",
@@ -79,13 +84,26 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmdbar.command.toggle_hidden", "file_pane::ToggleHidden"),
     ("cmdbar.command.toggle_tree", "file_pane::ToggleTree"),
     ("cmdbar.command.search", "file_pane::Search"),
+    ("cmdbar.command.search_tree", "file_pane::SearchTree"),
     ("cmdbar.command.quick_look", "file_pane::QuickLook"),
     ("cmdbar.command.edit_path", "file_pane::EditPath"),
+    ("cmdbar.command.download", "file_pane::Download"),
+    ("cmdbar.command.download_to", "file_pane::DownloadTo"),
+    ("cmdbar.command.upload", "file_pane::Upload"),
+    ("cmdbar.command.rename", "file_pane::RenameSelected"),
+    ("cmdbar.command.delete", "file_pane::DeleteSelected"),
+    ("cmdbar.command.copy_to_other", "file_pane::CopyToOtherPane"),
+    ("cmdbar.command.move_to_other", "file_pane::MoveToOtherPane"),
+    ("cmdbar.command.focus_transfers", "workspace::FocusTransfers"),
+    ("cmdbar.command.reconnect", "file_pane::Reconnect"),
 ];
 
 pub struct CommandBar {
     input: Entity<InputState>,
     entries: Vec<Entry>,
+    /// Entries built at open; anything past this index is the dynamic
+    /// "Connect to <url>" entry for a query that parses as a URL.
+    base_len: usize,
     /// Indices into `entries`, filtered + ranked by the current query.
     filtered: Vec<usize>,
     selected: usize,
@@ -129,7 +147,7 @@ impl CommandBar {
         }
         let state = cx.global::<AppState>();
         for site in &state.sites {
-            if site.id == LOCAL_SITE_ID {
+            if site.id == LOCAL_SITE_ID || site.space_id == QUICK_CONNECT_SPACE {
                 continue;
             }
             let mut icon = Icon::new(bookmark_icon(site.icon.as_deref(), IconName::Globe));
@@ -159,6 +177,7 @@ impl CommandBar {
         let filtered = (0..entries.len()).collect();
         Self {
             input,
+            base_len: entries.len(),
             entries,
             filtered,
             selected: 0,
@@ -167,7 +186,9 @@ impl CommandBar {
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).value().trim().to_lowercase();
+        let raw = self.input.read(cx).value().trim().to_string();
+        self.entries.truncate(self.base_len);
+        let query = raw.to_lowercase();
         if query.is_empty() {
             self.filtered = (0..self.entries.len()).collect();
         } else {
@@ -181,6 +202,16 @@ impl CommandBar {
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             self.filtered = scored.into_iter().map(|(_, ix)| ix).collect();
+        }
+        // A query that parses as a quick-connect URL ranks first.
+        if let Ok(target) = parse_quick_url(&raw) {
+            self.entries.push(Entry {
+                label: tf("cmdbar.connect_url", &[("url", &target.name)]),
+                keystroke: None,
+                icon: Icon::default().path("icons/zap.svg"),
+                run: RunRequest::QuickConnect(raw),
+            });
+            self.filtered.insert(0, self.entries.len() - 1);
         }
         self.selected = 0;
         self.scroll_handle
@@ -228,9 +259,9 @@ impl CommandBar {
         let is_selected = position == self.selected;
         h_flex()
             .id(("cmd-row", position))
+            .h(px(ROW_HEIGHT))
             .gap_2()
             .px_2()
-            .py_1()
             .rounded_md()
             .cursor_pointer()
             .text_sm()
@@ -266,6 +297,11 @@ impl CommandBar {
     }
 }
 
+/// Row height of the result list. The list gets an explicit height from it:
+/// a uniform list inside an auto-height popover collapses to zero otherwise.
+const ROW_HEIGHT: f32 = 28.;
+const VISIBLE_ROWS: usize = 12;
+
 impl Render for CommandBar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.filtered.len();
@@ -297,9 +333,8 @@ impl Render for CommandBar {
                                 .collect()
                         }),
                     )
-                    .track_scroll(self.scroll_handle.clone())
-                    .flex_1()
-                    .min_h_0(),
+                    .track_scroll(&self.scroll_handle)
+                    .h(px(ROW_HEIGHT * row_count.min(VISIBLE_ROWS) as f32)),
                 )
             })
             .when(row_count == 0, |el| {

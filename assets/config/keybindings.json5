@@ -45,6 +45,7 @@
     "secondary-b": "workspace::ToggleSidebar",
     "secondary-.": "workspace::ToggleSidebar",
     "secondary-j": "workspace::ToggleTransfers",
+    "secondary-shift-j": "workspace::FocusTransfers",
     "secondary-alt-j": "workspace::ToggleLogs",
     "secondary-alt-1": "workspace::LayoutSingle",
     "secondary-alt-2": "workspace::LayoutSplitH",
@@ -73,9 +74,10 @@
     "ctrl-a": "file_pane::SelectAll",
     "escape": "file_pane::ClearSelection",
 
-    // Navigation.
+    // Navigation. Activate enters a folder or opens a file; right arrow only
+    // enters a folder.
     "enter": "file_pane::Activate",
-    "right": "file_pane::Activate",
+    "right": "file_pane::EnterFolder",
     "secondary-down": "file_pane::Activate",
     "backspace": "file_pane::GoUp",
     "left": "file_pane::GoUp",
@@ -89,10 +91,19 @@
     // Files.
     "space": "file_pane::QuickLook",
     "secondary-f": "file_pane::Search",
+    "secondary-shift-f": "file_pane::SearchTree",
+    "secondary-enter": "file_pane::RevealInFolder",
     "secondary-r": "file_pane::Refresh",
-    "f5": "file_pane::Refresh",
+    "secondary-shift-r": "file_pane::Reconnect",
+    // Commander idioms: F5 copies, F6 moves the selection to the other pane.
+    "f5": "file_pane::CopyToOtherPane",
+    "secondary-shift-c": "file_pane::CopyToOtherPane",
+    "f6": "file_pane::MoveToOtherPane",
     "secondary-shift-n": "file_pane::NewFolder",
     "f2": "file_pane::RenameSelected",
+    "secondary-shift-d": "file_pane::Download",
+    "secondary-alt-d": "file_pane::DownloadTo",
+    "secondary-shift-u": "file_pane::Upload",
     "secondary-backspace": "file_pane::DeleteSelected",
     // macOS reports shift-. as ">", so bind both spellings.
     "secondary-shift-.": "file_pane::ToggleHidden",
@@ -100,6 +111,19 @@
     "secondary-shift-e": "file_pane::ToggleTree",
     // Address-bar idiom: edit the raw path (Escape returns to the breadcrumb).
     "secondary-l": "file_pane::EditPath",
+  },
+
+  // The queue, once focused with secondary-shift-j.
+  TransfersPanel: {
+    "down": "transfers::SelectNextJob",
+    "up": "transfers::SelectPrevJob",
+    "enter": "transfers::ToggleJobFiles",
+    "space": "transfers::PauseResumeJob",
+    "r": "transfers::RetryJob",
+    "c": "transfers::ResolveJobConflicts",
+    "backspace": "transfers::CancelJob",
+    "delete": "transfers::CancelJob",
+    "escape": "transfers::ReturnToPane",
   },
 
   // Ctrl is the command modifier off macOS, so ctrl-1…9 belongs to the tabs

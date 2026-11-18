@@ -11,8 +11,11 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use gpui::prelude::*;
-use gpui::{div, AnyElement, Context, Entity, EventEmitter, Hsla, SharedString, Window};
+use gpui::{
+    div, AnyElement, Context, Entity, EventEmitter, Hsla, PathPromptOptions, SharedString, Window,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
@@ -25,13 +28,16 @@ use sqlx::SqlitePool;
 use crate::app::AppState;
 use crate::aws;
 use crate::bookmarks::{
-    driver_by_scheme, is_oauth_scheme, secret_keys, DriverSpec, FieldSpec, AWS_PROFILE_OPT,
-    available_drivers,
+    apply_limits, available_drivers, driver_by_scheme, ftp_endpoint, is_oauth_scheme,
+    oauth_setup_url, secret_keys, split_ftp_endpoint, DriverSpec, FieldSpec, AWS_PROFILE_OPT,
+    QUICK_CONNECT_SPACE,
 };
-use crate::i18n::t;
+use crate::i18n::{t, tf};
+use crate::import::{self, ImportEntry};
 use crate::db;
 use crate::provider::{LayerConfig, Provider, SiteProfile};
 use crate::secrets::SecretStore;
+use crate::ui::connect::{error_block, open_host_key_dialog, FormError};
 use crate::ui::pickers;
 
 const CRED_MODE_KEYS: &str = "Access keys";
@@ -42,6 +48,9 @@ pub enum BookmarkEvent {
     Connect(SiteProfile),
     /// Bookmarks were added / edited / removed; `AppState.sites` is updated.
     SitesChanged,
+    /// A quick-connect site was saved into the active space; tabs showing it
+    /// can pin to its new bookmark row.
+    Promoted(i64),
 }
 
 type StringSelect = Entity<SelectState<SearchableVec<SharedString>>>;
@@ -77,21 +86,48 @@ struct Editor {
     /// (cloud-drive schemes); persisted to the keychain on save.
     oauth_token: Option<String>,
     oauth_busy: bool,
+    /// New connections only: keep the site in the sidebar. Off means a
+    /// one-off connection (a hidden quick-connect site).
+    save: bool,
+    /// Editing a quick-connect site through "Save as site": saving moves it
+    /// into the active space.
+    promote: bool,
+    /// `known_hosts_strategy` of an sftp site from before the trust dialog
+    /// ("add"), carried over on save so the site keeps working the same.
+    legacy_host_keys: Option<String>,
     /// Whether the (optional) appearance & organization block is expanded.
     /// Collapsed by default for a new connection so the form is just
     /// "pick a type → fill the connection"; expanded when editing a site.
     appearance_expanded: bool,
+    /// FTP only: explicit TLS (index 0) or plain FTP (index 1).
+    ftp_tls: StringSelect,
+    /// Layer config the site had; the form edits only the two limits below
+    /// and keeps retry and timeout as they were.
+    layers: LayerConfig,
+    max_connections: Entity<InputState>,
+    speed_limit: Entity<InputState>,
+    advanced_expanded: bool,
+}
+
+/// A parsed import file waiting for the user's go-ahead.
+struct ImportPreview {
+    entries: Vec<ImportEntry>,
 }
 
 pub struct BookmarkManager {
     sites: Vec<SiteProfile>,
     editor: Option<Editor>,
-    error: Option<SharedString>,
+    error: Option<FormError>,
+    /// Whether the error's raw details are expanded.
+    details_open: bool,
     /// Success feedback ("Connection OK").
     notice: Option<SharedString>,
     /// Site armed for deletion; the second click actually deletes.
     confirm_delete: Option<i64>,
     busy: bool,
+    import: Option<ImportPreview>,
+    /// Imported sites that still need their password entered.
+    needs_credentials: std::collections::HashSet<i64>,
 }
 
 /// Validated form values, shared by save and test-connection.
@@ -100,6 +136,7 @@ struct FormData {
     scheme: String,
     options: HashMap<String, String>,
     secrets: HashMap<String, String>,
+    layers: LayerConfig,
     profile_mode: bool,
     meta: db::BookmarkMeta,
 }
@@ -112,9 +149,12 @@ impl BookmarkManager {
             sites: cx.global::<AppState>().sites.clone(),
             editor: None,
             error: None,
+            details_open: false,
             notice: None,
             confirm_delete: None,
             busy: false,
+            import: None,
+            needs_credentials: Default::default(),
         }
     }
 
@@ -131,6 +171,16 @@ impl BookmarkManager {
         self.open_editor(site.as_ref(), window, cx);
     }
 
+    /// "Save as site" for a quick-connect tab: the editor for its hidden site,
+    /// which joins the active space on save.
+    pub fn open_promote(&mut self, site_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_edit(site_id, window, cx);
+        if let Some(editor) = &mut self.editor {
+            editor.promote = true;
+            editor.appearance_expanded = false;
+        }
+    }
+
     /// Called every time the dialog opens: back to the list, fresh data.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.sites = cx.global::<AppState>().sites.clone();
@@ -139,7 +189,29 @@ impl BookmarkManager {
         self.notice = None;
         self.confirm_delete = None;
         self.busy = false;
+        self.import = None;
+        self.load_needs_credentials(cx);
         cx.notify();
+    }
+
+    /// Reload which imported sites still need their password. The set is
+    /// tiny and only the list view reads it, so a late answer is harmless.
+    fn load_needs_credentials(&mut self, cx: &mut Context<Self>) {
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let task = state
+            .runtime
+            .spawn(async move { db::sites_needing_credentials(&pool).await });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(ids)) = task.await {
+                this.update(cx, |this, cx| {
+                    this.needs_credentials = ids;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn open_editor(
@@ -259,6 +331,38 @@ impl BookmarkManager {
             )
         });
 
+        let layers = site.map(|site| site.layers.clone()).unwrap_or_default();
+        let tls = options
+            .get("endpoint")
+            .filter(|_| spec.scheme == "ftp")
+            .is_none_or(|endpoint| split_ftp_endpoint(endpoint).1);
+        let ftp_tls = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(vec![
+                    SharedString::from(t("connect.ftp.tls")),
+                    SharedString::from(t("connect.ftp.plain")),
+                ]),
+                Some(IndexPath::new(usize::from(!tls))),
+                window,
+                cx,
+            )
+        });
+        let max_connections = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t("site.limits.connections_placeholder"))
+        });
+        if let Some(limit) = layers.concurrent_limit {
+            max_connections.update(cx, |input, cx| input.set_value(limit.to_string(), window, cx));
+        }
+        let speed_limit = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t("site.limits.speed_placeholder"))
+        });
+        if let Some(throttle) = &layers.throttle {
+            speed_limit.update(cx, |input, cx| {
+                input.set_value((throttle.bandwidth / 1024).to_string(), window, cx)
+            });
+        }
+        let advanced_expanded = layers.concurrent_limit.is_some() || layers.throttle.is_some();
+
         let mut editor = Editor {
             site_id: site.map(|site| site.id),
             had_secret,
@@ -280,11 +384,23 @@ impl BookmarkManager {
             folder_ids,
             oauth_token: None,
             oauth_busy: false,
+            save: true,
+            promote: false,
+            legacy_host_keys: options
+                .get("known_hosts_strategy")
+                .filter(|_| spec.scheme == "sftp")
+                .cloned(),
             appearance_expanded: site.is_some(),
+            ftp_tls,
+            layers,
+            max_connections,
+            speed_limit,
+            advanced_expanded,
         };
         editor.inputs = Self::build_inputs(spec, &options, had_secret, window, cx);
         self.editor = Some(editor);
         self.error = None;
+        self.details_open = false;
         self.notice = None;
         self.confirm_delete = None;
         cx.notify();
@@ -313,9 +429,22 @@ impl BookmarkManager {
                     state
                 });
                 if let Some(value) = existing.get(field.key) {
-                    input.update(cx, |input, cx| {
-                        input.set_value(value.clone(), window, cx)
-                    });
+                    // The FTP scheme lives in its own select.
+                    let value = if spec.scheme == "ftp" && field.key == "endpoint" {
+                        split_ftp_endpoint(value).0.to_string()
+                    } else {
+                        value.clone()
+                    };
+                    input.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
+                // Sign-in unlocks once a client ID is typed.
+                if field.key == "client_id" {
+                    cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change { .. } = event {
+                            cx.notify();
+                        }
+                    })
+                    .detach();
                 }
                 (field, input)
             })
@@ -372,17 +501,43 @@ impl BookmarkManager {
         }
     }
 
-    fn toggle_appearance(&mut self, cx: &mut Context<Self>) {
-        if let Some(editor) = &mut self.editor {
-            editor.appearance_expanded = !editor.appearance_expanded;
-            cx.notify();
-        }
+    /// A collapsible form section header; `toggle` flips its state.
+    fn disclosure(
+        &self,
+        id: &'static str,
+        label: SharedString,
+        expanded: bool,
+        toggle: fn(&mut Self),
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(id)
+            .mt_1()
+            .gap_1()
+            .items_center()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle(this);
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .small(),
+            )
+            .child(label)
+            .into_any_element()
     }
 
     /// Read and validate the editor form. `Err` is a user-facing message.
-    fn collect(&self, cx: &Context<Self>) -> Result<FormData, SharedString> {
+    fn collect(&self, cx: &Context<Self>) -> Result<FormData, FormError> {
         let Some(editor) = &self.editor else {
-            return Err("No editor open".into());
+            return Err(FormError::plain("No editor open"));
         };
 
         let profile_mode = editor.scheme == "s3" && editor.use_profile;
@@ -392,12 +547,22 @@ impl BookmarkManager {
             if field.secret && profile_mode {
                 continue;
             }
-            let value = input.read(cx).value().trim().to_string();
+            // Secrets are kept exactly as typed: a password may well start
+            // or end with a space.
+            let raw = input.read(cx).value();
+            let value = if field.secret {
+                raw.to_string()
+            } else {
+                raw.trim().to_string()
+            };
             if value.is_empty() {
                 if field.required {
-                    return Err(format!("{} is required", field.label).into());
+                    return Err(FormError::plain(format!("{} is required", field.label)));
                 }
                 continue;
+            }
+            if editor.scheme == "ftp" && field.key == "endpoint" && value.contains("://") {
+                return Err(FormError::plain(t("connect.ftp.no_scheme")));
             }
             if field.secret {
                 secrets.insert(field.key.to_string(), value);
@@ -405,11 +570,32 @@ impl BookmarkManager {
                 options.insert(field.key.to_string(), value);
             }
         }
+        if editor.scheme == "ftp" {
+            let tls = editor
+                .ftp_tls
+                .read(cx)
+                .selected_index(cx)
+                .is_none_or(|ix| ix.row == 0);
+            if let Some(host) = options.remove("endpoint") {
+                options.insert("endpoint".to_string(), ftp_endpoint(&host, tls));
+            }
+        }
+        let layers = apply_limits(
+            &editor.layers,
+            editor.max_connections.read(cx).value().as_ref(),
+            editor.speed_limit.read(cx).value().as_ref(),
+        )
+        .map_err(|error| FormError::plain(error.message()))?;
         if profile_mode {
             let Some(profile) = editor.profile.read(cx).selected_value().cloned() else {
-                return Err("Choose an AWS profile".into());
+                return Err(FormError::plain("Choose an AWS profile"));
             };
             options.insert(AWS_PROFILE_OPT.to_string(), profile.to_string());
+        }
+        if editor.scheme == "sftp" {
+            if let Some(strategy) = &editor.legacy_host_keys {
+                options.insert("known_hosts_strategy".to_string(), strategy.clone());
+            }
         }
 
         // Cloud drives: the refresh token from the browser flow is the real
@@ -420,7 +606,7 @@ impl BookmarkManager {
                     secrets.insert("refresh_token".to_string(), token.clone());
                 }
                 None if !Self::keeps_stored_secret(editor) => {
-                    return Err(t("oauth.needed"));
+                    return Err(FormError::plain(t("oauth.needed")));
                 }
                 None => {}
             }
@@ -456,14 +642,21 @@ impl BookmarkManager {
             scheme: editor.scheme.to_string(),
             options,
             secrets,
+            layers,
             profile_mode,
             meta: db::BookmarkMeta {
                 icon,
                 color,
                 tags,
                 folder_id,
-                // Only used on insert; edits never move a bookmark's space.
-                space_id: cx.global::<AppState>().active_space,
+                // Inserts land in the active space, or the hidden quick-connect
+                // space for a one-off connection; edits never move a site
+                // (except `promote`, handled in `save_site`).
+                space_id: if editor.site_id.is_none() && !editor.save {
+                    QUICK_CONNECT_SPACE
+                } else {
+                    cx.global::<AppState>().active_space
+                },
             },
         })
     }
@@ -494,13 +687,14 @@ impl BookmarkManager {
         let site_id = editor.site_id;
         let had_secret = editor.had_secret;
         let keep_stored = Self::keeps_stored_secret(editor);
+        let promoted = site_id.filter(|_| editor.promote);
 
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
-        let task = state
-            .runtime
-            .spawn(async move { save_site(pool, site_id, form, had_secret, keep_stored).await });
-        self.finish_with(task, true, connect, window, cx);
+        let task = state.runtime.spawn(async move {
+            save_site(pool, site_id, form, had_secret, keep_stored, promoted.is_some()).await
+        });
+        self.finish_with(task, true, connect, promoted, window, cx);
     }
 
     /// Build the layered operator with the form's current values (stored
@@ -523,6 +717,9 @@ impl BookmarkManager {
             .site_id
             .filter(|_| Self::keeps_stored_secret(editor))
             .map(SecretStore::handle_for_site);
+        let endpoint = (form.scheme == "sftp")
+            .then(|| form.options.get("endpoint").cloned())
+            .flatten();
 
         let state = cx.global::<AppState>();
         let defaults = state.config.layers.clone();
@@ -532,6 +729,7 @@ impl BookmarkManager {
 
         self.busy = true;
         self.error = None;
+        self.details_open = false;
         self.notice = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -542,8 +740,10 @@ impl BookmarkManager {
             this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(()) => this.notice = Some("Connection OK".into()),
-                    Err(error) => this.error = Some(format!("{error:#}").into()),
+                    Ok(()) => this.notice = Some(t("connect.test.ok")),
+                    Err(error) => {
+                        this.error = Some(FormError::from_error(&error, endpoint.as_deref()));
+                    }
                 }
                 cx.notify();
             })
@@ -573,7 +773,7 @@ impl BookmarkManager {
             }
         }
         if client_id.is_empty() {
-            self.error = Some("Enter the OAuth client ID first".into());
+            self.error = Some(FormError::plain("Enter the OAuth client ID first"));
             cx.notify();
             return;
         }
@@ -582,13 +782,18 @@ impl BookmarkManager {
             .site_id
             .filter(|_| Self::keeps_stored_secret(editor))
             .map(SecretStore::handle_for_site);
+        let site_id = editor.site_id;
+        let pool = cx.global::<AppState>().db.clone();
 
         let task = cx.global::<AppState>().runtime.spawn(async move {
+            if let Some(site_id) = site_id {
+                db::ensure_site_idle(&pool, site_id).await?;
+            }
             let mut secret = client_secret;
             if secret.is_empty() {
                 if let Some(handle) = stored_handle {
-                    if let Some(stored) = SecretStore::load(&handle)
-                        .ok()
+                    if let Some(stored) = SecretStore::load_optional(&handle)
+                        .context("Couldn't read the saved client secret from the keychain")?
                         .and_then(|mut secrets| secrets.remove("client_secret"))
                     {
                         secret = stored;
@@ -627,7 +832,7 @@ impl BookmarkManager {
                         this.error = None;
                     }
                     Err(error) => {
-                        this.error = Some(format!("{error:#}").into());
+                        this.error = Some(FormError::from_error(&error, None));
                         this.notice = None;
                     }
                 }
@@ -648,12 +853,12 @@ impl BookmarkManager {
             return;
         }
         let Some(profile) = editor.profile.read(cx).selected_value().cloned() else {
-            self.error = Some("Choose an AWS profile first".into());
+            self.error = Some(FormError::plain("Choose an AWS profile first"));
             cx.notify();
             return;
         };
         let Some((start_url, region)) = editor.sso_profiles.get(profile.as_ref()).cloned() else {
-            self.error = Some("The selected profile does not use AWS SSO".into());
+            self.error = Some(FormError::plain("The selected profile does not use AWS SSO"));
             cx.notify();
             return;
         };
@@ -684,7 +889,7 @@ impl BookmarkManager {
                         this.error = None;
                     }
                     Err(error) => {
-                        this.error = Some(format!("{error:#}").into());
+                        this.error = Some(FormError::from_error(&error, None));
                         this.notice = None;
                     }
                 }
@@ -724,11 +929,11 @@ impl BookmarkManager {
         let state = cx.global::<AppState>();
         let pool = state.db.clone();
         let task = state.runtime.spawn(async move {
-            let _ = SecretStore::delete(&SecretStore::handle_for_site(site_id));
             db::delete_site(&pool, site_id).await?;
+            let _ = SecretStore::delete(&SecretStore::handle_for_site(site_id));
             db::list_sites(&pool).await
         });
-        self.finish_with(task, false, false, window, cx);
+        self.finish_with(task, false, false, None, window, cx);
     }
 
     /// Await a DB task that returns the fresh site list, then sync it into
@@ -738,11 +943,13 @@ impl BookmarkManager {
         task: tokio::task::JoinHandle<Result<Vec<SiteProfile>>>,
         close_editor: bool,
         connect: bool,
+        promoted: Option<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.busy = true;
         self.error = None;
+        self.details_open = false;
         self.notice = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -766,17 +973,22 @@ impl BookmarkManager {
                             .flatten();
                         cx.global_mut::<AppState>().sites = sites.clone();
                         this.sites = sites;
+                        this.import = None;
+                        this.load_needs_credentials(cx);
                         if close_editor {
                             this.editor = None;
                         }
                         cx.emit(BookmarkEvent::SitesChanged);
+                        if let Some(site_id) = promoted {
+                            cx.emit(BookmarkEvent::Promoted(site_id));
+                        }
                         if let Some(profile) = added {
                             cx.emit(BookmarkEvent::Connect(profile));
                         }
                     }
                     Err(error) => {
                         tracing::error!(%error, "bookmark save/delete failed");
-                        this.error = Some(format!("{error:#}").into());
+                        this.error = Some(FormError::from_error(&error, None));
                     }
                 }
                 cx.notify();
@@ -786,12 +998,40 @@ impl BookmarkManager {
         .detach();
     }
 
+    fn render_error(&self, error: &FormError, cx: &Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let toggle = move |_: &mut Window, cx: &mut gpui::App| {
+            weak.update(cx, |this, cx| {
+                this.details_open = !this.details_open;
+                cx.notify();
+            })
+            .ok();
+        };
+        let review = error.untrusted_host.clone().map(|(host, port)| {
+            let weak = cx.entity().downgrade();
+            Box::new(move |window: &mut Window, cx: &mut gpui::App| {
+                let weak = weak.clone();
+                open_host_key_dialog(
+                    host.clone(),
+                    port,
+                    Rc::new(move |window, cx| {
+                        weak.update(cx, |this, cx| this.test_connection(window, cx)).ok();
+                    }),
+                    window,
+                    cx,
+                );
+            }) as Box<dyn Fn(&mut Window, &mut gpui::App)>
+        });
+        error_block("bookmark-error", error, self.details_open, toggle, review, cx)
+    }
+
     fn render_list(&self, cx: &Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let rows: Vec<AnyElement> = self
             .sites
             .iter()
             .enumerate()
+            .filter(|(_, site)| site.space_id != QUICK_CONNECT_SPACE)
             .map(|(ix, site)| {
                 let driver_label = driver_by_scheme(&site.scheme)
                     .map(|spec| spec.label)
@@ -800,6 +1040,7 @@ impl BookmarkManager {
                 let site_id = site.id;
                 let edit_ix = ix;
                 let armed = self.confirm_delete == Some(site_id);
+                let needs_credentials = self.needs_credentials.contains(&site_id);
                 h_flex()
                     .gap_2()
                     .px_2()
@@ -816,14 +1057,28 @@ impl BookmarkManager {
                                     .text_sm()
                                     .text_color(muted)
                                     .child(driver_label.to_string()),
-                            ),
+                            )
+                            .when(needs_credentials, |col| {
+                                col.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().warning)
+                                        .child(t("site.import.needs_credentials")),
+                                )
+                            }),
                     )
                     .child(
                         Button::new(("connect", ix))
                             .label("Connect")
                             .primary()
                             .small()
-                            .on_click(cx.listener(move |_, _, window, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if needs_credentials {
+                                    let site = this.sites.get(edit_ix).cloned();
+                                    this.open_editor(site.as_ref(), window, cx);
+                                    this.notice = Some(t("site.import.enter_credentials"));
+                                    return;
+                                }
                                 cx.emit(BookmarkEvent::Connect(site_for_connect.clone()));
                                 gpui_component::WindowExt::close_dialog(window, cx);
                             })),
@@ -889,15 +1144,181 @@ impl BookmarkManager {
             })
             .children(rows)
             .child(
-                h_flex().justify_end().child(
-                    Button::new("add-bookmark")
-                        .label("Add bookmark")
-                        .icon(Icon::new(IconName::Plus))
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_editor(None, window, cx);
-                        })),
-                ),
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("import-sites")
+                            .label(t("site.import.button"))
+                            .outline()
+                            .small()
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_import_files(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("add-bookmark")
+                            .label("Add bookmark")
+                            .icon(Icon::new(IconName::Plus))
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_editor(None, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Ask for FileZilla / Cyberduck files and show what they would import.
+    /// Nothing is saved until the user confirms the preview.
+    fn pick_import_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(t("site.import.button")),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let parsed: Result<Vec<ImportEntry>, FormError> = paths
+                .iter()
+                .map(|path| {
+                    let file = path.display().to_string();
+                    let text = std::fs::read_to_string(path).map_err(|error| {
+                        FormError::plain(format!("{file}: {error}"))
+                    })?;
+                    import::parse(&text)
+                        .map_err(|error| FormError::plain(format!("{file}: {error}")))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|files| files.into_iter().flatten().collect());
+            this.update(cx, |this, cx| {
+                match parsed {
+                    Ok(entries) if entries.is_empty() => {
+                        this.error = Some(FormError::plain(t("site.import.empty")));
+                    }
+                    Ok(entries) => {
+                        this.error = None;
+                        this.import = Some(ImportPreview { entries });
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = &self.import else { return };
+        if self.busy {
+            return;
+        }
+        let sites: Vec<db::ImportSite> = preview
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let target = entry.target.as_ref().ok()?;
+                Some(db::ImportSite {
+                    name: entry.name.clone(),
+                    scheme: target.scheme.to_string(),
+                    options: target.options.clone(),
+                    folder: entry.folder.clone(),
+                    needs_credentials: target.needs_credentials,
+                })
+            })
+            .collect();
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let space_id = state.active_space;
+        let task = state.runtime.spawn(async move {
+            db::import_sites(&pool, space_id, &sites).await?;
+            db::list_sites(&pool).await
+        });
+        self.finish_with(task, false, false, None, window, cx);
+    }
+
+    fn render_import(&self, preview: &ImportPreview, cx: &Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let importable = preview.entries.iter().filter(|entry| entry.target.is_ok()).count();
+        let rows: Vec<AnyElement> = preview
+            .entries
+            .iter()
+            .map(|entry| {
+                let (detail, color) = match &entry.target {
+                    Ok(target) => {
+                        let label = driver_by_scheme(target.scheme)
+                            .map_or(target.scheme, |spec| spec.label);
+                        let detail = if target.needs_credentials {
+                            format!("{label} · {}", t("site.import.needs_credentials"))
+                        } else {
+                            label.to_string()
+                        };
+                        (detail, muted)
+                    }
+                    Err(protocol) => (
+                        tf("site.import.unsupported", &[("protocol", protocol)]).to_string(),
+                        cx.theme().danger,
+                    ),
+                };
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().truncate().child(entry.name.clone()))
+                    .child(div().text_sm().text_color(color).child(detail))
+                    .children(entry.folder.clone().map(|folder| {
+                        div().text_xs().text_color(muted).child(tf(
+                            "site.import.folder",
+                            &[("folder", &folder)],
+                        ))
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .gap_2()
+            .child(div().text_sm().text_color(muted).child(tf(
+                "site.import.summary",
+                &[
+                    ("count", &importable.to_string()),
+                    ("total", &preview.entries.len().to_string()),
+                ],
+            )))
+            .child(v_flex().id("import-rows").max_h(gpui::px(320.)).overflow_y_scroll().children(rows))
+            .child(div().text_xs().text_color(muted).child(t("site.import.passwords_note")))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new("import-cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .small()
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.import = None;
+                                this.error = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("import-confirm")
+                            .label(tf("site.import.confirm", &[("count", &importable.to_string())]))
+                            .primary()
+                            .small()
+                            .loading(self.busy)
+                            .disabled(self.busy || importable == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_import(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -930,6 +1351,36 @@ impl BookmarkManager {
                 field.label.to_string()
             };
             fields.push(labeled(label, muted, Input::new(input).into_any_element()));
+            if editor.scheme == "ftp" && field.key == "endpoint" {
+                fields.push(labeled(
+                    t("connect.ftp.security"),
+                    muted,
+                    Select::new(&editor.ftp_tls).into_any_element(),
+                ));
+                let plain = editor
+                    .ftp_tls
+                    .read(cx)
+                    .selected_index(cx)
+                    .is_some_and(|ix| ix.row == 1);
+                if plain {
+                    fields.push(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().warning)
+                            .child(t("connect.ftp.plain_warning"))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if editor.scheme == "sftp" {
+            fields.push(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(t("connect.sftp.auth_note"))
+                    .into_any_element(),
+            );
         }
         if editor.scheme == "s3" {
             fields.push(labeled(
@@ -993,15 +1444,23 @@ impl BookmarkManager {
             }
         }
 
-        // Cloud drives: credentials come from the browser flow, not typing.
+        // Cloud drives: credentials come from the browser flow, not typing,
+        // and the flow needs the user's own OAuth client.
         if is_oauth_scheme(editor.scheme) {
+            let has_client_id = editor
+                .inputs
+                .iter()
+                .any(|(field, input)| field.key == "client_id" && !input.read(cx).value().trim().is_empty());
             let (status, color) = if editor.oauth_token.is_some() {
                 (t("oauth.signed_in_new"), cx.theme().success)
             } else if Self::keeps_stored_secret(editor) {
                 (t("oauth.signed_in"), cx.theme().success)
-            } else {
+            } else if has_client_id {
                 (t("oauth.needed"), muted)
+            } else {
+                (t("oauth.client_needed"), muted)
             };
+            let setup_url = oauth_setup_url(editor.scheme);
             fields.push(
                 h_flex()
                     .gap_2()
@@ -1012,7 +1471,7 @@ impl BookmarkManager {
                             .outline()
                             .small()
                             .loading(editor.oauth_busy)
-                            .disabled(editor.oauth_busy || self.busy)
+                            .disabled(editor.oauth_busy || self.busy || !has_client_id)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.oauth_sign_in(window, cx);
                             })),
@@ -1027,33 +1486,67 @@ impl BookmarkManager {
                     .child(t("oauth.redirect_hint"))
                     .into_any_element(),
             );
+            if let Some(url) = setup_url {
+                fields.push(
+                    Button::new("oauth-setup")
+                        .label(t("oauth.setup_steps"))
+                        .icon(Icon::default().path("icons/external-link.svg"))
+                        .link()
+                        .small()
+                        .on_click(move |_, _, cx| cx.open_url(url))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        // Per-site limits. Optional and rarely touched: collapsed unless the
+        // site already sets one.
+        fields.push(self.disclosure(
+            "advanced-disclosure",
+            t("site.advanced"),
+            editor.advanced_expanded,
+            |this| {
+                if let Some(editor) = &mut this.editor {
+                    editor.advanced_expanded = !editor.advanced_expanded;
+                }
+            },
+            cx,
+        ));
+        if editor.advanced_expanded {
+            fields.push(labeled(
+                t("site.limits.connections"),
+                muted,
+                Input::new(&editor.max_connections).into_any_element(),
+            ));
+            fields.push(labeled(
+                t("site.limits.speed"),
+                muted,
+                Input::new(&editor.speed_limit).into_any_element(),
+            ));
+            fields.push(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(t("site.limits.hint"))
+                    .into_any_element(),
+            );
         }
 
         // Sidebar presentation: icon, color, tags, folder. Optional and
         // secondary, so it lives behind a disclosure — collapsed by default
         // for a new connection, expanded when editing a saved site.
         let expanded = editor.appearance_expanded;
-        fields.push(
-            h_flex()
-                .id("appearance-disclosure")
-                .mt_1()
-                .gap_1()
-                .items_center()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(muted)
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_appearance(cx)))
-                .child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .small(),
-                )
-                .child("APPEARANCE & ORGANIZATION")
-                .into_any_element(),
-        );
+        fields.push(self.disclosure(
+            "appearance-disclosure",
+            "APPEARANCE & ORGANIZATION".into(),
+            expanded,
+            |this| {
+                if let Some(editor) = &mut this.editor {
+                    editor.appearance_expanded = !editor.appearance_expanded;
+                }
+            },
+            cx,
+        ));
         if !expanded {
             // Nothing else in this section when collapsed.
             return self.editor_frame(fields, cx);
@@ -1176,15 +1669,33 @@ impl BookmarkManager {
     }
 
     /// Wrap the editor fields with the shared action row. A new connection
-    /// offers "Save" (bookmark only) plus a primary "Connect" (save + open);
-    /// editing a saved site keeps a single primary "Save".
+    /// has a "Save this site" checkbox (on by default): checked, it offers
+    /// "Save" plus a primary "Connect" that saves and opens; unchecked, only
+    /// a one-off "Connect". Editing a saved site keeps a single "Save".
     fn editor_frame(&self, fields: Vec<AnyElement>, cx: &Context<Self>) -> AnyElement {
         let is_edit = self
             .editor
             .as_ref()
             .and_then(|editor| editor.site_id)
             .is_some();
+        let save = self.editor.as_ref().is_none_or(|editor| editor.save);
         let busy = self.busy;
+        let weak = cx.entity().downgrade();
+        let save_toggle = (!is_edit).then(|| {
+            Checkbox::new("save-site")
+                .label(t("connect.save_site"))
+                .checked(save)
+                .on_click(move |checked, _, cx| {
+                    let checked = *checked;
+                    weak.update(cx, |this, cx| {
+                        if let Some(editor) = &mut this.editor {
+                            editor.save = checked;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+        });
 
         let mut actions = h_flex()
             .gap_2()
@@ -1228,16 +1739,18 @@ impl BookmarkManager {
             );
         } else {
             actions = actions
-                .child(
-                    Button::new("save-bookmark")
-                        .label("Save")
-                        .outline()
-                        .small()
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.save(false, window, cx);
-                        })),
-                )
+                .when(save, |actions| {
+                    actions.child(
+                        Button::new("save-bookmark")
+                            .label("Save")
+                            .outline()
+                            .small()
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save(false, window, cx);
+                            })),
+                    )
+                })
                 .child(
                     Button::new("save-and-connect")
                         .label("Connect")
@@ -1253,6 +1766,7 @@ impl BookmarkManager {
         v_flex()
             .gap_3()
             .children(fields)
+            .children(save_toggle.map(|toggle| div().mt_1().child(toggle)))
             .child(actions)
             .into_any_element()
     }
@@ -1262,18 +1776,15 @@ impl Render for BookmarkManager {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.editor.is_some() {
             self.render_editor(cx)
+        } else if let Some(preview) = &self.import {
+            self.render_import(preview, cx)
         } else {
             self.render_list(cx)
         };
         v_flex()
             .gap_2()
             .child(body)
-            .children(self.error.clone().map(|error| {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().danger)
-                    .child(error)
-            }))
+            .children(self.error.as_ref().map(|error| self.render_error(error, cx)))
             .children(self.notice.clone().map(|notice| {
                 div()
                     .text_sm()
@@ -1314,50 +1825,113 @@ fn section(label: &'static str, muted: Hsla) -> AnyElement {
 /// Keychain rules: profile mode owns no entry; a scheme change invalidates
 /// the stored entry (`keep_stored` false); otherwise blank secret fields mean
 /// "keep the stored value" and typed ones overwrite it.
+///
+/// A failed keychain write leaves the previous site and credentials as they
+/// were: an edit writes the keychain first and restores it if the row then
+/// fails, a new site's row is removed again.
 async fn save_site(
     pool: SqlitePool,
     site_id: Option<i64>,
     form: FormData,
     had_secret: bool,
     keep_stored: bool,
+    promote: bool,
 ) -> Result<Vec<SiteProfile>> {
-    let id = match site_id {
+    match site_id {
         Some(id) => {
-            db::update_site(&pool, id, &form.name, &form.scheme, &form.options, &form.meta)
-                .await?;
-            id
+            db::ensure_site_retargetable(&pool, id, &form.scheme, &form.options).await?;
+            // A new sign-in can be another account, which no option shows.
+            if form.secrets.contains_key("refresh_token") {
+                db::ensure_site_idle(&pool, id).await?;
+            }
+            update_existing(&pool, id, &form, had_secret, keep_stored, promote).await?;
         }
-        None => {
-            db::insert_site(
-                &pool,
-                &form.name,
-                &form.scheme,
-                &form.options,
-                &LayerConfig::default(),
-                &form.meta,
-            )
-            .await?
-        }
-    };
-
+        None => insert_new(&pool, &form).await?,
+    }
     // Tags live as first-class rows too (lowercase, optional color).
     db::upsert_tags(&pool, &form.meta.tags).await?;
+    db::list_sites(&pool).await
+}
 
+async fn insert_new(pool: &SqlitePool, form: &FormData) -> Result<()> {
+    let id = db::insert_site(
+        pool,
+        &form.name,
+        &form.scheme,
+        &form.options,
+        &form.layers,
+        &form.meta,
+    )
+    .await?;
+    if form.secrets.is_empty() {
+        return Ok(());
+    }
     let handle = SecretStore::handle_for_site(id);
-    if form.profile_mode || (form.secrets.is_empty() && had_secret && !keep_stored) {
-        // No secrets belong to this site anymore; drop a stale entry.
-        if had_secret {
-            let _ = SecretStore::delete(&handle);
-            db::set_site_secret_handle(&pool, id, None).await?;
+    let stored = match SecretStore::store(&handle, &form.secrets) {
+        Ok(()) => db::set_site_secret_handle(pool, id, Some(&handle)).await,
+        Err(error) => Err(error.into()),
+    };
+    if stored.is_err() {
+        let _ = SecretStore::delete(&handle);
+        let _ = db::delete_site(pool, id).await;
+    }
+    stored
+}
+
+async fn update_existing(
+    pool: &SqlitePool,
+    id: i64,
+    form: &FormData,
+    had_secret: bool,
+    keep_stored: bool,
+    promote: bool,
+) -> Result<()> {
+    let write_row = || async {
+        db::update_site(pool, id, &form.name, &form.scheme, &form.options, &form.layers, &form.meta)
+            .await?;
+        if promote {
+            sqlx::query("UPDATE sites SET space_id = ? WHERE id = ?")
+                .bind(form.meta.space_id)
+                .bind(id)
+                .execute(pool)
+                .await?;
         }
-    } else if !form.secrets.is_empty() {
-        let mut merged = stored_secrets(&handle, &form.scheme, keep_stored);
-        merged.extend(form.secrets);
-        SecretStore::store(&handle, &merged)?;
-        db::set_site_secret_handle(&pool, id, Some(&handle)).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let handle = SecretStore::handle_for_site(id);
+
+    // No secrets belong to this site anymore: drop the row's reference, then
+    // the stale entry.
+    if had_secret && (form.profile_mode || (form.secrets.is_empty() && !keep_stored)) {
+        write_row().await?;
+        db::set_site_secret_handle(pool, id, None).await?;
+        let _ = SecretStore::delete(&handle);
+        return Ok(());
+    }
+    if form.secrets.is_empty() {
+        return write_row().await;
     }
 
-    db::list_sites(&pool).await
+    let previous = SecretStore::load_optional(&handle)
+        .context("Couldn't read the saved passwords from the keychain")?;
+    let mut merged = match (&previous, keep_stored) {
+        (Some(previous), true) => allowed_secrets(previous.clone(), &form.scheme),
+        _ => HashMap::new(),
+    };
+    merged.extend(form.secrets.clone());
+    SecretStore::store(&handle, &merged)?;
+    let saved = async {
+        write_row().await?;
+        db::set_site_secret_handle(pool, id, Some(&handle)).await
+    }
+    .await;
+    if saved.is_err() {
+        let _ = match &previous {
+            Some(previous) => SecretStore::store(&handle, previous),
+            None => SecretStore::delete(&handle),
+        };
+    }
+    saved
 }
 
 /// A display name for a connection when the user left the field blank:
@@ -1383,18 +1957,26 @@ fn derive_name(scheme: &str, options: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| scheme.to_string())
 }
 
-/// The stored keychain map, restricted to the secret keys the current scheme
-/// actually declares (stale keys from an earlier scheme are dropped).
-fn stored_secrets(handle: &str, scheme: &str, keep_stored: bool) -> HashMap<String, String> {
-    if !keep_stored {
-        return HashMap::new();
-    }
+/// The keychain map restricted to the secret keys the scheme actually
+/// declares (stale keys from an earlier scheme are dropped).
+fn allowed_secrets(secrets: HashMap<String, String>, scheme: &str) -> HashMap<String, String> {
     let allowed = secret_keys(scheme);
-    SecretStore::load(handle)
-        .unwrap_or_default()
+    secrets
         .into_iter()
         .filter(|(key, _)| allowed.contains(&key.as_str()))
         .collect()
+}
+
+/// The stored keychain map for a connection test. A missing entry is empty;
+/// any other keychain failure is an error, so a locked keychain can't make a
+/// test silently drop the other secrets.
+fn stored_secrets(handle: &str, scheme: &str) -> Result<HashMap<String, String>> {
+    Ok(allowed_secrets(
+        SecretStore::load_optional(handle)
+            .context("Couldn't read the saved passwords from the keychain")?
+            .unwrap_or_default(),
+        scheme,
+    ))
 }
 
 /// Probe a backend with the form's values without persisting anything:
@@ -1407,7 +1989,7 @@ async fn test_site(
 ) -> Result<()> {
     let mut options = form.options;
     if let Some(handle) = stored_handle {
-        for (key, value) in stored_secrets(&handle, &form.scheme, true) {
+        for (key, value) in stored_secrets(&handle, &form.scheme)? {
             options.entry(key).or_insert(value);
         }
     }
