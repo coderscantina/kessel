@@ -109,6 +109,7 @@ sha1 = "0.10"
 base64 = "0.22"
 rand = "0.10"
 url = "2"
+quick-xml = "0.41"
 
 # Zed theme / icon-theme extension downloads: the Zed API serves each
 # extension as a gzipped tar, which the theme browser unpacks into

@@ -4158,6 +4158,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "opendal",
  "openssh-sftp-client",
+ "quick-xml 0.41.0",
  "rand 0.10.2",
  "raw-window-handle",
  "reqsign",
