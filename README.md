@@ -155,17 +155,13 @@ wrapped in a composable, per-site layer stack:
 ### Prerequisites
 
 - Rust stable (latest; GPUI tracks latest stable)
-- macOS 12+ or Windows 10+ — both are built and tested in CI
+- macOS 12+, the platform built and tested in CI and shipped in releases
 
-SFTP is macOS/Linux only: its transport drives the system `ssh` binary through
-a unix control socket, so the Windows build ships without that backend. Every
-other backend — S3, FTP, WebDAV, GCS, Azure Blob, Drive, Dropbox, OneDrive and
-the local filesystem — is available on both.
+Windows builds are paused for now. The Windows code stays in the tree, but CI
+does not compile it and releases do not include it.
 
-One other difference: dragging entries out to Finder or Explorer promises
-remote *files* on both platforms, but remote *folders* only on macOS — the
-Windows protocol needs every file named before the drag starts. Drag a folder
-through the transfer queue instead.
+SFTP signs in with a key or the SSH agent through the system `ssh` binary.
+Password login is not supported.
 
 ### Build & run
 
@@ -188,22 +184,6 @@ identity) and notarizes via `KESSEL_NOTARY_PROFILE` or
 `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_PASSWORD`; without an identity it falls
 back to an ad-hoc-signed, non-notarized DMG for local use.
 
-### Package a Windows build
-
-```powershell
-scripts\package-windows.ps1     # → target\dist\kessel-<version>-x86_64.exe (+ .zip, + .sha256)
-```
-
-kessel is a single self-contained executable on Windows — assets, icons,
-migrations and config defaults are all compiled in — so there is no installer:
-put the `.exe` where you want it and run it. The script signs it when
-`KESSEL_WIN_CERT` (a `.pfx`) or `KESSEL_WIN_CERT_THUMBPRINT` is set, and warns
-that SmartScreen will flag the download when neither is.
-
-The app icon and version metadata are compiled into the executable by
-`build.rs`; regenerate the `.ico` files from the SVG sources with
-`scripts/gen-icons.sh` after changing the artwork.
-
 ## Releases & versioning
 
 - **CalVer**: releases are tagged `vYY.M.D` (e.g. `v26.7.10`) — the version
@@ -214,14 +194,11 @@ The app icon and version metadata are compiled into the executable by
   written to be read.
 - `scripts/release.sh` cuts a release: bumps `Cargo.toml`, creates the
   `🔖 Release` commit, folds the generated changelog entry into it, tags and
-  pushes — and the tag triggers the GitHub workflow, which builds every
-  platform in parallel (a signed, notarized universal DMG on macOS; a signed
-  executable on Windows) and publishes them in one release alongside a
-  per-platform update manifest.
+  pushes — and the tag triggers the GitHub workflow, which builds a signed,
+  notarized universal DMG and publishes it alongside the update manifest.
 - **Auto-update**: kessel checks the latest release on startup (daily
   thereafter, `update.check = false` to opt out) and offers a one-click,
-  checksum-verified install-and-relaunch — swapping the `.app` bundle on
-  macOS, the `.exe` on Windows.
+  checksum-verified install-and-relaunch that swaps the `.app` bundle.
 
 ### Configuration
 

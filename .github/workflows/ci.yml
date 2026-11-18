@@ -1,9 +1,5 @@
 name: CI
 
-# kessel is built for macOS and Windows from one tree, and most of what breaks
-# a Windows build (a unix-only crate, `std::os::unix`, a path assumption) does
-# so at compile time. Building both on every push catches it here rather than
-# at tag time, when the release workflow would be the first Windows compile.
 on:
   push:
     branches: [main]
@@ -15,14 +11,8 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: macOS, os: macos-14 }
-          - { name: Windows, os: windows-latest }
+    name: macOS
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
