@@ -55,6 +55,8 @@ actions!(
         PrevTab,
         ToggleSidebar,
         ToggleTransfers,
+        ShowTransfers,
+        FocusTransfers,
         ToggleLogs,
         LayoutSingle,
         LayoutSplitH,
@@ -1017,6 +1019,21 @@ impl KesselApp {
         self.toggle_bottom(BottomPanel::Transfers, cx);
     }
 
+    /// Open the queue without moving the keyboard: where every "queued" note
+    /// leads, whichever way the transfer was started.
+    fn on_show_transfers(&mut self, _: &ShowTransfers, _: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        cx.notify();
+    }
+
+    /// Open the queue and give it the keyboard.
+    fn on_focus_transfers(&mut self, _: &FocusTransfers, window: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        let focus = self.transfers.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn on_toggle_logs(&mut self, _: &ToggleLogs, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_bottom(BottomPanel::Logs, cx);
     }
@@ -1654,6 +1671,10 @@ impl KesselApp {
             TransfersRequest::ShowInPane { site_id, dir } => {
                 self.show_in_pane(*site_id, dir.clone(), window, cx);
             }
+            TransfersRequest::ReturnToPane => {
+                self.pending_pane_focus = true;
+                cx.notify();
+            }
         }
     }
 
@@ -1967,9 +1988,6 @@ impl KesselApp {
         src_pane
             .clone()
             .update(cx, |pane, cx| pane.submit_jobs(jobs, window, cx));
-        // Surface the queue right where the work was kicked off.
-        self.bottom_dock = Some(BottomPanel::Transfers);
-        cx.notify();
     }
 
     // --- panel size persistence ---
@@ -2379,6 +2397,8 @@ impl KesselApp {
         } else {
             Some(panel)
         };
+        // A closing panel may hold the keyboard; hand it back to the files.
+        self.pending_pane_focus |= self.bottom_dock.is_none();
         cx.notify();
     }
 
@@ -2426,6 +2446,7 @@ impl KesselApp {
                             .tooltip(t("dock.close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bottom_dock = None;
+                                this.pending_pane_focus = true;
                                 cx.notify();
                             })),
                     ),
@@ -4003,10 +4024,14 @@ impl Render for KesselApp {
             window.focus(&focus, cx);
         }
         // Keyboard shortcuts must work everywhere: when nothing holds focus
-        // (empty space, freshly closed dialog), park it on the workspace so
-        // Workspace-context bindings (quit, tabs, panels) keep firing.
+        // (empty space, a dialog that opened with nothing focused), park it
+        // on the active pane, or the workspace when no pane is showing.
         if window.focused(cx).is_none() && self.rename.is_none() {
-            window.focus(&self.focus_handle, cx);
+            let focus = match self.active_tab().map(|tab| &tab.content) {
+                Some(TabContent::Panes(workspace)) => workspace.panes[workspace.active].focus_handle(cx),
+                _ => self.focus_handle.clone(),
+            };
+            window.focus(&focus, cx);
         }
 
         // Where the OS draws no menu bar, kessel draws one in its title bar.
@@ -4118,6 +4143,8 @@ impl Render for KesselApp {
             .on_action(cx.listener(Self::on_layout_split_v))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_transfers))
+            .on_action(cx.listener(Self::on_show_transfers))
+            .on_action(cx.listener(Self::on_focus_transfers))
             .on_action(cx.listener(Self::on_toggle_logs))
             .on_action(cx.listener(Self::on_open_bookmarks))
             .on_action(cx.listener(Self::on_about))

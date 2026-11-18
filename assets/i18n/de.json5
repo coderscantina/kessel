@@ -428,4 +428,23 @@
   "file_pane.search.unreadable": "{count} nicht lesbare Ordner übersprungen",
   "file_pane.search.stop": "Stopp",
   "file_pane.search.reveal": "Im Ordner anzeigen",
+
+  // Tastaturbefehle und der Weg zur Warteschlange.
+  "menu.file.upload": "Hochladen…",
+  "menu.file.download": "Herunterladen",
+  "menu.file.download_to": "Herunterladen nach…",
+  "menu.file.rename": "Umbenennen…",
+  "menu.file.delete": "Löschen…",
+  "cmdbar.command.download": "Auswahl herunterladen",
+  "cmdbar.command.download_to": "Auswahl herunterladen nach…",
+  "cmdbar.command.upload": "Hochladen…",
+  "cmdbar.command.rename": "Auswahl umbenennen",
+  "cmdbar.command.delete": "Auswahl löschen",
+  "cmdbar.command.copy_to_other": "In anderen Bereich kopieren",
+  "cmdbar.command.move_to_other": "In anderen Bereich verschieben",
+  "cmdbar.command.focus_transfers": "Übertragungen fokussieren",
+  "file_pane.queued.show": "Übertragungen anzeigen",
+  "file_pane.delete.stopped_title": "{deleted} von {total} Objekten gelöscht",
+  "file_pane.delete.stopped_failed": "„{name}“ konnte nicht gelöscht werden: {reason}",
+  "file_pane.delete.stopped_remaining": "Nicht versucht: {names}.",
 }

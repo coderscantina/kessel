@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, list, px, AnyElement, App, Context, EventEmitter, ListAlignment, ListState,
-    SharedString, WeakEntity, Window,
+    actions, div, list, px, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, SharedString, WeakEntity, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
@@ -35,6 +35,20 @@ use crate::queue::{
     QueueSnapshot, TaskSnapshot, LOCAL_SITE_ID,
 };
 use crate::ui::{human_duration, human_size, human_time};
+
+actions!(
+    transfers,
+    [
+        SelectNextJob,
+        SelectPrevJob,
+        ToggleJobFiles,
+        PauseResumeJob,
+        RetryJob,
+        ResolveJobConflicts,
+        CancelJob,
+        ReturnToPane
+    ]
+);
 
 /// Rows fetched per page for the per-job drill-down and the history list.
 const PAGE: i64 = 200;
@@ -143,6 +157,8 @@ pub enum TransfersRequest {
     ConflictParked { job_id: i64 },
     /// Show a finished job's destination folder in a file pane.
     ShowInPane { site_id: i64, dir: String },
+    /// Escape in the panel: the keyboard goes back to the active file pane.
+    ReturnToPane,
 }
 
 /// A fetched list and whether it's still loading or failed.
@@ -161,6 +177,9 @@ struct Drill {
 }
 
 pub struct TransfersPanel {
+    focus_handle: FocusHandle,
+    /// Job the keyboard acts on.
+    selected_job: Option<i64>,
     snapshot: QueueSnapshot,
     jobs_list: ListState,
     drills: HashMap<i64, Drill>,
@@ -173,6 +192,12 @@ pub struct TransfersPanel {
     history: Fetched<Vec<HistoryEntry>>,
     history_limit: i64,
     history_list: ListState,
+}
+
+impl Focusable for TransfersPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl EventEmitter<TransfersEvent> for TransfersPanel {}
@@ -477,6 +502,8 @@ impl TransfersPanel {
         let snapshot = handle.latest();
         let jobs_list = ListState::new(snapshot.jobs.len(), ListAlignment::Top, px(200.));
         Self {
+            focus_handle: cx.focus_handle(),
+            selected_job: None,
             snapshot,
             jobs_list,
             drills: HashMap::new(),
@@ -537,6 +564,86 @@ impl TransfersPanel {
             cx.emit(TransfersRequest::ConflictParked { job_id });
         }
         cx.notify();
+    }
+
+    // --- keyboard ---
+
+    /// Row of the job the keyboard acts on, falling back to the first job
+    /// when the selected one has left the queue.
+    fn selected_ix(&self) -> Option<usize> {
+        let jobs = &self.snapshot.jobs;
+        let selected = self.selected_job.and_then(|id| jobs.iter().position(|job| job.id == id));
+        selected.or((!jobs.is_empty()).then_some(0))
+    }
+
+    fn selected_snapshot(&self) -> Option<&JobSnapshot> {
+        self.snapshot.jobs.get(self.selected_ix()?)
+    }
+
+    fn step_job(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.selected_ix() else { return };
+        let last = self.snapshot.jobs.len() as isize - 1;
+        let next = if self.selected_job.is_none() { current } else {
+            (current as isize + delta).clamp(0, last) as usize
+        };
+        self.selected_job = Some(self.snapshot.jobs[next].id);
+        self.jobs_list.scroll_to_reveal_item(next);
+        cx.notify();
+    }
+
+    fn select_next_job(&mut self, _: &SelectNextJob, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_job(1, cx);
+    }
+
+    fn select_prev_job(&mut self, _: &SelectPrevJob, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_job(-1, cx);
+    }
+
+    fn toggle_job_files(&mut self, _: &ToggleJobFiles, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_snapshot().map(|job| job.id) {
+            self.toggle_drill(id, false, cx);
+        }
+    }
+
+    fn pause_resume_job(&mut self, _: &PauseResumeJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        match job.state {
+            JobState::Active | JobState::Queued => queue.pause(job.id),
+            JobState::Paused => queue.resume(job.id),
+            _ => {}
+        }
+    }
+
+    fn retry_job(&mut self, _: &RetryJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        match job.state {
+            JobState::Failed | JobState::Cancelled => queue.retry(job.id),
+            JobState::Done if job.files_failed > 0 => queue.retry_failed(job.id),
+            _ => {}
+        }
+    }
+
+    fn resolve_job_conflicts(&mut self, _: &ResolveJobConflicts, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(job) = self.selected_snapshot().filter(|job| job.files_conflict > 0) {
+            open_resolve_dialog(job.id, window, cx);
+        }
+    }
+
+    /// Cancel a running job; a finished one leaves the queue view.
+    fn cancel_job(&mut self, _: &CancelJob, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_snapshot() else { return };
+        let queue = &cx.global::<AppState>().queue;
+        if job.state.is_terminal() {
+            queue.remove(job.id);
+        } else if job.state != JobState::Cancelling {
+            queue.cancel(job.id);
+        }
+    }
+
+    fn return_to_pane(&mut self, _: &ReturnToPane, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TransfersRequest::ReturnToPane);
     }
 
     /// Tell the job list its rows changed; heights vary, so they remeasure.
@@ -789,6 +896,7 @@ impl TransfersPanel {
         let is_expanded = drill.is_some();
         let failed_open = drill.is_some_and(|drill| drill.failed_only);
         let local_download = is_local_download(job);
+        let keyboard_row = self.selected_job == Some(id);
 
         let controls = h_flex()
             .gap_1()
@@ -891,6 +999,7 @@ impl TransfersPanel {
             .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
+            .when(keyboard_row, |this| this.bg(cx.theme().list_active))
             .context_menu(move |menu, _, cx| build_job_menu(menu, &menu_job, is_expanded, weak.clone(), cx))
             .child(
                 h_flex()
@@ -1281,6 +1390,16 @@ impl Render for TransfersPanel {
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().sidebar)
+            .key_context("TransfersPanel")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next_job))
+            .on_action(cx.listener(Self::select_prev_job))
+            .on_action(cx.listener(Self::toggle_job_files))
+            .on_action(cx.listener(Self::pause_resume_job))
+            .on_action(cx.listener(Self::retry_job))
+            .on_action(cx.listener(Self::resolve_job_conflicts))
+            .on_action(cx.listener(Self::cancel_job))
+            .on_action(cx.listener(Self::return_to_pane))
             .child(
                 h_flex()
                     .px_3()

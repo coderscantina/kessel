@@ -438,4 +438,23 @@
   "file_pane.search.unreadable": "{count} unreadable folders skipped",
   "file_pane.search.stop": "Stop",
   "file_pane.search.reveal": "Show in Folder",
+
+  // Keyboard commands and the route to the queue.
+  "menu.file.upload": "Upload…",
+  "menu.file.download": "Download",
+  "menu.file.download_to": "Download To…",
+  "menu.file.rename": "Rename…",
+  "menu.file.delete": "Delete…",
+  "cmdbar.command.download": "Download Selection",
+  "cmdbar.command.download_to": "Download Selection To…",
+  "cmdbar.command.upload": "Upload…",
+  "cmdbar.command.rename": "Rename Selection",
+  "cmdbar.command.delete": "Delete Selection",
+  "cmdbar.command.copy_to_other": "Copy to Other Pane",
+  "cmdbar.command.move_to_other": "Move to Other Pane",
+  "cmdbar.command.focus_transfers": "Focus Transfers",
+  "file_pane.queued.show": "Show transfers",
+  "file_pane.delete.stopped_title": "Deleted {deleted} of {total} items",
+  "file_pane.delete.stopped_failed": "“{name}” couldn't be deleted: {reason}",
+  "file_pane.delete.stopped_remaining": "Not attempted: {names}.",
 }

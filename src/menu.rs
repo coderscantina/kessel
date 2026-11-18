@@ -63,6 +63,13 @@ pub fn install(cx: &mut App) {
         MenuItem::action(t("menu.file.bookmarks"), OpenBookmarks),
         MenuItem::action(t("menu.file.new_folder"), file_pane::NewFolder),
         MenuItem::separator(),
+        MenuItem::action(t("menu.file.upload"), file_pane::Upload),
+        MenuItem::action(t("menu.file.download"), file_pane::Download),
+        MenuItem::action(t("menu.file.download_to"), file_pane::DownloadTo),
+        MenuItem::separator(),
+        MenuItem::action(t("menu.file.rename"), file_pane::RenameSelected),
+        MenuItem::action(t("menu.file.delete"), file_pane::DeleteSelected),
+        MenuItem::separator(),
         MenuItem::action(t("menu.file.synchronize"), SyncPanes),
     ];
     if !cfg!(target_os = "macos") {

@@ -87,6 +87,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmdbar.command.search_tree", "file_pane::SearchTree"),
     ("cmdbar.command.quick_look", "file_pane::QuickLook"),
     ("cmdbar.command.edit_path", "file_pane::EditPath"),
+    ("cmdbar.command.download", "file_pane::Download"),
+    ("cmdbar.command.download_to", "file_pane::DownloadTo"),
+    ("cmdbar.command.upload", "file_pane::Upload"),
+    ("cmdbar.command.rename", "file_pane::RenameSelected"),
+    ("cmdbar.command.delete", "file_pane::DeleteSelected"),
+    ("cmdbar.command.copy_to_other", "file_pane::CopyToOtherPane"),
+    ("cmdbar.command.move_to_other", "file_pane::MoveToOtherPane"),
+    ("cmdbar.command.focus_transfers", "workspace::FocusTransfers"),
     ("cmdbar.command.reconnect", "file_pane::Reconnect"),
 ];
 

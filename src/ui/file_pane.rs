@@ -82,7 +82,10 @@ actions!(
         MoveToOtherPane,
         Reconnect,
         SearchTree,
-        RevealInFolder
+        RevealInFolder,
+        Download,
+        DownloadTo,
+        Upload
     ]
 );
 
@@ -1800,6 +1803,38 @@ impl FilePane {
         }
     }
 
+    /// The selection a keyboard transfer acts on: remote rows only, and none
+    /// while the user types in the path bar or filter.
+    fn selected_for_download(&self, window: &Window, cx: &App) -> Vec<FsEntry> {
+        if self.text_input_focused(window, cx)
+            || self.is_stale()
+            || self.site_id() == crate::queue::LOCAL_SITE_ID
+        {
+            return Vec::new();
+        }
+        self.selected_entries()
+    }
+
+    fn download_action(&mut self, _: &Download, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_for_download(window, cx);
+        if !selected.is_empty() {
+            self.download(selected, window, cx);
+        }
+    }
+
+    fn download_to_action(&mut self, _: &DownloadTo, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected_for_download(window, cx);
+        if !selected.is_empty() {
+            self.download_to(selected, window, cx);
+        }
+    }
+
+    fn upload_action(&mut self, _: &Upload, window: &mut Window, cx: &mut Context<Self>) {
+        if self.provider().is_some() && !self.text_input_focused(window, cx) {
+            self.upload(window, cx);
+        }
+    }
+
     fn go_up_action(&mut self, _: &GoUp, window: &mut Window, cx: &mut Context<Self>) {
         self.go_up(window, cx);
     }
@@ -2187,7 +2222,7 @@ impl FilePane {
             }
             cx.update(|window, cx| {
                 if accepted > 0 {
-                    window.push_notification(queued_message(accepted), cx);
+                    window.push_notification(queued_notification(accepted), cx);
                 }
                 if let Some(error) = &first_error {
                     let reason = humanize(error).title;
@@ -2298,27 +2333,68 @@ impl FilePane {
                 )
                 .on_ok(move |_, window, cx| {
                     let entries = entries.clone();
-                    pane.update(cx, |this, cx| {
-                        let Some(provider) = this.provider().cloned() else { return };
-                        this.spawn_op(
-                            async move {
-                                for entry in entries {
-                                    if to_trash {
-                                        provider.trash(&entry.path).await?;
-                                    } else {
-                                        provider.delete(&entry.path, entry.is_dir).await?;
-                                    }
-                                }
-                                Ok(())
-                            },
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
+                    pane.update(cx, |this, cx| this.delete_entries(entries, to_trash, window, cx))
+                        .ok();
                     true
                 })
         });
+    }
+
+    /// Delete in order and stop at the first failure, so one unreachable item
+    /// doesn't repeat its error for every other. The report names what failed
+    /// and what was not attempted.
+    fn delete_entries(
+        &mut self,
+        entries: Vec<FsEntry>,
+        to_trash: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider().cloned() else { return };
+        let single = entries.len() == 1;
+        let task = cx.global::<AppState>().runtime.spawn(async move {
+            let mut entries = entries.into_iter();
+            let mut deleted = 0;
+            while let Some(entry) = entries.next() {
+                let result = if to_trash {
+                    provider.trash(&entry.path).await
+                } else {
+                    provider.delete(&entry.path, entry.is_dir).await
+                };
+                if let Err(error) = result {
+                    return Err(DeleteStopped {
+                        deleted,
+                        failed: entry.name.to_string(),
+                        error,
+                        remaining: entries.collect(),
+                    });
+                }
+                deleted += 1;
+            }
+            Ok(())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(stopped)) if single => notify_error(&stopped.error, window, cx),
+                    Ok(Err(stopped)) => {
+                        tracing::error!(error = %format!("{:#}", stopped.error), "delete stopped early");
+                        let (title, body) = stopped.report();
+                        window.push_notification(Notification::error(body).title(title).autohide(false), cx);
+                    }
+                    Err(join_error) => notify_error(&anyhow::anyhow!("delete task failed: {join_error}"), window, cx),
+                }
+                if this.tree_search.is_some() {
+                    this.run_tree_search(window, cx);
+                } else {
+                    this.reload(window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn rename_dialog(&mut self, entry: FsEntry, window: &mut Window, cx: &mut Context<Self>) {
@@ -4069,6 +4145,9 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::reconnect))
             .on_action(cx.listener(Self::search_tree_action))
             .on_action(cx.listener(Self::reveal_in_folder))
+            .on_action(cx.listener(Self::download_action))
+            .on_action(cx.listener(Self::download_to_action))
+            .on_action(cx.listener(Self::upload_action))
             // Typing a printable character starts type-to-search.
             .on_key_down(cx.listener(Self::on_pane_key_down))
             // Column resize: the header handle sets `resizing`; the pane
@@ -4876,6 +4955,54 @@ fn queued_message(count: usize) -> SharedString {
     }
 }
 
+/// Marks the "queued" note so a newer one replaces it instead of stacking.
+struct QueuedNote;
+
+/// The one route from any started transfer to the queue: every upload,
+/// download, drop and pane copy reports here.
+fn queued_notification(count: usize) -> Notification {
+    Notification::success(queued_message(count))
+        .id::<QueuedNote>()
+        .action(|_, _, cx| {
+            Button::new("show-transfers")
+                .label(t("file_pane.queued.show"))
+                .small()
+                .primary()
+                .on_click(cx.listener(|note, _, window, cx| {
+                    note.dismiss(window, cx);
+                    window.dispatch_action(Box::new(crate::app::ShowTransfers), cx);
+                }))
+        })
+}
+
+/// How a multi-item delete ended when it stopped early.
+struct DeleteStopped {
+    deleted: usize,
+    failed: String,
+    error: anyhow::Error,
+    /// Items after the failed one, which were not attempted.
+    remaining: Vec<FsEntry>,
+}
+
+impl DeleteStopped {
+    /// Notification title and body: what was deleted, what failed and why,
+    /// and what was left untouched.
+    fn report(&self) -> (SharedString, String) {
+        let total = self.deleted + 1 + self.remaining.len();
+        let title = tf(
+            "file_pane.delete.stopped_title",
+            &[("deleted", &self.deleted.to_string()), ("total", &total.to_string())],
+        );
+        let reason = humanize(&self.error).title;
+        let mut body = tf("file_pane.delete.stopped_failed", &[("name", &self.failed), ("reason", &reason)]).to_string();
+        if !self.remaining.is_empty() {
+            body.push(' ');
+            body.push_str(&tf("file_pane.delete.stopped_remaining", &[("names", &name_list(&self.remaining))]));
+        }
+        (title, body)
+    }
+}
+
 /// Show a failed operation in plain words: the humanized title, with the
 /// next step as the message when there is one.
 fn notify_error(error: &anyhow::Error, window: &mut Window, cx: &mut App) {
@@ -4918,6 +5045,22 @@ mod tests {
             storage_class: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn a_stopped_delete_names_the_failure_and_what_is_left() {
+        crate::i18n::init("en");
+        let stopped = DeleteStopped {
+            deleted: 2,
+            failed: "c.txt".into(),
+            error: anyhow::Error::new(opendal::Error::new(opendal::ErrorKind::PermissionDenied, "no")),
+            remaining: vec![entry("d.txt"), entry("e.txt")],
+        };
+        let (title, body) = stopped.report();
+        assert_eq!(title, "Deleted 2 of 5 items");
+        assert!(body.contains("“c.txt”"), "{body}");
+        assert!(body.contains("permission"), "{body}");
+        assert!(body.contains("“d.txt”, “e.txt”"), "{body}");
     }
 
     #[test]
