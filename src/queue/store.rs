@@ -195,6 +195,25 @@ pub(crate) async fn insert_tasks(pool: &SqlitePool, job_id: i64, tasks: &[NewTas
     Ok(())
 }
 
+/// Record an entry the fan-out left behind, with the reason the transfers
+/// panel shows for it.
+pub(crate) async fn insert_skipped(
+    pool: &SqlitePool,
+    job_id: i64,
+    src: &str,
+    dst: &str,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO transfer_tasks (job_id, src, dst, state, error) VALUES (?, ?, ?, 'skipped', ?)")
+        .bind(job_id)
+        .bind(src)
+        .bind(dst)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Seal a completed fan-out and flip the job to `active` in one transaction.
 /// A crash before this point leaves `expanded = 0`, so expansion reruns from
 /// scratch on the next launch.
@@ -229,6 +248,33 @@ async fn activate(tx: &mut sqlx::SqliteConnection, job_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The claim statement for a comma-joined list of job ids. Each job offers
+/// its first runnable task, read in id order from `idx_transfer_tasks_job`,
+/// so the cost doesn't grow with the number of queued files. A task waits while
+/// another one writes the same normalized path on the same site: both would
+/// see a free destination and the later commit would replace the first.
+fn claim_sql(ids: &str) -> String {
+    format!(
+        "UPDATE transfer_tasks SET state = 'active', attempts = attempts + 1, \
+         updated_at = datetime('now') \
+         WHERE id = (SELECT head.id FROM transfer_jobs j \
+             JOIN transfer_tasks head ON head.id = (SELECT t.id FROM transfer_tasks t \
+                 WHERE t.job_id = j.id AND t.state = 'queued' \
+                   AND (t.not_before IS NULL OR t.not_before <= datetime('now')) \
+                   AND NOT EXISTS (SELECT 1 FROM transfer_tasks o \
+                       JOIN transfer_jobs oj ON oj.id = o.job_id \
+                       WHERE o.state = 'active' \
+                         AND ltrim(replace(o.dst, '//', '/'), '/') = ltrim(replace(t.dst, '//', '/'), '/') \
+                         AND oj.dst_site_id = j.dst_site_id) \
+                 ORDER BY t.id LIMIT 1) \
+             WHERE j.state = 'active' AND j.id IN ({ids}) \
+             ORDER BY j.priority DESC, head.id LIMIT 1) \
+         RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, partial, in_place, \
+             COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
+             (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
+    )
+}
+
 /// Atomically claim the next queued task of any prepared job: flip it to
 /// `active` and bump its attempt counter. `ready_job_ids` are jobs whose
 /// providers are connected — only their tasks may run.
@@ -244,20 +290,8 @@ pub(crate) async fn claim_task(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        "UPDATE transfer_tasks SET state = 'active', attempts = attempts + 1, \
-         updated_at = datetime('now') \
-         WHERE id = (SELECT t.id FROM transfer_tasks t \
-             JOIN transfer_jobs j ON j.id = t.job_id \
-             WHERE t.state = 'queued' AND j.state = 'active' AND j.id IN ({ids}) \
-               AND (t.not_before IS NULL OR t.not_before <= datetime('now')) \
-             ORDER BY j.priority DESC, t.id LIMIT 1) \
-         RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, partial, in_place, \
-             COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
-             (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
-    );
     // `ids` is a comma-joined list of i64 job ids, not user input.
-    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let row = sqlx::query(sqlx::AssertSqlSafe(claim_sql(&ids)))
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|row| ClaimedTask {
@@ -508,6 +542,21 @@ pub(crate) async fn task_failed(
     .fetch_one(pool)
     .await?;
     Ok(state == "failed")
+}
+
+/// The connection dropped under this task: it goes back in the queue with its
+/// resume offset and without using up an attempt, while the job waits.
+pub(crate) async fn task_interrupted(pool: &SqlitePool, task_id: i64, error: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE transfer_tasks SET \
+         state = CASE WHEN {JOB_CANCELLED} THEN 'cancelled' ELSE 'queued' END, \
+         attempts = MAX(attempts - 1, 0), error = ?, updated_at = datetime('now') WHERE id = ?"
+    )))
+    .bind(error)
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Keep the first permanent failure's wording on the job, as the
@@ -1055,6 +1104,7 @@ pub(crate) async fn snapshot_jobs(pool: &SqlitePool) -> Result<Vec<JobSnapshot>>
             bps: 0,
             priority: row.get("priority"),
             move_source: row.get::<i64, _>("move_source") != 0,
+            discovering: None,
         })
         .collect())
 }
@@ -1198,6 +1248,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interrupted_task_keeps_its_attempts_and_offset() {
+        let (pool, id) = prepared_job().await;
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        update_task_offset(&pool, task.id, 2).await.unwrap();
+        for _ in 0..5 {
+            task_interrupted(&pool, task.id, "connection reset").await.unwrap();
+            let again = claim_task(&pool, &[id]).await.unwrap().unwrap();
+            assert_eq!(again.byte_offset, 2);
+        }
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM transfer_tasks WHERE id = ?")
+            .bind(task.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_destination_being_written_is_not_claimed_twice() {
+        let (pool, id) = prepared_job().await;
+        insert_tasks(
+            &pool,
+            id,
+            &[
+                NewTask {
+                    src: "source/same".into(),
+                    dst: "/target//file".into(),
+                    total_bytes: Some(3),
+                    src_etag: None,
+                },
+                NewTask {
+                    src: "source/free".into(),
+                    dst: "target/free".into(),
+                    total_bytes: Some(3),
+                    src_etag: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let first = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert_eq!(first.dst, "target/file");
+        // The spelled-differently twin waits; the unrelated file overtakes it.
+        let second = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert_eq!(second.dst, "target/free");
+        assert!(claim_task(&pool, &[id]).await.unwrap().is_none());
+
+        complete_task(&pool, first.id, 3).await.unwrap();
+        let third = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        assert_eq!(third.dst, "/target//file");
+    }
+
+    #[tokio::test]
+    async fn claiming_reads_each_jobs_queue_through_the_index() {
+        let (pool, id) = prepared_job().await;
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            claim_sql(&id.to_string())
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        assert!(plan.iter().any(|step| step.contains("idx_transfer_tasks_job")), "{plan:#?}");
+        assert!(plan.iter().any(|step| step.contains("idx_transfer_tasks_active_dst")), "{plan:#?}");
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN") || step.contains("TEMP B-TREE")), "{plan:#?}");
+    }
+
+    #[tokio::test]
     async fn late_outcomes_never_requeue_under_a_cancelled_job() {
         let (pool, id) = prepared_job().await;
         let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
@@ -1218,7 +1339,7 @@ mod tests {
             id,
             &[NewTask {
                 src: "source/other".into(),
-                dst: "target/file".into(),
+                dst: "target/other".into(),
                 total_bytes: Some(3),
                 src_etag: None,
             }],
