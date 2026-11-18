@@ -42,6 +42,17 @@ impl Class {
     }
 }
 
+/// The connection failed rather than this one file: the server is unreachable
+/// or OpenDAL's retry layer gave up on a temporary error. Waiting can fix it,
+/// so a transfer holds off instead of failing file after file.
+pub fn is_outage(error: &anyhow::Error) -> bool {
+    matches!(classify(error), Class::HostUnreachable | Class::Timeout)
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<opendal::Error>())
+            .any(opendal::Error::is_persistent)
+}
+
 /// Classify an error by its OpenDAL kind or its message chain.
 pub fn classify(error: &anyhow::Error) -> Class {
     let text = format!("{error:#}").to_lowercase();
@@ -88,7 +99,14 @@ pub fn classify(error: &anyhow::Error) -> Class {
             Io::AlreadyExists => return Class::AlreadyExists,
             Io::TimedOut => return Class::Timeout,
             Io::StorageFull | Io::QuotaExceeded => return Class::DiskFull,
-            Io::ConnectionRefused | Io::ConnectionReset | Io::HostUnreachable => {
+            Io::ConnectionRefused
+            | Io::ConnectionReset
+            | Io::ConnectionAborted
+            | Io::NotConnected
+            | Io::BrokenPipe
+            | Io::HostUnreachable
+            | Io::NetworkUnreachable
+            | Io::NetworkDown => {
                 return Class::HostUnreachable;
             }
             _ => {}
@@ -100,8 +118,15 @@ pub fn classify(error: &anyhow::Error) -> Class {
         || text.contains("failed to lookup address")
         || text.contains("dns error")
         || text.contains("connection refused")
+        || text.contains("connection reset")
+        || text.contains("connection closed")
+        || text.contains("connection aborted")
+        || text.contains("connection lost")
+        || text.contains("broken pipe")
+        || text.contains("tcp connect error")
         || text.contains("no route to host")
         || text.contains("network is unreachable")
+        || text.contains("network is down")
     {
         Class::HostUnreachable
     } else if text.contains("no space left") {
@@ -186,6 +211,18 @@ mod tests {
         assert_eq!(classify(&e), Class::NotFound);
         assert!(!Class::NotFound.is_transient());
         assert!(Class::Timeout.is_transient());
+    }
+
+    #[test]
+    fn dropped_connections_and_exhausted_retries_count_as_outages() {
+        assert!(is_outage(&err("read: connection reset by peer")));
+        assert!(is_outage(&anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))));
+        let exhausted = opendal::Error::new(ErrorKind::Unexpected, "503").set_persistent();
+        assert!(is_outage(&anyhow::Error::new(exhausted).context("write")));
+
+        assert!(!is_outage(&err("weird thing")));
+        let denied = opendal::Error::new(ErrorKind::PermissionDenied, "denied");
+        assert!(!is_outage(&anyhow::Error::new(denied)));
     }
 
     #[test]
