@@ -5659,8 +5659,6 @@ dependencies = [
 [[package]]
 name = "opendal-service-ftp"
 version = "0.58.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fd0e582b15c6c4af448c60c877c8fbae3f689f94e66a836972064fee0415529"
 dependencies = [
  "bytes",
  "fastpool",

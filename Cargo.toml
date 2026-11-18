@@ -221,3 +221,8 @@ opt-level = 3
 # With the macOS 27 toolchain its output is rejected by dyld ("mis-aligned
 # LINKEDIT string pool"), so leave build-time artifacts unstripped.
 strip = false
+
+# OpenDAL 0.58 hands `host:port` to TLS as the server name, which rustls rejects,
+# so every FTPS connection fails. Drop this patch once upstream passes the host.
+[patch.crates-io]
+opendal-service-ftp = { path = "patches/opendal-service-ftp" }
