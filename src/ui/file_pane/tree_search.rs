@@ -174,15 +174,19 @@ impl Walker {
         Some(end)
     }
 
-    /// Everything else is walked folder by folder, so one unreadable folder
-    /// costs only its own subtree. Symlinks are not followed, which rules out
-    /// cycles.
+    /// Everything else is walked folder by folder, so one unreadable subfolder
+    /// costs only its own subtree, while failing on the search root is an error.
+    /// Symlinks are not followed, which rules out cycles.
     async fn walk_folders(&mut self, rel: String) -> Option<SearchEnd> {
         let mut end = SearchEnd::default();
         let mut pending = VecDeque::from([rel]);
         'walk: while let Some(dir) = pending.pop_front() {
             let mut lister = match self.op.lister(&dir).await {
                 Ok(lister) => lister,
+                Err(error) if dir == self.root => {
+                    end.error = Some(error.into());
+                    break;
+                }
                 Err(error) => {
                     tracing::debug!(%error, %dir, "search skipped an unreadable folder");
                     end.unreadable += 1;
@@ -190,9 +194,16 @@ impl Walker {
                 }
             };
             while let Some(entry) = lister.next().await {
-                let Ok(entry) = entry else {
-                    end.unreadable += 1;
-                    break;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if dir == self.root => {
+                        end.error = Some(error.into());
+                        break 'walk;
+                    }
+                    Err(_) => {
+                        end.unreadable += 1;
+                        break;
+                    }
                 };
                 if is_listed_folder(&entry, &dir) {
                     continue;
@@ -346,6 +357,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_root_is_an_error_and_an_unreadable_subfolder_is_skipped() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tree = Tree::new("unreadable", &["top/locked/file.txt", "top/open.txt"]);
+        let locked = tree.0.join("top/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let walker = |events| Walker::new(tree.op(), String::new(), Query::new("nothing", false), events);
+
+        let root = walker(events.clone()).walk("top/locked/".into(), false).await.unwrap();
+        let below = walker(events).walk("top/".into(), false).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(root.error.is_some());
+        assert_eq!(root.unreadable, 0);
+        assert!(below.error.is_none());
+        assert_eq!(below.unreadable, 1);
     }
 
     async fn search(op: Operator, rel: &str, text: &str, show_hidden: bool) -> (Vec<Hit>, SearchEnd) {

@@ -1746,7 +1746,14 @@ impl FilePane {
         cx.notify();
     }
 
-    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+    /// Escape: leave the search bar while typing in it or with nothing
+    /// selected, otherwise clear the selection first.
+    fn clear_selection(&mut self, _: &ClearSelection, window: &mut Window, cx: &mut Context<Self>) {
+        let typing = self.search_input.focus_handle(cx).is_focused(window);
+        if self.search_active && (typing || self.selection.is_empty()) {
+            self.close_search(window, cx);
+            return;
+        }
         self.selection.clear();
         self.rubber = None;
         cx.notify();
