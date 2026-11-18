@@ -229,7 +229,7 @@
   // Sites, die noch von Übertragungen genutzt werden.
   "site.busy.title": "Site wird noch verwendet",
   "site.busy.delete": "Übertragungen nutzen diese Site noch (offen: {jobs}). Löschen würde sie entfernen. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
-  "site.busy.edit": "Übertragungen nutzen diese Site noch (offen: {jobs}), deshalb lassen sich Protokoll, Endpunkt, Stammpfad, Bucket und Container jetzt nicht ändern. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
+  "site.busy.edit": "Übertragungen nutzen diese Site noch (offen: {jobs}), deshalb lassen sich Protokoll, Endpunkt, Stammpfad, Bucket, Container und Konto jetzt nicht ändern. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
 
   // Import aus anderen Clients.
   "site.import.button": "Importieren…",

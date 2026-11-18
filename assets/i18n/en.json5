@@ -239,7 +239,7 @@
   // Sites in use by transfer jobs.
   "site.busy.title": "Site is still in use",
   "site.busy.delete": "Transfer jobs still use this site (open: {jobs}). Deleting it would remove them. Cancel them or clear finished ones in the Transfers panel, then try again.",
-  "site.busy.edit": "Transfer jobs still use this site (open: {jobs}), so its protocol, endpoint, root, bucket and container can't change now. Cancel them or clear finished ones in the Transfers panel, then try again.",
+  "site.busy.edit": "Transfer jobs still use this site (open: {jobs}), so its protocol, endpoint, root, bucket, container and account can't change now. Cancel them or clear finished ones in the Transfers panel, then try again.",
 
   // Import from other clients.
   "site.import.button": "Import…",
