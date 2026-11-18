@@ -408,4 +408,10 @@
   "file_pane.launch.cancel": "Abbrechen",
   "file_pane.launch.no_preview": "Dieser Dateityp kann Programme ausführen und deshalb nicht in der Vorschau angezeigt werden. Lade ihn stattdessen herunter.",
   "file_pane.names_more": "{names} und {count} weitere",
+
+  // Verbindungsabbrüche.
+  "file_pane.reconnect": "Neu verbinden",
+  "file_pane.reconnecting": "Verbinde neu…",
+  "file_pane.stale_rows": "Zuletzt geladener Inhalt von {folder}. Er ist möglicherweise veraltet.",
+  "cmdbar.command.reconnect": "Neu mit Site verbinden",
 }

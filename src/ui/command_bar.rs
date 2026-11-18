@@ -86,6 +86,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmdbar.command.search", "file_pane::Search"),
     ("cmdbar.command.quick_look", "file_pane::QuickLook"),
     ("cmdbar.command.edit_path", "file_pane::EditPath"),
+    ("cmdbar.command.reconnect", "file_pane::Reconnect"),
 ];
 
 pub struct CommandBar {

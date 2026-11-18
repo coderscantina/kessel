@@ -418,4 +418,10 @@
   "file_pane.launch.cancel": "Cancel",
   "file_pane.launch.no_preview": "This file type can run programs, so it can't be previewed. Download it instead.",
   "file_pane.names_more": "{names} and {count} more",
+
+  // Lost connections.
+  "file_pane.reconnect": "Reconnect",
+  "file_pane.reconnecting": "Reconnecting…",
+  "file_pane.stale_rows": "Showing the last loaded contents of {folder}. They may be out of date.",
+  "cmdbar.command.reconnect": "Reconnect to Site",
 }

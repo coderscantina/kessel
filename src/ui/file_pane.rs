@@ -42,7 +42,7 @@ use gpui_component::{
 };
 
 use crate::app::AppState;
-use crate::errors::{humanize, Humanized};
+use crate::errors::{humanize, is_outage, Class, Humanized};
 use crate::i18n::{t, tf};
 use crate::provider::{Provider, SiteProfile};
 use crate::queue::{BatchFile, ConflictPolicy, NewBatch, NewJob};
@@ -75,7 +75,8 @@ actions!(
         ToggleTree,
         EditPath,
         CopyToOtherPane,
-        MoveToOtherPane
+        MoveToOtherPane,
+        Reconnect
     ]
 );
 
@@ -414,6 +415,9 @@ pub struct FilePane {
     loaded_path: Option<String>,
     /// Failed listing of the current directory.
     error: Option<Humanized>,
+    /// The connection dropped while rows were on screen: they stay visible,
+    /// dimmed and inert, under a banner offering Reconnect.
+    connection_lost: Option<Humanized>,
     /// The error state's "Details" disclosure is open.
     details_open: bool,
     selection: BTreeSet<usize>,
@@ -570,6 +574,7 @@ impl FilePane {
             slow_loading: false,
             loaded_path: None,
             error: None,
+            connection_lost: None,
             details_open: false,
             selection: BTreeSet::new(),
             cursor: None,
@@ -641,7 +646,11 @@ impl FilePane {
                             error = %format!("{error:#}"),
                             "connecting site failed"
                         );
-                        this.connection = Connection::Failed(humanize(&error));
+                        let human = humanize(&error);
+                        if this.connection_lost.is_some() {
+                            this.connection_lost = Some(human.clone());
+                        }
+                        this.connection = Connection::Failed(human);
                     }
                 }
                 cx.notify();
@@ -649,6 +658,14 @@ impl FilePane {
             .ok();
         })
         .detach();
+    }
+
+    /// Rebuild the operator from the site's stored settings, which picks up
+    /// rotated keys and renews expired credentials, then list again.
+    fn reconnect(&mut self, _: &Reconnect, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.connection, Connection::Connecting) {
+            self.connect(window, cx);
+        }
     }
 
     fn on_connected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1279,10 +1296,11 @@ impl FilePane {
         status
     }
 
-    /// A listing for another directory is in flight, so the visible rows
-    /// belong to the previous one and must not be acted on.
+    /// The visible rows must not be acted on: a listing for another
+    /// directory is in flight, or the connection behind them is gone.
     fn is_stale(&self) -> bool {
-        self.loading && self.loaded_path.as_deref() != Some(self.path.as_str())
+        self.connection_lost.is_some()
+            || (self.loading && self.loaded_path.as_deref() != Some(self.path.as_str()))
     }
 
     // --- selection model ---
@@ -2840,6 +2858,7 @@ impl FilePane {
                                 },
                             );
                         }
+                        this.connection_lost = None;
                         this.all_entries = entries;
                         this.loaded_path = Some(this.path.clone());
                         this.apply_sort();
@@ -2860,10 +2879,15 @@ impl FilePane {
                     }
                     Err(error) => {
                         tracing::error!(path = %this.path, error = %format!("{error:#}"), "listing failed");
-                        this.all_entries = Vec::new();
-                        this.entries = Vec::new();
-                        this.loaded_path = None;
-                        this.error = Some(humanize(&error));
+                        if is_connection_loss(&error) && this.loaded_path.is_some() {
+                            this.connection_lost = Some(humanize(&error));
+                        } else {
+                            this.all_entries = Vec::new();
+                            this.entries = Vec::new();
+                            this.loaded_path = None;
+                            this.connection_lost = None;
+                            this.error = Some(humanize(&error));
+                        }
                         cx.emit(PaneEvent::LinkedNavigationFailed);
                     }
                 }
@@ -3039,7 +3063,7 @@ impl FilePane {
         // They dim only once the load is slow, so fast navigation doesn't
         // flash.
         let stale = self.is_stale();
-        let dimmed = stale && self.slow_loading;
+        let dimmed = self.connection_lost.is_some() || (stale && self.slow_loading);
         let is_drag_source = !payload.entries.is_empty() && !stale;
 
         // Dirs (and the `..` row) accept drops into themselves.
@@ -3160,6 +3184,10 @@ impl FilePane {
     /// or listing, a slow first load, an empty folder, or a filter with no
     /// matches. `None` while rows tell the story themselves.
     fn render_list_state(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        // Kept rows tell the story, with the banner above them.
+        if self.connection_lost.is_some() {
+            return None;
+        }
         let spinner = |cx: &mut Context<Self>| {
             Spinner::new()
                 .color(cx.theme().muted_foreground)
@@ -3208,6 +3236,11 @@ impl FilePane {
                     .small()
                     .primary()
                     .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                Button::new("list-reconnect")
+                    .label(t("file_pane.reconnect"))
+                    .small()
+                    .outline()
+                    .on_click(cx.listener(|this, _, window, cx| this.reconnect(&Reconnect, window, cx))),
                 Button::new("list-go-up")
                     .label(t("file_pane.go_up"))
                     .small()
@@ -3250,6 +3283,51 @@ impl FilePane {
             .into_any_element();
         let hint = Some(t("file_pane.empty_hint"));
         Some(self.render_state(Some(icon), t("file_pane.empty"), hint, None, Vec::new(), cx))
+    }
+
+    /// Above the kept rows of a lost connection: what happened, which folder
+    /// the rows are from, and the way back.
+    fn render_connection_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let human = self.connection_lost.as_ref()?;
+        let busy = self.loading || matches!(self.connection, Connection::Connecting);
+        let folder = format!("/{}", self.loaded_path.as_deref().unwrap_or_default());
+        let mut actions = vec![Button::new("banner-reconnect")
+            .label(t(if busy { "file_pane.reconnecting" } else { "file_pane.reconnect" }))
+            .small()
+            .primary()
+            .loading(busy)
+            .disabled(busy)
+            .on_click(cx.listener(|this, _, window, cx| this.reconnect(&Reconnect, window, cx)))];
+        actions.extend(self.trust_action(human));
+        Some(
+            h_flex()
+                .id("connection-banner")
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().warning.opacity(0.12))
+                .text_sm()
+                .child(Icon::new(IconName::TriangleAlert).small().text_color(cx.theme().warning))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().font_weight(gpui::FontWeight::MEDIUM).child(human.title.clone()))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(tf("file_pane.stale_rows", &[("folder", &folder)])),
+                        ),
+                )
+                .children(actions)
+                .into_any_element(),
+        )
     }
 
     /// One centered list state: icon, title, hint, an optional "Details"
@@ -3749,6 +3827,7 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::edit_path))
             .on_action(cx.listener(Self::copy_to_other_pane))
             .on_action(cx.listener(Self::move_to_other_pane))
+            .on_action(cx.listener(Self::reconnect))
             // Typing a printable character starts type-to-search.
             .on_key_down(cx.listener(Self::on_pane_key_down))
             // Column resize: the header handle sets `resizing`; the pane
@@ -3924,6 +4003,7 @@ impl Render for FilePane {
                     .when(tree_on_top, |el| el.w_full().min_h_0())
                     .when(!tree_on_top, |el| el.h_full().min_w_0())
                     .overflow_hidden()
+            .children(self.render_connection_banner(cx))
             .child(
                 h_flex()
                     .id("list-header")
@@ -4144,6 +4224,16 @@ impl Render for FilePane {
             )
             })
     }
+}
+
+/// Whether a failed listing means the connection is gone rather than this
+/// folder being unreadable. Expired credentials count: reconnecting renews them.
+fn is_connection_loss(error: &anyhow::Error) -> bool {
+    const EXPIRED: [&str; 4] = ["expiredtoken", "expired token", "token has expired", "requestexpired"];
+    let text = format!("{error:#}").to_lowercase();
+    is_outage(error)
+        || crate::errors::classify(error) == Class::AuthFailed
+        || EXPIRED.iter().any(|needle| text.contains(needle))
 }
 
 /// File types the OS runs, installs or hands to an interpreter when "opened".
@@ -4539,6 +4629,17 @@ mod tests {
             storage_class: None,
             region: None,
         }
+    }
+
+    #[test]
+    fn only_connection_failures_keep_the_listing() {
+        let opendal = |kind| anyhow::Error::new(opendal::Error::new(kind, "listing failed"));
+        assert!(is_connection_loss(&anyhow::anyhow!("read: connection reset by peer")));
+        assert!(is_connection_loss(&anyhow::anyhow!("operation timed out")));
+        assert!(is_connection_loss(&anyhow::anyhow!("ExpiredToken: the token has expired")));
+        assert!(is_connection_loss(&anyhow::anyhow!("530 Login incorrect")));
+        assert!(!is_connection_loss(&opendal(opendal::ErrorKind::NotFound)));
+        assert!(!is_connection_loss(&opendal(opendal::ErrorKind::PermissionDenied)));
     }
 
     #[test]

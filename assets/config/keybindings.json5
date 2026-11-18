@@ -91,6 +91,7 @@
     "space": "file_pane::QuickLook",
     "secondary-f": "file_pane::Search",
     "secondary-r": "file_pane::Refresh",
+    "secondary-shift-r": "file_pane::Reconnect",
     // Commander idioms: F5 copies, F6 moves the selection to the other pane.
     "f5": "file_pane::CopyToOtherPane",
     "secondary-shift-c": "file_pane::CopyToOtherPane",
