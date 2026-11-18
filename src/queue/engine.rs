@@ -2335,6 +2335,33 @@ mod tests {
         assert_eq!(server.names(), ["up/big.bin"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_same_site_move_renames_instead_of_copying() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let env = test_env("same-site-move");
+        let src = env.dir.join("from/file.txt");
+        let dst_dir = env.dir.join("to");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        std::fs::write(&src, b"moved").unwrap();
+        let inode = std::fs::metadata(&src).unwrap().ino();
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit(NewJob {
+                move_source: true,
+                ..job(browse(&src), format!("{}/", browse(&dst_dir)), ConflictPolicy::Ask)
+            }))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert!(!src.exists());
+        assert_eq!(std::fs::metadata(dst_dir.join("file.txt")).unwrap().ino(), inode);
+    }
+
     #[test]
     fn a_site_limit_holds_across_jobs() {
         let (env, src_dir, dst_dir, _) = slow_env("site-limit");

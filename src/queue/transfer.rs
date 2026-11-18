@@ -230,10 +230,17 @@ async fn run_inner(
     // copy, mtime); kept in sync with `dst_path` on rename.
     let mut dst_browse = task.dst.clone();
 
-    let meta = src_op
-        .stat(&src_path)
-        .await
-        .with_context(|| format!("stat source `{}`", task.src))?;
+    let meta = match src_op.stat(&src_path).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            if error.kind() == opendal::ErrorKind::NotFound && task.move_source {
+                if let Some(bytes) = already_moved(task, &dst_op, &dst_path).await? {
+                    return Ok(Outcome::Done { bytes });
+                }
+            }
+            return Err(error).with_context(|| format!("stat source `{}`", task.src));
+        }
+    };
     let size = meta.content_length();
     let etag = meta.etag().map(str::to_string);
     let modified = meta
@@ -310,6 +317,18 @@ async fn run_inner(
         }
         if append_to_existing {
             store::set_task_in_place(pool, task.id, true).await?;
+        }
+    }
+
+    // A same-site move is one rename on the server when the backend has it.
+    // Anything it can't do (another volume, say) still works by copying.
+    if opts.same_site && task.move_source && dst.caps.rename && offset == 0 && !append_to_existing {
+        match move_into_place(dst, &dst_op, &src_path, &dst_path).await {
+            Ok(()) => return Ok(Outcome::Done { bytes: size }),
+            Err(error) => tracing::warn!(
+                src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
+                "server-side move failed; falling back to copying"
+            ),
         }
     }
 
@@ -532,7 +551,7 @@ async fn finish_transfer(
         if let Some(outcome) = reviewed_state_changed(task, &dest.op, &dest.path).await? {
             return Ok(outcome);
         }
-        commit_partial(dst, &dest.op, partial, &dest.path).await?;
+        move_into_place(dst, &dest.op, partial, &dest.path).await?;
         store::set_task_partial(pool, task.id, None).await?;
     }
 
@@ -590,13 +609,28 @@ async fn reviewed_state_changed(task: &ClaimedTask, op: &Operator, path: &str) -
     }))
 }
 
-/// Move a finished partial onto the real name. Some servers (SFTP v3) refuse
-/// to rename over an existing file. Only for that case, with both files
-/// present and no permission or not-found error, the old file is moved
-/// aside to a backup name first, the partial renamed into place, and the
-/// backup deleted. A failure in between moves the old file back, so it is
-/// never lost.
-async fn commit_partial(dst: &Provider, op: &Operator, partial: &str, path: &str) -> Result<()> {
+/// Whether a move whose source is gone already finished: a crash can land
+/// between deleting the source and recording completion. The destination then
+/// holds the whole file. Returns its size.
+async fn already_moved(task: &ClaimedTask, op: &Operator, path: &str) -> Result<Option<u64>> {
+    let Some(size) = task.total_bytes else {
+        return Ok(None);
+    };
+    match op.stat(path).await {
+        Ok(meta) if meta.is_file() && meta.content_length() == size => Ok(Some(size)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("checking the destination of a moved file"),
+    }
+}
+
+/// Rename a finished partial (or a moved source) onto the real name. Some
+/// servers (SFTP v3) refuse to rename over an existing file. Only for that
+/// case, with both files present and no permission or not-found error, the
+/// old file is moved aside to a backup name first, the new one renamed into
+/// place, and the backup deleted. A failure in between moves the old file
+/// back, so it is never lost.
+async fn move_into_place(dst: &Provider, op: &Operator, partial: &str, path: &str) -> Result<()> {
     let Err(error) = dst.rename_on_server(op, partial, path).await else {
         return Ok(());
     };
@@ -844,8 +878,47 @@ mod tests {
         let (op, _) = dst.op_for("").unwrap();
         // The partial is missing: the rename fails for a reason other than
         // the destination existing, so the destination must stay.
-        assert!(commit_partial(&dst, &op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
+        assert!(move_into_place(&dst, &op, ".file.txt.1.kessel-part", "file.txt").await.is_err());
         assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_move_whose_source_is_gone_is_done_once_the_destination_is_complete() {
+        let dir = std::env::temp_dir().join(format!("kessel-moved-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b"), b"moved!").unwrap();
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), dir.to_string_lossy().to_string())].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&local, &Default::default()).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let control = JobControl::default();
+        let opts = TransferOpts {
+            same_site: false,
+            verify: false,
+            preserve_timestamps: false,
+            throttle: None,
+        };
+        let moved = |total_bytes| ClaimedTask {
+            total_bytes: Some(total_bytes),
+            move_source: true,
+            ..task(None, None)
+        };
+
+        let (done, _) = run_task(&pool, &provider, &provider, &moved(6), &control, opts.clone()).await;
+        assert!(matches!(done, Outcome::Done { bytes: 6 }), "{done:?}");
+        // A shorter destination is no finished move: the failure stays visible.
+        let (short, _) = run_task(&pool, &provider, &provider, &moved(9), &control, opts).await;
+        assert!(matches!(short, Outcome::Failed(_)), "{short:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
