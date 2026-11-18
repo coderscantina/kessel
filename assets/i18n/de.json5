@@ -414,4 +414,18 @@
   "file_pane.reconnecting": "Verbinde neu…",
   "file_pane.stale_rows": "Zuletzt geladener Inhalt von {folder}. Er ist möglicherweise veraltet.",
   "cmdbar.command.reconnect": "Neu mit Site verbinden",
+
+  // Rekursive Suche.
+  "cmdbar.command.search_tree": "In Unterordnern suchen",
+  "file_pane.search.subfolders": "Unterordner",
+  "file_pane.search.subfolders_hint": "Enter durchsucht diesen Ordner und alles darunter",
+  "file_pane.search.folder": "Ordner",
+  "file_pane.search.one_match": "1 Treffer",
+  "file_pane.search.matches": "{count} Treffer",
+  "file_pane.search.running": "Suche… {found} gefunden, {scanned} geprüft",
+  "file_pane.search.done": "{found} gefunden, {scanned} geprüft",
+  "file_pane.search.capped": "bei {max} Treffern angehalten",
+  "file_pane.search.unreadable": "{count} nicht lesbare Ordner übersprungen",
+  "file_pane.search.stop": "Stopp",
+  "file_pane.search.reveal": "Im Ordner anzeigen",
 }

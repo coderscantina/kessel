@@ -49,6 +49,10 @@ use crate::queue::{BatchFile, ConflictPolicy, NewBatch, NewJob};
 use crate::ui::file_icons::{self, FileIcons};
 use crate::ui::{human_size, human_time};
 
+mod tree_search;
+
+use tree_search::{Hit, Query, SearchEnd, SearchEvent, MAX_HITS};
+
 actions!(
     file_pane,
     [
@@ -76,7 +80,9 @@ actions!(
         EditPath,
         CopyToOtherPane,
         MoveToOtherPane,
-        Reconnect
+        Reconnect,
+        SearchTree,
+        RevealInFolder
     ]
 );
 
@@ -86,7 +92,9 @@ const ROW_HEIGHT: f32 = 26.0;
 /// Opening more items than this at once asks first.
 const OPEN_CONFIRM_THRESHOLD: usize = 20;
 /// Suffix of the queue's in-progress partial files, kept out of listings.
-const PARTIAL_SUFFIX: &str = ".kessel-part";
+use crate::queue::PARTIAL_SUFFIX;
+/// Width of the "Folder" column while showing recursive search results.
+const LOCATION_WIDTH: f32 = 220.0;
 
 #[derive(Clone)]
 pub struct FsEntry {
@@ -377,6 +385,24 @@ struct RubberBand {
     base: BTreeSet<usize>,
 }
 
+/// A recursive search whose hits are the pane's current rows.
+struct TreeSearch {
+    /// Folder the search started from; hits show their path relative to it.
+    root: String,
+    query: String,
+    running: bool,
+    scanned: u64,
+    capped: bool,
+    unreadable: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TreeSearch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct FilePane {
     label: SharedString,
     connection: Connection,
@@ -406,6 +432,12 @@ pub struct FilePane {
     /// Mirrors `search_input`'s value so filtering doesn't need the input
     /// entity (updated from its change events).
     search_query: String,
+    /// The search bar looks through subfolders instead of filtering rows.
+    tree_scope: bool,
+    /// While set, `all_entries` holds this search's hits, not a listing.
+    tree_search: Option<TreeSearch>,
+    /// Row to select and scroll to once the next listing arrives.
+    reveal_name: Option<SharedString>,
     loading: bool,
     /// A listing has been in flight for longer than a blink: shows the
     /// path-bar spinner.
@@ -534,7 +566,13 @@ impl FilePane {
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => {
-                    this.activate(&Activate, window, cx);
+                    let query = this.search_query.trim();
+                    let searched = this.tree_search.as_ref().is_some_and(|search| search.query == query);
+                    if this.tree_scope && !searched {
+                        this.run_tree_search(window, cx);
+                    } else {
+                        this.activate(&Activate, window, cx);
+                    }
                 }
                 _ => {}
             },
@@ -570,6 +608,9 @@ impl FilePane {
             search_input,
             search_active: false,
             search_query: String::new(),
+            tree_scope: false,
+            tree_search: None,
+            reveal_name: None,
             loading: false,
             slow_loading: false,
             loaded_path: None,
@@ -764,7 +805,8 @@ impl FilePane {
             .map(|entry| entry.path.clone());
         self.rubber = None;
         let query = self.search_query.trim();
-        self.entries = if !self.search_active || query.is_empty() {
+        let filtering = self.search_active && !query.is_empty() && self.tree_search.is_none();
+        self.entries = if !filtering {
             self.all_entries.clone()
         } else {
             self.all_entries
@@ -778,7 +820,7 @@ impl FilePane {
             .and_then(|path| self.entries.iter().position(|entry| entry.path == path));
         self.anchor = self.cursor;
         // Preselect the first match so Enter opens it right away.
-        if self.search_active && !query.is_empty() && self.selection.is_empty() {
+        if filtering && self.selection.is_empty() {
             if let Some(first) = self.entries.iter().position(|entry| !entry.is_parent) {
                 self.selection.insert(first);
                 self.cursor = Some(first);
@@ -805,12 +847,158 @@ impl FilePane {
             return;
         }
         self.search_active = false;
+        self.tree_scope = false;
         self.search_query.clear();
         self.search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.rebuild_view();
+        if self.tree_search.take().is_some() {
+            // The rows were search hits: bring the folder's listing back.
+            self.reload(window, cx);
+        } else {
+            self.rebuild_view();
+        }
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    // --- recursive search ---
+
+    /// Open the search bar in subfolder mode, or focus it when it is open.
+    fn search_tree_action(&mut self, _: &SearchTree, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_scope = true;
+        if self.search_active {
+            let focus = self.search_input.focus_handle(cx);
+            window.focus(&focus, cx);
+            cx.notify();
+        } else {
+            self.start_search("", window, cx);
+        }
+    }
+
+    /// Flip the search bar between filtering this folder and searching below it.
+    fn toggle_tree_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_scope = !self.tree_scope;
+        if self.tree_scope {
+            self.run_tree_search(window, cx);
+        } else if self.tree_search.take().is_some() {
+            self.reload(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Search below the current folder for the bar's text. The hits replace
+    /// the rows, so selection, drag, transfers and the context menu all work
+    /// on them as on any listing.
+    fn run_tree_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_string();
+        let Some(provider) = self.provider().cloned() else { return };
+        if query.is_empty() || self.connection_lost.is_some() {
+            return;
+        }
+        let (events, mut updates) = tokio::sync::mpsc::channel(4);
+        let root = self.path.clone();
+        let task = cx.global::<AppState>().runtime.spawn(tree_search::run(
+            provider,
+            root.clone(),
+            Query::new(&query, self.show_hidden),
+            events,
+        ));
+        // Replacing an earlier search aborts it.
+        self.tree_search = Some(TreeSearch {
+            root,
+            query,
+            running: true,
+            scanned: 0,
+            capped: false,
+            unreadable: 0,
+            task,
+        });
+        self.all_entries.clear();
+        self.rebuild_view();
+        cx.notify();
+
+        let task_id = self.tree_search.as_ref().map(|search| search.task.id());
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = updates.recv().await {
+                let applied = this.update_in(cx, |this, window, cx| {
+                    let current = this.tree_search.as_ref().map(|search| search.task.id());
+                    if current != task_id {
+                        return false;
+                    }
+                    this.apply_tree_event(event, window, cx);
+                    true
+                });
+                if !matches!(applied, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_tree_event(&mut self, event: SearchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search) = self.tree_search.as_mut() else { return };
+        match event {
+            SearchEvent::Batch { hits, scanned } => {
+                search.scanned = scanned;
+                if !hits.is_empty() {
+                    self.all_entries.extend(hits.into_iter().map(hit_entry));
+                    self.apply_sort();
+                }
+            }
+            SearchEvent::Finished(SearchEnd { scanned, capped, unreadable, error }) => {
+                search.running = false;
+                search.scanned = scanned;
+                search.capped = capped;
+                search.unreadable = unreadable;
+                if let Some(error) = error {
+                    tracing::error!(error = %format!("{error:#}"), "recursive search failed");
+                    notify_error(&error, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stop walking and keep the hits found so far.
+    fn stop_tree_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = self.tree_search.as_mut() {
+            search.task.abort();
+            search.running = false;
+            cx.notify();
+        }
+    }
+
+    /// Leave the results and open the folder holding the selected hit, with
+    /// the hit selected.
+    fn reveal_in_folder(&mut self, _: &RevealInFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_search.is_none() {
+            return;
+        }
+        let Some(entry) = self.selected_entries().into_iter().next() else { return };
+        self.reveal_name = Some(entry.name);
+        self.navigate_to(parent_of(&entry.path), window, cx);
+    }
+
+    /// The search bar's status text while it shows recursive results.
+    fn tree_search_status(search: &TreeSearch, found: usize) -> SharedString {
+        let found_text = found.to_string();
+        let scanned = search.scanned.to_string();
+        let args = [("found", found_text.as_str()), ("scanned", scanned.as_str())];
+        let mut status = if search.running {
+            tf("file_pane.search.running", &args).to_string()
+        } else {
+            tf("file_pane.search.done", &args).to_string()
+        };
+        if search.capped {
+            status.push_str(" · ");
+            status.push_str(&tf("file_pane.search.capped", &[("max", &MAX_HITS.to_string())]));
+        }
+        if search.unreadable > 0 {
+            status.push_str(" · ");
+            status.push_str(&tf("file_pane.search.unreadable", &[("count", &search.unreadable.to_string())]));
+        }
+        status.into()
     }
 
     fn search_action(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
@@ -1642,8 +1830,14 @@ impl FilePane {
         }
     }
 
+    /// The user asked for fresh rows: on search results that means searching
+    /// again. Background refreshes (`refresh`) leave results alone.
     fn refresh_action(&mut self, _: &Refresh, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh(window, cx);
+        if self.tree_search.is_some() {
+            self.run_tree_search(window, cx);
+        } else {
+            self.refresh(window, cx);
+        }
     }
 
     fn new_folder_action(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -2038,7 +2232,11 @@ impl FilePane {
                     tracing::error!(error = %format!("{error:#}"), "file operation failed");
                     notify_error(&error, window, cx);
                 }
-                this.reload(window, cx);
+                if this.tree_search.is_some() {
+                    this.run_tree_search(window, cx);
+                } else {
+                    this.reload(window, cx);
+                }
             })
             .ok();
         })
@@ -2594,6 +2792,7 @@ impl FilePane {
             self.back_stack.push(std::mem::replace(&mut self.path, path));
             self.forward_stack.clear();
         }
+        self.tree_search = None;
         self.close_search(window, cx);
         self.reload(window, cx);
         cx.emit(PaneEvent::Navigated);
@@ -2603,6 +2802,7 @@ impl FilePane {
         if let Some(path) = self.back_stack.pop() {
             self.forward_stack
                 .push(std::mem::replace(&mut self.path, path));
+            self.tree_search = None;
             self.close_search(window, cx);
             self.reload(window, cx);
             cx.emit(PaneEvent::Navigated);
@@ -2613,6 +2813,7 @@ impl FilePane {
         if let Some(path) = self.forward_stack.pop() {
             self.back_stack
                 .push(std::mem::replace(&mut self.path, path));
+            self.tree_search = None;
             self.close_search(window, cx);
             self.reload(window, cx);
             cx.emit(PaneEvent::Navigated);
@@ -2749,6 +2950,9 @@ impl FilePane {
     /// Reload the listing but keep the current selection (matched by name).
     /// On a failed connection this retries connecting instead.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_search.is_some() {
+            return;
+        }
         match self.connection {
             Connection::Ready(_) => {}
             Connection::Failed(_) => return self.connect(window, cx),
@@ -2875,6 +3079,11 @@ impl FilePane {
                                 })
                                 .map(|(ix, _)| ix)
                                 .collect();
+                        }
+                        if let Some(name) = this.reveal_name.take() {
+                            if let Some(ix) = this.entries.iter().position(|entry| entry.name == name) {
+                                this.jump_to(ix, cx);
+                            }
                         }
                     }
                     Err(error) => {
@@ -3071,6 +3280,11 @@ impl FilePane {
 
         let weak = cx.entity().downgrade();
         let entry_clone = entry.clone();
+        let location = self.tree_search.as_ref().map(|search| {
+            let parent = parent_of(&entry.path);
+            let inner = parent.strip_prefix(search.root.as_str()).unwrap_or(&parent);
+            SharedString::from(format!("/{}", inner.trim_end_matches('/')))
+        });
 
         h_flex()
             .id(ix)
@@ -3141,6 +3355,16 @@ impl FilePane {
             })
             .child(icon)
             .child(div().flex_1().min_w_0().truncate().child(entry.name.clone()))
+            .when_some(location, |el, location| {
+                el.child(
+                    div()
+                        .w(px(LOCATION_WIDTH))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(location),
+                )
+            })
             .children(self.columns.iter().map(|column| {
                 div()
                     .w(self.column_width(*column))
@@ -3507,6 +3731,21 @@ fn build_context_menu(
     // The pane-to-pane transfer is a download or an upload depending on
     // which side of the split it starts from.
     let mut menu = menu;
+    if pane.read(cx).tree_search.is_some() {
+        menu = menu
+            .item(
+                PopupMenuItem::new(t("file_pane.search.reveal"))
+                    .action(Box::new(RevealInFolder))
+                    .on_click({
+                        let pane = weak.clone();
+                        move |_, window, cx| {
+                            pane.update(cx, |this, cx| this.reveal_in_folder(&RevealInFolder, window, cx))
+                                .ok();
+                        }
+                    }),
+            )
+            .separator();
+    }
     if !is_local {
         menu = menu
             .item(PopupMenuItem::new(plural("Download")).on_click({
@@ -3828,6 +4067,8 @@ impl Render for FilePane {
             .on_action(cx.listener(Self::copy_to_other_pane))
             .on_action(cx.listener(Self::move_to_other_pane))
             .on_action(cx.listener(Self::reconnect))
+            .on_action(cx.listener(Self::search_tree_action))
+            .on_action(cx.listener(Self::reveal_in_folder))
             // Typing a printable character starts type-to-search.
             .on_key_down(cx.listener(Self::on_pane_key_down))
             // Column resize: the header handle sets `resizing`; the pane
@@ -3974,7 +4215,9 @@ impl Render for FilePane {
                             .icon(Icon::default().path("icons/rotate-cw.svg"))
                             .ghost()
                             .small()
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh_action(&Refresh, window, cx)
+                            })),
                     ),
             )
             .children(self.path_error.clone().map(|message| {
@@ -4064,6 +4307,14 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, _, cx| this.set_sort(None, cx)))
                             .child(format!("Name{}", self.sort_marker(None))),
                     )
+                    .when(self.tree_search.is_some(), |el| {
+                        el.child(
+                            div()
+                                .w(px(LOCATION_WIDTH))
+                                .flex_shrink_0()
+                                .child(t("file_pane.search.folder")),
+                        )
+                    })
                     .children(self.columns.iter().enumerate().map(|(ix, column)| {
                         let column = *column;
                         div()
@@ -4200,16 +4451,36 @@ impl Render for FilePane {
                         )
                         .child(div().flex_1().child(Input::new(&self.search_input).small()))
                         .child(
+                            Button::new("search-subfolders")
+                                .label(t("file_pane.search.subfolders"))
+                                .ghost()
+                                .xsmall()
+                                .selected(self.tree_scope)
+                                .tooltip(t("file_pane.search.subfolders_hint"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_tree_scope(window, cx)
+                                })),
+                        )
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .whitespace_nowrap()
-                                .child(if matches == 1 {
-                                    "1 match".to_string()
-                                } else {
-                                    format!("{matches} matches")
+                                .child(match &self.tree_search {
+                                    Some(search) => Self::tree_search_status(search, matches),
+                                    None if matches == 1 => t("file_pane.search.one_match"),
+                                    None => tf("file_pane.search.matches", &[("count", &matches.to_string())]),
                                 }),
                         )
+                        .when(self.tree_search.as_ref().is_some_and(|search| search.running), |el| {
+                            el.child(
+                                Button::new("stop-search")
+                                    .label(t("file_pane.search.stop"))
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| this.stop_tree_search(cx))),
+                            )
+                        })
                         .child(
                             Button::new("close-search")
                                 .icon(Icon::new(IconName::Close))
@@ -4223,6 +4494,24 @@ impl Render for FilePane {
             })
             )
             })
+    }
+}
+
+/// A search hit as a row. Metadata the walk didn't fetch stays empty.
+fn hit_entry(hit: Hit) -> FsEntry {
+    FsEntry {
+        is_hidden: hit.name.starts_with('.'),
+        name: hit.name.into(),
+        path: hit.path,
+        is_dir: hit.is_dir,
+        is_symlink: false,
+        is_bucket: false,
+        is_parent: false,
+        size: hit.size,
+        modified: hit.modified,
+        permissions: None,
+        storage_class: None,
+        region: None,
     }
 }
 

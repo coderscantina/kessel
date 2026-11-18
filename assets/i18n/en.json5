@@ -424,4 +424,18 @@
   "file_pane.reconnecting": "Reconnecting…",
   "file_pane.stale_rows": "Showing the last loaded contents of {folder}. They may be out of date.",
   "cmdbar.command.reconnect": "Reconnect to Site",
+
+  // Recursive search.
+  "cmdbar.command.search_tree": "Search in Subfolders",
+  "file_pane.search.subfolders": "Subfolders",
+  "file_pane.search.subfolders_hint": "Press Enter to search this folder and everything below it",
+  "file_pane.search.folder": "Folder",
+  "file_pane.search.one_match": "1 match",
+  "file_pane.search.matches": "{count} matches",
+  "file_pane.search.running": "Searching… {found} found, {scanned} checked",
+  "file_pane.search.done": "{found} found, {scanned} checked",
+  "file_pane.search.capped": "stopped at {max} matches",
+  "file_pane.search.unreadable": "{count} unreadable folders skipped",
+  "file_pane.search.stop": "Stop",
+  "file_pane.search.reveal": "Show in Folder",
 }

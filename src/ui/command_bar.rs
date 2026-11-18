@@ -84,6 +84,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmdbar.command.toggle_hidden", "file_pane::ToggleHidden"),
     ("cmdbar.command.toggle_tree", "file_pane::ToggleTree"),
     ("cmdbar.command.search", "file_pane::Search"),
+    ("cmdbar.command.search_tree", "file_pane::SearchTree"),
     ("cmdbar.command.quick_look", "file_pane::QuickLook"),
     ("cmdbar.command.edit_path", "file_pane::EditPath"),
     ("cmdbar.command.reconnect", "file_pane::Reconnect"),

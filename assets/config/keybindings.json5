@@ -90,6 +90,8 @@
     // Files.
     "space": "file_pane::QuickLook",
     "secondary-f": "file_pane::Search",
+    "secondary-shift-f": "file_pane::SearchTree",
+    "secondary-enter": "file_pane::RevealInFolder",
     "secondary-r": "file_pane::Refresh",
     "secondary-shift-r": "file_pane::Reconnect",
     // Commander idioms: F5 copies, F6 moves the selection to the other pane.
