@@ -2335,6 +2335,36 @@ mod tests {
         assert_eq!(server.names(), ["up/big.bin"]);
     }
 
+    #[test]
+    fn an_ftp_upload_leaves_a_file_named_like_an_old_partial_alone() {
+        let (env, server) = ftp_env("ftp-foreign-partial", 0);
+        // The name earlier versions derived from the file and the task id.
+        server.put("up/file.txt.1.kessel-part", b"not ours");
+        let src = env.dir.join("file.txt");
+        std::fs::write(&src, b"new content").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/file.txt.1.kessel-part").unwrap(), b"not ours");
+        assert_eq!(server.names(), ["up/file.txt", "up/file.txt.1.kessel-part"]);
+    }
+
+    #[test]
+    fn a_dotfile_upload_verifies_on_a_server_that_hides_dotfiles() {
+        let (env, server) = ftp_env("ftp-dotfile", 0);
+        let src = env.dir.join(".htaccess");
+        std::fs::write(&src, b"deny from all").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/.htaccess").unwrap(), b"deny from all");
+        assert_eq!(server.names(), ["up/.htaccess"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_same_site_move_renames_instead_of_copying() {

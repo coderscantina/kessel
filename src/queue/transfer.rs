@@ -2,10 +2,10 @@
 //!
 //! Safe overwrite: on backends that can rename (local fs, sftp, ftp, …) a
 //! task writes into its own partial file next to the destination
-//! (`.<name>.<task id>.kessel-part`, on FTP without the leading dot) and
-//! renames it onto the real name only after the copy finished and verified. The old file stays intact until
-//! then. The task records the partial it owns, so cancel and removal can
-//! delete it later. Object stores write the destination directly: their
+//! (`.<name>.<task id>.kessel-part`, on FTP a fresh random name, see
+//! [`fresh_ftp_partial`]) and renames it onto the real name only after the
+//! copy finished and verified. The old file stays intact until then. The task
+//! records the partial it owns, so cancel and removal can delete it later. Object stores write the destination directly: their
 //! uploads only become visible on a successful close, so an interrupted
 //! upload is always aborted and restarts from zero.
 //!
@@ -162,14 +162,40 @@ fn resumes_by_append(caps: &Capabilities) -> bool {
     caps.write_can_append && !caps.virtual_dirs
 }
 
+/// `path` with its file name replaced by `name`.
+fn sibling(path: &str, name: &str) -> String {
+    format!("{}{name}", &path[..path.len() - file_name(path).len()])
+}
+
 /// The partial file next to `path` (an operator or browse path) that task
-/// `task_id` writes before committing. FTP partials stay visible: many
-/// servers hide dotfiles from `LIST`, the only way OpenDAL stats a file there.
-pub(crate) fn partial_path(dst: &Provider, path: &str, task_id: i64) -> String {
-    let name = file_name(path);
-    let parent = &path[..path.len() - name.len()];
-    let dot = if dst.scheme == "ftp" { "" } else { "." };
-    format!("{parent}{dot}{name}.{task_id}{PARTIAL_SUFFIX}")
+/// `task_id` writes before committing, on backends other than FTP.
+fn partial_name(path: &str, task_id: i64) -> String {
+    format!(".{}.{task_id}{PARTIAL_SUFFIX}", file_name(path))
+}
+
+/// The file an earlier run of the task left its bytes in. FTP partials have
+/// random names, so only the task's record knows them.
+fn earlier_partial(dst: &Provider, path: &str, task: &ClaimedTask) -> Option<String> {
+    if dst.scheme == "ftp" {
+        return task.partial.as_deref().map(|partial| sibling(path, file_name(partial)));
+    }
+    Some(sibling(path, &partial_name(path, task.id)))
+}
+
+/// A partial name next to `path` that nothing on the FTP server uses yet. FTP
+/// can't create a file exclusively and appends to what it finds, so the name
+/// is random and probed first. It never starts with a dot: many servers hide
+/// dotfiles from `LIST`, the only way OpenDAL stats a file there.
+async fn fresh_ftp_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
+    for _ in 0..8 {
+        let name = format!("kessel-{task_id}-{:016x}{PARTIAL_SUFFIX}", rand::random::<u64>());
+        match op.stat(&sibling(path, &name)).await {
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(name),
+            Err(error) => return Err(error).context("probing a name for the partial file"),
+            Ok(_) => {}
+        }
+    }
+    anyhow::bail!("no free partial file name next to `{path}`")
 }
 
 /// Run one claimed task. Also returns the bytes the worker still counts in
@@ -258,11 +284,13 @@ async fn run_inner(
     let mut offset = 0;
     if task.byte_offset > 0 {
         let written = if task.in_place || !stages(&dst.caps) {
-            dst_path.clone()
+            Some(dst_path.clone())
         } else {
-            partial_path(dst, &dst_path, task.id)
+            earlier_partial(dst, &dst_path, task)
         };
-        if can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref()) {
+        if let Some(written) = written.filter(|_| {
+            can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref())
+        }) {
             offset = resume_offset(&dst_op, &written, size).await;
         }
     }
@@ -336,12 +364,16 @@ async fn run_inner(
     // case that deliberately writes the real file in place, also when a
     // later run of the task picks up its resume offset.
     let in_place = append_to_existing || (offset > 0 && task.in_place);
-    let partial = (stages(&dst.caps) && !in_place).then(|| {
-        (
-            partial_path(dst, &dst_path, task.id),
-            partial_path(dst, &dst_browse, task.id),
-        )
-    });
+    let partial = if stages(&dst.caps) && !in_place {
+        let name = match task.partial.as_deref() {
+            _ if dst.scheme != "ftp" => partial_name(&dst_path, task.id),
+            Some(recorded) if offset > 0 => file_name(recorded).to_string(),
+            _ => fresh_ftp_partial(&dst_op, &dst_path, task.id).await?,
+        };
+        Some((sibling(&dst_path, &name), sibling(&dst_browse, &name)))
+    } else {
+        None
+    };
     let dest = Dest {
         op: dst_op,
         path: dst_path,
@@ -400,12 +432,6 @@ async fn run_inner(
     // A writer that renames on close would publish whatever an interrupted
     // upload holds, so those bytes go straight into the partial instead.
     let append = offset > 0 || dst.caps.write_renames_on_close;
-    if offset == 0 && append && dest.partial.is_some() {
-        dest.op
-            .delete(dest.write_path())
-            .await
-            .with_context(|| format!("clearing the partial of `{}`", task.dst))?;
-    }
 
     // Only the streaming writer draws from the global bandwidth budget.
     let write_op = match &opts.throttle {
