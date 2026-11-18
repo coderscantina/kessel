@@ -124,6 +124,7 @@ fn main() -> Result<()> {
         cx.on_app_quit({
             let queue = state.queue.clone();
             move |cx| {
+                edit::end_sessions();
                 let ack = queue.shutdown();
                 let deadline = cx
                     .background_executor()

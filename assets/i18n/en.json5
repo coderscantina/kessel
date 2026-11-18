@@ -184,7 +184,17 @@
   "sync.confirm.back": "Back",
   "sync.report.skipped": "{count} item(s) were left alone because they changed after the review.",
   "edit.saved": "Saved {name} to {site}.",
-  "edit.failed": "Couldn't save {name} to {site}: {reason} Your local copy is kept; save again to retry.",
+  "edit.failed": "Couldn't save {name} to {site}: {reason} Your local copy is kept.",
+  "edit.retry": "Retry",
+  "edit.conflict.title": "Server file changed",
+  "edit.conflict.summary": "The server copy of “{name}” changed after your edit session started. Uploading your save would overwrite that change.",
+  "edit.conflict.summary_at": "The server copy of “{name}” changed on {when}, after your edit session started. Uploading your save would overwrite that change.",
+  "edit.conflict.upload": "Upload Anyway",
+  "edit.conflict.upload_hint": "Replace the server copy with your local save.",
+  "edit.conflict.discard": "Discard My Changes",
+  "edit.conflict.discard_hint": "Throw your local edits away and reload the server copy.",
+  "edit.conflict.later": "Decide Later",
+  "edit.conflict.later_hint": "Keep editing locally; nothing is uploaded for this save.",
 
   // Theme & icon-theme browser (Zed extension registry).
   "themes.title": "Browse Themes",
