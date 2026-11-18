@@ -240,7 +240,11 @@ async fn location(provider: &Provider, dir: &str) -> String {
         let path = real.to_string_lossy().replace('\\', "/");
         return format!("fs://{}/", path.trim_end_matches('/'));
     }
-    let server = server_identity(provider.endpoint(), &info.name(), provider.site_id);
+    let mut server = server_identity(provider.endpoint(), &info.name(), provider.site_id);
+    // FTP paths are relative to the account: each login can have its own root.
+    if let Some(login) = provider.login().filter(|_| scheme == "ftp") {
+        server = format!("{login}@{server}");
+    }
     let parts = [server.as_str(), &info.name(), &info.root(), &rel];
     let path: Vec<&str> = parts.iter().map(|part| part.trim_matches('/')).filter(|part| !part.is_empty()).collect();
     format!("{scheme}://{}/", path.join("/"))
@@ -851,6 +855,29 @@ mod tests {
         // No endpoint: only a bucket name can say two sites share a store.
         assert_ne!(server_identity(None, "", 1), server_identity(None, "", 2));
         assert_eq!(server_identity(None, "bucket", 1), server_identity(None, "bucket", 2));
+    }
+
+    #[test]
+    fn two_ftp_accounts_on_one_server_are_different_locations() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ftp = |id, user: &str| {
+            let options = [
+                ("endpoint".to_string(), "ftp://files.example.org".to_string()),
+                ("user".to_string(), user.to_string()),
+            ];
+            let profile = crate::provider::SiteProfile {
+                id,
+                scheme: "ftp".into(),
+                options: options.into(),
+                ..Default::default()
+            };
+            Provider::connect(&profile, &Default::default()).unwrap()
+        };
+        let at = |provider: &Provider, dir: &str| rt.block_on(location(provider, dir));
+        let (anna, bob, anna_again) = (ftp(1, "anna"), ftp(2, "bob"), ftp(3, "anna"));
+
+        assert!(!overlapping(&at(&anna, "www/"), &at(&bob, "www/")));
+        assert!(overlapping(&at(&anna, "www/"), &at(&anna_again, "www/sub/")));
     }
 
     #[test]
