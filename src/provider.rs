@@ -384,6 +384,11 @@ impl Provider {
         Ok(())
     }
 
+    /// The server this site talks to, when its options name one.
+    pub(crate) fn endpoint(&self) -> Option<&str> {
+        self.options.get("endpoint").map(String::as_str).filter(|endpoint| !endpoint.is_empty())
+    }
+
     /// One server-side rename of operator paths (guarded by `caps.rename`).
     /// OpenDAL has no FTP rename, so that goes through [`crate::ftp`].
     pub(crate) async fn rename_on_server(&self, op: &Operator, from: &str, to: &str) -> opendal::Result<()> {

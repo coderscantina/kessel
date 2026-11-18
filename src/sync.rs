@@ -203,13 +203,25 @@ fn compare(src: &FileMeta, dst: &FileMeta, dst_keeps_mtime: bool) -> Option<Plan
     }
 }
 
+/// What tells a site's server apart from others of its scheme: the endpoint,
+/// or the site itself when neither an endpoint nor a service name (a bucket,
+/// say) identifies the store.
+fn server_identity(endpoint: Option<&str>, service: &str, site_id: i64) -> String {
+    match endpoint {
+        Some(endpoint) => endpoint.trim_end_matches('/').to_lowercase(),
+        None if service.is_empty() => format!("site-{site_id}"),
+        None => String::new(),
+    }
+}
+
 /// Where a browse directory really lives, comparable across bookmarks of
 /// one store: a location inside another starts with that location's text.
 async fn location(provider: &Provider, dir: &str) -> String {
     let scheme = &provider.scheme;
-    // Only the account root of a bucket-root S3 site has no operator.
+    // Only the account root of a bucket-root S3 site has no operator. It
+    // contains every bucket of its server.
     let Ok((op, rel)) = provider.route(dir).await else {
-        return format!("{scheme}://");
+        return format!("{scheme}://{}", provider.endpoint().unwrap_or_default().to_lowercase());
     };
     let info = op.info();
     if scheme == "fs" {
@@ -218,7 +230,8 @@ async fn location(provider: &Provider, dir: &str) -> String {
         let path = real.to_string_lossy().replace('\\', "/");
         return format!("fs://{}/", path.trim_end_matches('/'));
     }
-    let parts = [info.name(), info.root(), rel];
+    let server = server_identity(provider.endpoint(), &info.name(), provider.site_id);
+    let parts = [server.as_str(), &info.name(), &info.root(), &rel];
     let path: Vec<&str> = parts.iter().map(|part| part.trim_matches('/')).filter(|part| !part.is_empty()).collect();
     format!("{scheme}://{}/", path.join("/"))
 }
@@ -771,6 +784,28 @@ mod tests {
             .unwrap();
         assert_eq!(plan.items.iter().map(|item| item.rel.as_str()).collect::<Vec<_>>(), ["a.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sites_on_different_servers_are_different_locations() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ftp = |id, endpoint: &str| {
+            let profile = crate::provider::SiteProfile {
+                id,
+                scheme: "ftp".into(),
+                options: [("endpoint".to_string(), endpoint.to_string())].into(),
+                ..Default::default()
+            };
+            Provider::connect(&profile, &Default::default()).unwrap()
+        };
+        let at = |provider: &Provider, dir: &str| rt.block_on(location(provider, dir));
+        let (a, b, a_again) = (ftp(1, "ftp://a.example.org"), ftp(2, "ftp://b.example.org"), ftp(3, "ftp://A.example.org/"));
+
+        assert!(!overlapping(&at(&a, "www/"), &at(&b, "www/")));
+        assert!(overlapping(&at(&a, "www/"), &at(&a_again, "www/sub/")));
+        // No endpoint: only a bucket name can say two sites share a store.
+        assert_ne!(server_identity(None, "", 1), server_identity(None, "", 2));
+        assert_eq!(server_identity(None, "bucket", 1), server_identity(None, "bucket", 2));
     }
 
     #[test]
