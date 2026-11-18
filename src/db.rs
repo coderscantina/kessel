@@ -23,12 +23,42 @@ pub async fn connect(data_dir: &Path) -> Result<SqlitePool> {
         .await
         .context("opening kessel.db")?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
+    let migrator = sqlx::migrate!("./migrations");
+    backup_before_migrating(&pool, &migrator, &data_dir.join("kessel.db.bak")).await?;
+    migrator.run(&pool).await.context("running migrations")?;
 
     Ok(pool)
+}
+
+/// Copy the database to `backup` when it already has applied migrations and
+/// the binary carries newer ones, replacing the previous backup. A fresh
+/// database has nothing worth keeping. `VACUUM INTO` gives a consistent copy
+/// of a WAL database, which a plain file copy would not.
+async fn backup_before_migrating(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+    backup: &Path,
+) -> Result<()> {
+    // The table doesn't exist before the first run.
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    let pending = migrator
+        .iter()
+        .any(|migration| !applied.contains(&migration.version));
+    if applied.is_empty() || !pending {
+        return Ok(());
+    }
+    // VACUUM INTO refuses to overwrite.
+    std::fs::remove_file(backup).ok();
+    sqlx::query("VACUUM INTO ?")
+        .bind(backup.to_string_lossy().into_owned())
+        .execute(pool)
+        .await
+        .context("backing up kessel.db before migrating")?;
+    tracing::info!(backup = %backup.display(), "database backed up before migrating");
+    Ok(())
 }
 
 /// Non-connection bookmark metadata: sidebar presentation and grouping.
@@ -451,4 +481,33 @@ pub async fn requeue_interrupted(pool: &SqlitePool) -> Result<u64> {
         .rows_affected();
     tx.commit().await?;
     Ok(jobs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backs_up_only_when_migrations_are_pending() {
+        let dir = std::env::temp_dir().join(format!("kessel-db-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = dir.join("kessel.db.bak");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let pool = connect(&dir).await.unwrap();
+            assert!(!backup.exists(), "a fresh database needs no backup");
+
+            let migrator = sqlx::migrate!("./migrations");
+            backup_before_migrating(&pool, &migrator, &backup).await.unwrap();
+            assert!(!backup.exists(), "nothing pending");
+
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            backup_before_migrating(&pool, &migrator, &backup).await.unwrap();
+            assert!(backup.exists());
+            pool.close().await;
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
