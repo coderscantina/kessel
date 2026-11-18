@@ -219,6 +219,39 @@
   "oauth.needed": "Sign in with the browser before saving.",
   "oauth.redirect_hint": "Register http://localhost:53682/ as the app's redirect URI.",
 
+  // Site form: FTP security, limits, OAuth setup.
+  "connect.ftp.security": "Security",
+  "connect.ftp.tls": "FTP with explicit TLS (recommended)",
+  "connect.ftp.plain": "Plain FTP (unencrypted)",
+  "connect.ftp.plain_warning": "Plain FTP sends your password and files unencrypted.",
+  "connect.ftp.no_scheme": "Enter the host without ftp:// and choose the security below.",
+  "site.advanced": "ADVANCED",
+  "site.limits.connections": "Concurrent connections",
+  "site.limits.connections_placeholder": "App default",
+  "site.limits.connections_invalid": "Concurrent connections must be a whole number from 1 to {max}.",
+  "site.limits.speed": "Speed limit (KiB/s)",
+  "site.limits.speed_placeholder": "Unlimited",
+  "site.limits.speed_invalid": "Speed limit must be a whole number from 1 to {max} KiB/s.",
+  "site.limits.hint": "Leave a field empty to use the app default.",
+  "oauth.client_needed": "Enter your OAuth client ID to enable sign-in.",
+  "oauth.setup_steps": "How to create an OAuth client",
+
+  // Sites in use by transfer jobs.
+  "site.busy.title": "Site is still in use",
+  "site.busy.delete": "Transfer jobs still use this site (open: {jobs}). Deleting it would remove them. Cancel them or clear finished ones in the Transfers panel, then try again.",
+  "site.busy.edit": "Transfer jobs still use this site (open: {jobs}), so its protocol, endpoint, root, bucket and container can't change now. Cancel them or clear finished ones in the Transfers panel, then try again.",
+
+  // Import from other clients.
+  "site.import.button": "Import…",
+  "site.import.empty": "No sites found in that file.",
+  "site.import.summary": "{count} of {total} sites can be imported from FileZilla or Cyberduck.",
+  "site.import.confirm": "Import {count} sites",
+  "site.import.unsupported": "Can't import: {protocol}",
+  "site.import.folder": "Folder: {folder}",
+  "site.import.needs_credentials": "Password needed on first connect",
+  "site.import.enter_credentials": "Enter the password, save, then connect.",
+  "site.import.passwords_note": "Passwords are never imported. Enter them when you first connect.",
+
   // AWS IAM Identity Center (SSO) interactive sign-in.
   "sso.sign_in": "Sign in with AWS SSO",
   "sso.waiting": "Waiting for AWS sign-in in the browser…",

@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use crate::provider::{LayerConfig, ThrottleConfig};
+
 /// Kessel-internal option key for S3 "use an ~/.aws profile" mode. Stripped
 /// and resolved to real credentials in `Provider::connect`, never passed to
 /// the Operator.
@@ -133,7 +135,7 @@ pub const DRIVERS: &[DriverSpec] = &[
         scheme: "ftp",
         label: "FTP",
         fields: &[
-            field("endpoint", "Host", "ftp://host[:21]", false, true),
+            field("endpoint", "Host", "host[:21]", false, true),
             field("user", "User", "anonymous", false, false),
             field("password", "Password", "", true, false),
             field("root", "Root path", "/", false, false),
@@ -218,6 +220,96 @@ pub fn available_drivers() -> Vec<&'static DriverSpec> {
 /// Schemes whose credentials come from the browser OAuth flow.
 pub fn is_oauth_scheme(scheme: &str) -> bool {
     matches!(scheme, "gdrive" | "dropbox" | "onedrive")
+}
+
+/// Where to register an OAuth client for a cloud-drive scheme.
+pub fn oauth_setup_url(scheme: &str) -> Option<&'static str> {
+    match scheme {
+        "gdrive" => Some("https://developers.google.com/workspace/guides/create-credentials#oauth-client-id"),
+        "dropbox" => Some("https://www.dropbox.com/developers/apps"),
+        "onedrive" => Some(
+            "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
+        ),
+        _ => None,
+    }
+}
+
+/// Split a stored FTP endpoint into host and whether it uses explicit TLS.
+/// OpenDAL reads a bare host as FTPS and only `ftp://` as plain FTP, so the
+/// form shows exactly that.
+pub fn split_ftp_endpoint(endpoint: &str) -> (&str, bool) {
+    match endpoint.split_once("://") {
+        Some(("ftp", host)) => (host, false),
+        Some((_, host)) => (host, true),
+        None => (endpoint, true),
+    }
+}
+
+/// The endpoint option for an FTP site: always carries its scheme, so the
+/// TLS choice never depends on OpenDAL's handling of a bare host.
+pub fn ftp_endpoint(host: &str, tls: bool) -> String {
+    format!("{}://{host}", if tls { "ftps" } else { "ftp" })
+}
+
+/// Highest per-site connection count the form accepts.
+pub const MAX_CONNECTIONS: usize = 64;
+/// Highest per-site speed limit the form accepts, in KiB/s. Keeps the
+/// throttle's byte rate and burst inside `u32`.
+pub const MAX_SPEED_KIB: u32 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitError {
+    Connections,
+    Speed,
+}
+
+impl LimitError {
+    pub fn message(self) -> String {
+        use crate::i18n::tf;
+        match self {
+            Self::Connections => tf(
+                "site.limits.connections_invalid",
+                &[("max", &MAX_CONNECTIONS.to_string())],
+            ),
+            Self::Speed => tf("site.limits.speed_invalid", &[("max", &MAX_SPEED_KIB.to_string())]),
+        }
+        .to_string()
+    }
+}
+
+/// `base` with the form's connection count and speed limit applied. An empty
+/// field clears the limit, so the app-level default applies again.
+pub fn apply_limits(
+    base: &LayerConfig,
+    connections: &str,
+    speed_kib: &str,
+) -> Result<LayerConfig, LimitError> {
+    let (connections, speed_kib) = (connections.trim(), speed_kib.trim());
+    let concurrent_limit = match connections {
+        "" => None,
+        text => match text.parse::<usize>() {
+            Ok(count) if (1..=MAX_CONNECTIONS).contains(&count) => Some(count),
+            _ => return Err(LimitError::Connections),
+        },
+    };
+    let throttle = match speed_kib {
+        "" => None,
+        text => match text.parse::<u32>() {
+            Ok(kib) if (1..=MAX_SPEED_KIB).contains(&kib) => {
+                let bandwidth = kib * 1024;
+                Some(ThrottleConfig {
+                    bandwidth,
+                    burst: (bandwidth * 2).max(2 * 1024 * 1024),
+                })
+            }
+            _ => return Err(LimitError::Speed),
+        },
+    };
+    Ok(LayerConfig {
+        concurrent_limit,
+        throttle,
+        ..base.clone()
+    })
 }
 
 pub fn driver_by_scheme(scheme: &str) -> Option<&'static DriverSpec> {
@@ -519,6 +611,32 @@ mod tests {
         assert!(quick_prompt_fields(&target).is_empty());
         let keys = parse_quick_url("s3://media").unwrap();
         assert_eq!(quick_prompt_fields(&keys).len(), 2);
+    }
+
+    #[test]
+    fn ftp_endpoint_keeps_the_tls_choice_explicit() {
+        assert_eq!(split_ftp_endpoint("files.example.org"), ("files.example.org", true));
+        assert_eq!(split_ftp_endpoint("ftp://files.example.org"), ("files.example.org", false));
+        assert_eq!(split_ftp_endpoint("ftps://files.example.org:21"), ("files.example.org:21", true));
+        assert_eq!(ftp_endpoint("files.example.org", true), "ftps://files.example.org");
+        assert_eq!(ftp_endpoint("files.example.org", false), "ftp://files.example.org");
+    }
+
+    #[test]
+    fn limits_validate_and_clear() {
+        let base = LayerConfig {
+            timeout_secs: Some(9),
+            ..Default::default()
+        };
+        let layers = apply_limits(&base, " 4 ", "512").unwrap();
+        assert_eq!(layers.concurrent_limit, Some(4));
+        assert_eq!(layers.throttle.as_ref().map(|t| t.bandwidth), Some(512 * 1024));
+        assert_eq!(layers.timeout_secs, Some(9));
+        assert_eq!(apply_limits(&layers, "", "").unwrap().concurrent_limit, None);
+        assert_eq!(apply_limits(&base, "0", ""), Err(LimitError::Connections));
+        assert_eq!(apply_limits(&base, "65", ""), Err(LimitError::Connections));
+        assert_eq!(apply_limits(&base, "", "fast"), Err(LimitError::Speed));
+        assert_eq!(apply_limits(&base, "", "1000001"), Err(LimitError::Speed));
     }
 
     #[test]
