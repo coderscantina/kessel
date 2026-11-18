@@ -7,18 +7,17 @@
 //! Destination paths are re-checked right before they are overwritten or
 //! deleted, so nothing that changed after the review is touched.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 
-use crate::queue::{BatchFile, ConflictPolicy, JobOutcome, JobState, NewBatch, QueueHandle};
+use crate::queue::{
+    BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState, NewBatch, QueueHandle,
+    MTIME_SLACK_SECS,
+};
 use crate::provider::Provider;
-
-/// Clock slack when comparing modified times across backends (FAT, S3 and
-/// friends round or re-stamp timestamps).
-const MTIME_SLACK_SECS: i64 = 2;
 
 /// Destination stats in flight at once while re-checking reviewed copies.
 const RECHECK_CONCURRENCY: usize = 16;
@@ -85,6 +84,15 @@ impl ReviewedFile {
         };
         self.size == size && same_time
     }
+}
+
+/// What the queue must still find at a reviewed copy's destination.
+fn expected_dest(reviewed: Option<ReviewedFile>) -> ExpectedDest {
+    reviewed.map_or(ExpectedDest::Absent, |file| ExpectedDest::File {
+        size: file.size,
+        etag: None,
+        modified: file.modified,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +202,7 @@ fn compare(src: &FileMeta, dst: &FileMeta, dst_keeps_mtime: bool) -> Option<Plan
 async fn location(provider: &Provider, dir: &str) -> String {
     let scheme = &provider.scheme;
     // Only the account root of a bucket-root S3 site has no operator.
-    let Ok((op, rel)) = provider.op_for(dir) else {
+    let Ok((op, rel)) = provider.route(dir).await else {
         return format!("{scheme}://");
     };
     let info = op.info();
@@ -402,7 +410,7 @@ impl SyncReport {
 /// Whether the destination file at `path` is still what the review saw
 /// (`None` = nothing there).
 async fn still_as_reviewed(dst: &Provider, path: &str, reviewed: Option<ReviewedFile>) -> Result<bool> {
-    let (op, rel) = dst.op_for(path)?;
+    let (op, rel) = dst.route(path).await?;
     match op.stat(&rel).await {
         Ok(meta) => {
             let modified = meta.last_modified().and_then(crate::provider::to_datetime);
@@ -415,19 +423,19 @@ async fn still_as_reviewed(dst: &Provider, path: &str, reviewed: Option<Reviewed
 
 /// The copies whose destination still matches the review. The rest are
 /// counted as skipped, or as failed when the check itself failed.
-async fn recheck_copies(dst: &Provider, copies: Vec<ReviewedCopy>, report: &mut SyncReport) -> Vec<BatchFile> {
+async fn recheck_copies(dst: &Provider, copies: Vec<ReviewedCopy>, report: &mut SyncReport) -> Vec<ReviewedCopy> {
     let checked: Vec<_> = futures::stream::iter(copies)
         .map(|copy| async move {
             let unchanged = still_as_reviewed(dst, &copy.file.dst, copy.reviewed).await;
-            (copy.file, unchanged)
+            (copy, unchanged)
         })
         .buffered(RECHECK_CONCURRENCY)
         .collect()
         .await;
     let mut files = Vec::with_capacity(checked.len());
-    for (file, unchanged) in checked {
+    for (copy, unchanged) in checked {
         match unchanged {
-            Ok(true) => files.push(file),
+            Ok(true) => files.push(copy),
             Ok(false) => report.skipped += 1,
             Err(error) => report.fail(1, crate::errors::humanize(&error).title),
         }
@@ -444,7 +452,7 @@ async fn delete_reviewed(dst: &Provider, entry: &ReviewedDelete) -> Result<bool>
             return Ok(false);
         }
     } else {
-        let (op, rel) = dst.op_for(&entry.path)?;
+        let (op, rel) = dst.route(&entry.path).await?;
         match op.stat(&rel).await {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => return Ok(false),
@@ -467,7 +475,9 @@ async fn delete_reviewed(dst: &Provider, entry: &ReviewedDelete) -> Result<bool>
 /// and only then delete. Any copy failure, cancellation or queue error
 /// holds back every delete, so a mirror never removes files while the
 /// destination is missing some of the source. Paths that changed after the
-/// review are skipped and counted in the report.
+/// review are skipped and counted in the report. The queue checks each
+/// reviewed destination again right before writing it; one that changed in
+/// between waits as a conflict in the transfers panel.
 pub async fn run(
     queue: &QueueHandle,
     src_site_id: i64,
@@ -488,16 +498,20 @@ pub async fn run(
     let copies = recheck_copies(dst, work.copies, &mut report).await;
     if !copies.is_empty() {
         let total = copies.len() as u64;
+        let expected: HashMap<String, ExpectedDest> = copies
+            .iter()
+            .map(|copy| (copy.file.dst.clone(), expected_dest(copy.reviewed)))
+            .collect();
         let batch = NewBatch {
             src_site_id,
             dst_site_id: dst.site_id,
             src_label,
             dst_label,
-            files: copies,
+            files: copies.into_iter().map(|copy| copy.file).collect(),
             conflict_policy: ConflictPolicy::Overwrite,
             move_source: false,
         };
-        let settled = match queue.submit_batch(batch).await {
+        let settled = match queue.submit_reviewed_batch(batch, expected).await {
             Ok(job_id) => queue.settled(job_id).await,
             Err(error) => Err(error),
         };
@@ -520,13 +534,14 @@ pub async fn run(
 }
 
 /// Fold the copy job's outcome into the report. True only when the job
-/// finished `Done` with every file copied; a cancelled job is never a
-/// success, even with nothing missing.
+/// finished `Done` with every file copied or deliberately skipped; a
+/// cancelled job is never a success, even with nothing missing.
 fn record_copies(report: &mut SyncReport, total: u64, settled: Result<JobOutcome>) -> bool {
     match settled {
         Ok(outcome) => {
             report.copied = outcome.files_done;
-            let missing = total.saturating_sub(outcome.files_done);
+            report.skipped += outcome.files_skipped;
+            let missing = total.saturating_sub(outcome.files_done + outcome.files_skipped);
             let ok = outcome.state == JobState::Done && missing == 0;
             if !ok {
                 let reason = outcome
@@ -618,11 +633,36 @@ mod tests {
             state: JobState::Cancelled,
             error: None,
             files_done: 2,
+            files_skipped: 0,
             files_failed: 0,
         };
         assert!(!record_copies(&mut report, 2, Ok(cancelled)));
         assert_eq!(report.copied, 2);
         assert!(report.reason.is_some());
+    }
+
+    #[test]
+    fn a_conflict_skipped_in_the_queue_counts_as_skipped_and_keeps_deletes_going() {
+        let mut report = SyncReport::default();
+        let done = JobOutcome {
+            state: JobState::Done,
+            error: None,
+            files_done: 1,
+            files_skipped: 1,
+            files_failed: 0,
+        };
+        assert!(record_copies(&mut report, 2, Ok(done)));
+        assert_eq!((report.copied, report.skipped, report.failed), (1, 1, 0));
+    }
+
+    #[test]
+    fn a_reviewed_copy_expects_what_the_review_saw() {
+        assert_eq!(expected_dest(None), ExpectedDest::Absent);
+        let modified = Some(Utc::now());
+        assert_eq!(
+            expected_dest(Some(ReviewedFile { size: 7, modified })),
+            ExpectedDest::File { size: 7, etag: None, modified }
+        );
     }
 
     #[test]

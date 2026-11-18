@@ -9,8 +9,8 @@ use sqlx::{Row as _, SqlitePool};
 use crate::provider::{LayerConfig, SiteProfile};
 
 use super::{
-    ConflictInfo, ConflictPolicy, HistoryEntry, JobOutcome, JobSnapshot, JobState, NewBatch,
-    NewJob, TaskSnapshot,
+    ConflictInfo, ConflictPolicy, ExpectedDest, HistoryEntry, JobOutcome, JobSnapshot, JobState,
+    NewBatch, NewJob, TaskSnapshot,
 };
 
 /// A job row as the scheduler sees it.
@@ -50,6 +50,8 @@ pub(crate) struct ClaimedTask {
     pub partial: Option<String>,
     /// The task appends onto the existing destination in place.
     pub in_place: bool,
+    /// What the destination must still hold when this task writes it.
+    pub expected: Option<ExpectedDest>,
 }
 
 /// A file discovered during directory expansion.
@@ -104,10 +106,18 @@ pub(crate) async fn enqueue_job(pool: &SqlitePool, job: &NewJob) -> Result<i64> 
 /// Persist a multi-file job and all its tasks in one transaction. The job
 /// is born `expanded`, so preparation only connects and activates it and a
 /// retry never re-walks anything.
-pub(crate) async fn enqueue_batch(pool: &SqlitePool, batch: &NewBatch) -> Result<i64> {
+pub(crate) async fn enqueue_batch(
+    pool: &SqlitePool,
+    batch: &NewBatch,
+    expected: &HashMap<String, ExpectedDest>,
+) -> Result<i64> {
     /// Rows per INSERT, well below SQLite's bound-parameter limit.
     const CHUNK: usize = 500;
 
+    let expected: HashMap<&str, String> = expected
+        .iter()
+        .map(|(dst, state)| Ok((dst.as_str(), serde_json::to_string(state)?)))
+        .collect::<Result<_>>()?;
     let mut tx = pool.begin().await?;
     let id = sqlx::query(
         "INSERT INTO transfer_jobs (src_site_id, dst_site_id, src, dst, conflict_policy, move_source, expanded) \
@@ -126,12 +136,14 @@ pub(crate) async fn enqueue_batch(pool: &SqlitePool, batch: &NewBatch) -> Result
     .await?
     .last_insert_rowid();
     for chunk in batch.files.chunks(CHUNK) {
-        let mut builder = sqlx::QueryBuilder::new("INSERT INTO transfer_tasks (job_id, src, dst, total_bytes) ");
+        let mut builder =
+            sqlx::QueryBuilder::new("INSERT INTO transfer_tasks (job_id, src, dst, total_bytes, expected_dest) ");
         builder.push_values(chunk, |mut row, file| {
             row.push_bind(id)
                 .push_bind(&file.src)
                 .push_bind(&file.dst)
-                .push_bind(file.size.map(|b| b as i64));
+                .push_bind(file.size.map(|b| b as i64))
+                .push_bind(expected.get(file.dst.as_str()));
         });
         builder.build().execute(&mut *tx).await?;
     }
@@ -270,6 +282,7 @@ fn claim_sql(ids: &str) -> String {
              WHERE j.state = 'active' AND j.id IN ({ids}) \
              ORDER BY j.priority DESC, head.id LIMIT 1) \
          RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, partial, in_place, \
+             expected_dest, \
              COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
              (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
     )
@@ -294,7 +307,13 @@ pub(crate) async fn claim_task(
     let row = sqlx::query(sqlx::AssertSqlSafe(claim_sql(&ids)))
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|row| ClaimedTask {
+    let Some(row) = row else { return Ok(None) };
+    let expected = row
+        .get::<Option<String>, _>("expected_dest")
+        .map(|state| serde_json::from_str(&state))
+        .transpose()
+        .context("reading a task's expected destination")?;
+    Ok(Some(ClaimedTask {
         id: row.get("id"),
         job_id: row.get("job_id"),
         src: row.get("src"),
@@ -307,6 +326,7 @@ pub(crate) async fn claim_task(
         move_source: row.get::<i64, _>("move_source") != 0,
         partial: row.get("partial"),
         in_place: row.get::<i64, _>("in_place") != 0,
+        expected,
     }))
 }
 
@@ -447,7 +467,8 @@ pub(crate) async fn set_task_in_place(pool: &SqlitePool, task_id: i64, in_place:
 }
 
 /// Apply a conflict decision: the job's policy changes (covering future
-/// conflicts too) and parked tasks go back in the queue.
+/// conflicts too) and parked tasks go back in the queue. The decision replaces
+/// what those tasks expected to find at their destination.
 pub(crate) async fn resolve_job_conflicts(
     pool: &SqlitePool,
     job_id: i64,
@@ -460,8 +481,8 @@ pub(crate) async fn resolve_job_conflicts(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE transfer_tasks SET conflict_policy = NULL, state = 'queued', updated_at = datetime('now') \
-         WHERE job_id = ? AND state = 'conflict'",
+        "UPDATE transfer_tasks SET conflict_policy = NULL, expected_dest = NULL, state = 'queued', \
+         updated_at = datetime('now') WHERE job_id = ? AND state = 'conflict'",
     )
     .bind(job_id)
     .execute(&mut *tx)
@@ -475,7 +496,7 @@ pub(crate) async fn resolve_task_conflict(
     task_id: i64,
     policy: ConflictPolicy,
 ) -> Result<()> {
-    sqlx::query("UPDATE transfer_tasks SET conflict_policy = ?, state = 'queued', updated_at = datetime('now') WHERE id = ? AND state = 'conflict'")
+    sqlx::query("UPDATE transfer_tasks SET conflict_policy = ?, expected_dest = NULL, state = 'queued', updated_at = datetime('now') WHERE id = ? AND state = 'conflict'")
         .bind(policy.as_str())
         .bind(task_id)
         .execute(pool)
@@ -822,7 +843,7 @@ const VISIBLE_STATE: &str =
 /// caller checks `state.is_terminal()` to know whether it has settled.
 pub(crate) async fn job_outcome(pool: &SqlitePool, job_id: i64) -> Result<Option<JobOutcome>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {VISIBLE_STATE} AS state, error, files_done, files_failed \
+        "SELECT {VISIBLE_STATE} AS state, error, files_done, files_skipped, files_failed \
          FROM transfer_jobs WHERE id = ?"
     )))
     .bind(job_id)
@@ -832,6 +853,7 @@ pub(crate) async fn job_outcome(pool: &SqlitePool, job_id: i64) -> Result<Option
         state: JobState::from_str(&row.get::<String, _>("state")),
         error: row.get("error"),
         files_done: row.get::<i64, _>("files_done") as u64,
+        files_skipped: row.get::<i64, _>("files_skipped") as u64,
         files_failed: row.get::<i64, _>("files_failed") as u64,
     }))
 }

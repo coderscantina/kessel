@@ -55,6 +55,23 @@ async fn send(
     headers: &[(&'static str, String)],
     what: &str,
 ) -> Result<(String, reqwest::header::HeaderMap)> {
+    let (status, body, headers) = execute(signing, &reqwest::Client::new(), method, url, headers, what).await?;
+    if !status.is_success() {
+        let message = tag_text(&body, "Message").unwrap_or(&body);
+        bail!("{what} failed ({status}): {}", message.trim());
+    }
+    Ok((body, headers))
+}
+
+/// Sign and execute one request, whatever status it answers with.
+async fn execute(
+    signing: &Signing,
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: reqwest::Url,
+    headers: &[(&'static str, String)],
+    what: &str,
+) -> Result<(reqwest::StatusCode, String, reqwest::header::HeaderMap)> {
     // reqsign 0.20 signs an `http::request::Parts` (SigV4, empty/unsigned
     // payload). Build the request parts, sign, then hand off to reqwest.
     let (mut parts, _) = http::Request::builder()
@@ -85,7 +102,7 @@ async fn send(
 
     let request = reqwest::Request::try_from(http::Request::from_parts(parts, Vec::<u8>::new()))
         .with_context(|| format!("building {what} request"))?;
-    let response = reqwest::Client::new()
+    let response = client
         .execute(request)
         .await
         .with_context(|| format!("{what} on {}", signing.endpoint))?;
@@ -95,11 +112,7 @@ async fn send(
         .text()
         .await
         .with_context(|| format!("reading {what} response"))?;
-    if !status.is_success() {
-        let message = tag_text(&body, "Message").unwrap_or(&body);
-        bail!("{what} failed ({status}): {}", message.trim());
-    }
-    Ok((body, headers))
+    Ok((status, body, headers))
 }
 
 /// `{endpoint}/{bucket}/{key}` with each path segment percent-encoded.
@@ -207,9 +220,9 @@ pub async fn set_acl(
     Ok(())
 }
 
-/// A bucket's region, from HeadBucket's `x-amz-bucket-region` header (S3
-/// returns it even on 301/403, but those land in `send`'s error path — for
-/// the common same-partition case the success header is enough).
+/// A bucket's region, from HeadBucket's `x-amz-bucket-region` header. S3 sends
+/// it with the 301 or 403 a request for another region gets too, so the status
+/// doesn't matter and redirects aren't followed.
 pub async fn bucket_region(
     options: &HashMap<String, String>,
     bucket: &str,
@@ -217,7 +230,11 @@ pub async fn bucket_region(
     let signing = signing(options)?;
     let mut url = reqwest::Url::parse(&signing.endpoint)?;
     url.path_segments_mut().ok().context("bad endpoint")?.push(bucket);
-    let (_, headers) = send(&signing, reqwest::Method::HEAD, url, &[], "HeadBucket").await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building HeadBucket client")?;
+    let (_, _, headers) = execute(&signing, &client, reqwest::Method::HEAD, url, &[], "HeadBucket").await?;
     Ok(headers
         .get("x-amz-bucket-region")
         .and_then(|value| value.to_str().ok())
@@ -258,6 +275,32 @@ fn tag_text<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_bucket_in_another_region_is_found_through_the_redirect() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 301 Moved Permanently\r\nx-amz-bucket-region: eu-west-1\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let options = HashMap::from([
+            ("access_key_id".to_string(), "key".to_string()),
+            ("secret_access_key".to_string(), "secret".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), endpoint),
+        ]);
+
+        let region = bucket_region(&options, "elsewhere").await.unwrap();
+        assert_eq!(region.as_deref(), Some("eu-west-1"));
+    }
 
     #[test]
     fn parses_list_buckets_response() {

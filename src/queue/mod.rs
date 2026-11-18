@@ -16,6 +16,10 @@ mod transfer;
 pub use engine::start;
 pub(crate) use transfer::PARTIAL_SUFFIX;
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// The reserved `sites` row backing the local-filesystem side of transfers.
@@ -61,6 +65,45 @@ pub struct BatchFile {
     pub dst: String,
     /// Expected size, so the job's total is right before files start.
     pub size: Option<u64>,
+}
+
+/// Clock slack when comparing modified times across backends and between
+/// listings and stats (FAT, S3 and friends round or re-stamp timestamps).
+pub(crate) const MTIME_SLACK_SECS: i64 = 2;
+
+/// What a destination must still hold for a reviewed write to go ahead. The
+/// worker checks it right before writing and parks the file as a conflict on
+/// a mismatch, also when an old job is retried later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedDest {
+    /// Nothing may exist at the destination.
+    Absent,
+    /// The file the user reviewed. An ETag known on both sides decides alone;
+    /// otherwise the modified time does, within [`MTIME_SLACK_SECS`].
+    File {
+        size: u64,
+        etag: Option<String>,
+        modified: Option<DateTime<Utc>>,
+    },
+}
+
+impl ExpectedDest {
+    /// Whether `current` (`None` = nothing there) is still the reviewed state.
+    fn matches(&self, current: Option<&opendal::Metadata>) -> bool {
+        let (Self::File { size, etag, modified }, Some(meta)) = (self, current) else {
+            return matches!((self, current), (Self::Absent, None));
+        };
+        if meta.is_dir() || meta.content_length() != *size {
+            return false;
+        }
+        if let (Some(expected), Some(now)) = (etag.as_deref(), meta.etag()) {
+            return expected == now;
+        }
+        match (modified, meta.last_modified().and_then(crate::provider::to_datetime)) {
+            (Some(expected), Some(now)) => (*expected - now).num_seconds().abs() <= MTIME_SLACK_SECS,
+            _ => true,
+        }
+    }
 }
 
 /// What to do when a destination file already exists. Applied per file at
@@ -231,6 +274,8 @@ pub struct JobOutcome {
     /// failure count plus a representative reason for a done one.
     pub error: Option<String>,
     pub files_done: u64,
+    /// Files left alone, for example by a conflict decision.
+    pub files_skipped: u64,
     pub files_failed: u64,
 }
 
@@ -268,8 +313,9 @@ pub(crate) enum Command {
     EnqueueTracked(NewJob, oneshot::Sender<i64>),
     /// Enqueue and report the persisted id or the rejection reason.
     Submit(NewJob, oneshot::Sender<anyhow::Result<i64>>),
-    /// Persist a multi-file job and report its id or the rejection reason.
-    SubmitBatch(NewBatch, oneshot::Sender<anyhow::Result<i64>>),
+    /// Persist a multi-file job, with the destination state each listed
+    /// `dst` must still hold, and report its id or the rejection reason.
+    SubmitBatch(NewBatch, HashMap<String, ExpectedDest>, oneshot::Sender<anyhow::Result<i64>>),
     /// Report the job's outcome once it settles.
     Settled(i64, oneshot::Sender<anyhow::Result<JobOutcome>>),
     Pause(i64),
@@ -343,9 +389,19 @@ impl QueueHandle {
     }
     /// Persist a multi-file job (one task per listed file) and return its id.
     pub async fn submit_batch(&self, batch: NewBatch) -> anyhow::Result<i64> {
+        self.submit_reviewed_batch(batch, HashMap::new()).await
+    }
+    /// [`Self::submit_batch`] for files the user reviewed: `expected` maps a
+    /// file's `dst` to what that destination must still hold when it is
+    /// written. Files without an entry are written unconditionally.
+    pub async fn submit_reviewed_batch(
+        &self,
+        batch: NewBatch,
+        expected: HashMap<String, ExpectedDest>,
+    ) -> anyhow::Result<i64> {
         let (tx, rx) = oneshot::channel();
         self.cmds
-            .send(Command::SubmitBatch(batch, tx))
+            .send(Command::SubmitBatch(batch, expected, tx))
             .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?

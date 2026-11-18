@@ -12,6 +12,7 @@ mod db;
 mod dragout;
 mod edit;
 mod errors;
+mod ftp;
 mod i18n;
 mod import;
 mod keymap;

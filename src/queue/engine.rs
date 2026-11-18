@@ -393,8 +393,8 @@ impl Engine {
             Command::Submit(job, reply) => {
                 let _ = reply.send(self.enqueue(&job).await);
             }
-            Command::SubmitBatch(batch, reply) => {
-                let _ = reply.send(self.enqueue_batch(&batch).await);
+            Command::SubmitBatch(batch, expected, reply) => {
+                let _ = reply.send(self.enqueue_batch(&batch, &expected).await);
             }
             Command::Settled(id, reply) => match store::job_outcome(&self.pool, id).await? {
                 None => {
@@ -640,14 +640,18 @@ impl Engine {
     }
 
     /// Validate and persist a multi-file job, already expanded.
-    async fn enqueue_batch(&self, batch: &super::NewBatch) -> Result<i64> {
+    async fn enqueue_batch(
+        &self,
+        batch: &super::NewBatch,
+        expected: &HashMap<String, super::ExpectedDest>,
+    ) -> Result<i64> {
         anyhow::ensure!(!batch.files.is_empty(), "nothing to transfer");
         anyhow::ensure!(
             batch.src_site_id != batch.dst_site_id
                 || batch.files.iter().all(|file| file.src != file.dst),
             "source and destination are the same"
         );
-        store::enqueue_batch(&self.pool, batch).await
+        store::enqueue_batch(&self.pool, batch, expected).await
     }
 
     /// Answer everyone waiting for this job to settle.
@@ -911,7 +915,7 @@ async fn delete_orphans(pool: &SqlitePool, partials: Vec<(i64, String)>, default
 }
 
 async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
-    let (op, rel) = provider.op_for(path)?;
+    let (op, rel) = provider.route(path).await?;
     op.delete(&rel)
         .await
         .with_context(|| format!("deleting `{path}`"))
@@ -931,7 +935,7 @@ async fn expand_job(
     skip_hidden: bool,
     control: &JobControl,
 ) -> Result<bool> {
-    let (src_op, src_rel) = providers.src.op_for(&job.src)?;
+    let (src_op, src_rel) = providers.src.route(&job.src).await?;
     let name = job
         .dst_name
         .clone()
@@ -967,14 +971,14 @@ async fn expand_job(
         !providers.same_site || format!("{}{name}/", job.dst) != src_dir,
         "source and destination are the same folder"
     );
-    let (src_op, src_rel) = providers.src.op_for(&src_dir)?;
+    let (src_op, src_rel) = providers.src.route(&src_dir).await?;
     let base = format!("{}{name}/", job.dst);
 
     let mut walk = TreeWalk::new(src_op.clone(), src_rel.clone(), skip_hidden)
         .await
         .with_context(|| format!("listing `{src_dir}`"))?;
 
-    let (dst_op, dst_rel) = providers.dst.op_for(&base)?;
+    let (dst_op, dst_rel) = providers.dst.route(&base).await?;
     if dst_op.info().capability().create_dir {
         dst_op
             .create_dir(&dst_rel)
@@ -992,7 +996,7 @@ async fn expand_job(
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
         let meta = entry.metadata();
         if meta.is_dir() {
-            let (dst_op, dst_rel) = providers.dst.op_for(&format!("{base}{rel}"))?;
+            let (dst_op, dst_rel) = providers.dst.route(&format!("{base}{rel}")).await?;
             if dst_op.info().capability().create_dir {
                 dst_op
                     .create_dir(&dst_rel)
@@ -1147,7 +1151,7 @@ async fn cleanup_moved_source(provider: Provider, src: String) {
     use futures::TryStreamExt as _;
 
     let result: Result<()> = async {
-        let (op, rel) = provider.op_for(&src)?;
+        let (op, rel) = provider.route(&src).await?;
         let mut lister = op.lister_with(&rel).recursive(true).await?;
         let mut dirs = vec![rel.clone()];
         while let Some(entry) = lister.try_next().await? {
@@ -1204,7 +1208,7 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
-    use crate::queue::{ConflictPolicy, JobState, NewJob, QueueHandle, QueueSnapshot};
+    use crate::queue::{BatchFile, ConflictPolicy, JobState, NewBatch, NewJob, QueueHandle, QueueSnapshot};
 
     fn job(src: String, dst_dir: String, policy: ConflictPolicy) -> NewJob {
         NewJob {
@@ -2166,6 +2170,198 @@ mod tests {
         assert_eq!(reason("broken"), "Broken link, not copied");
     }
 
+    /// One reviewed file `src/new.txt` → `dst/file.txt`, as a sync or an
+    /// edit save submits it.
+    fn reviewed_batch(env: &TestEnv, expected: crate::queue::ExpectedDest) -> i64 {
+        let dst = browse(&env.dir.join("dst/file.txt"));
+        let batch = NewBatch {
+            src_site_id: 0,
+            dst_site_id: 1,
+            src_label: "src".into(),
+            dst_label: "dst".into(),
+            files: vec![BatchFile {
+                src: browse(&env.dir.join("src/new.txt")),
+                dst: dst.clone(),
+                size: Some(3),
+            }],
+            conflict_policy: ConflictPolicy::Overwrite,
+            move_source: false,
+        };
+        env.rt
+            .block_on(env.handle.submit_reviewed_batch(batch, [(dst, expected)].into()))
+            .unwrap()
+    }
+
+    fn reviewed_env(name: &str) -> TestEnv {
+        let env = test_env(name);
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO sites (id, name, scheme, options) \
+                     VALUES (1, 'Local copy', 'fs', '{\"root\":\"/\"}')",
+                )
+                .execute(&env.pool),
+            )
+            .unwrap();
+        std::fs::create_dir_all(env.dir.join("src")).unwrap();
+        std::fs::create_dir_all(env.dir.join("dst")).unwrap();
+        std::fs::write(env.dir.join("src/new.txt"), b"new").unwrap();
+        env
+    }
+
+    fn wait_for_conflict(env: &TestEnv, id: i64) {
+        wait_until(&env.handle, |s| s.jobs.iter().any(|j| j.id == id && j.files_conflict == 1));
+    }
+
+    #[test]
+    fn a_reviewed_write_parks_when_the_destination_changed_and_the_decision_wins() {
+        let env = reviewed_env("reviewed-changed");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"theirs").unwrap();
+        let id = reviewed_batch(
+            &env,
+            crate::queue::ExpectedDest::File { size: 3, etag: None, modified: None },
+        );
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"theirs");
+
+        env.handle.resolve(id, ConflictPolicy::Overwrite);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_reviewed_new_file_parks_when_one_appeared_meanwhile() {
+        let env = reviewed_env("reviewed-absent");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"appeared").unwrap();
+        let id = reviewed_batch(&env, crate::queue::ExpectedDest::Absent);
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"appeared");
+    }
+
+    #[test]
+    fn a_retried_save_goes_through_the_check_again() {
+        let env = reviewed_env("reviewed-retry");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"old").unwrap();
+        let reviewed = crate::queue::ExpectedDest::File { size: 3, etag: None, modified: None };
+        // The save fails because its source is gone.
+        std::fs::rename(env.dir.join("src/new.txt"), env.dir.join("src/parked.txt")).unwrap();
+        let id = reviewed_batch(&env, reviewed);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.files_failed, 1);
+
+        // A later version lands on the server before the old save is retried.
+        std::fs::write(&dst, b"a newer save").unwrap();
+        std::fs::rename(env.dir.join("src/parked.txt"), env.dir.join("src/new.txt")).unwrap();
+        env.handle.retry_failed(id);
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"a newer save");
+    }
+
+    /// An engine with an FTP site (id 2) backed by the in-memory test server.
+    /// Local sources stream to it; `up/` is the upload folder.
+    fn ftp_env(name: &str, bandwidth: u64) -> (TestEnv, crate::ftp::test_server::FakeFtp) {
+        let env = test_env_with(name, |cfg| cfg.bandwidth_limit = bandwidth);
+        let server = crate::ftp::test_server::FakeFtp::start();
+        let options = format!("{{\"endpoint\":\"ftp://127.0.0.1:{}\"}}", server.port);
+        env.rt
+            .block_on(
+                sqlx::query("INSERT INTO sites (id, name, scheme, options) VALUES (2, 'FTP', 'ftp', ?)")
+                    .bind(options)
+                    .execute(&env.pool),
+            )
+            .unwrap();
+        (env, server)
+    }
+
+    fn ftp_upload(src: &Path) -> NewJob {
+        NewJob {
+            dst_site_id: 2,
+            ..job(browse(src), "up/".to_string(), ConflictPolicy::Overwrite)
+        }
+    }
+
+    #[test]
+    fn an_ftp_upload_replaces_the_old_file_through_a_partial() {
+        let (env, server) = ftp_env("ftp-replace", 0);
+        server.put("up/file.txt", b"old");
+        let src = env.dir.join("file.txt");
+        std::fs::write(&src, b"new content").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/file.txt").unwrap(), b"new content");
+        assert_eq!(server.names(), ["up/file.txt"]);
+    }
+
+    #[test]
+    fn an_empty_file_reaches_the_ftp_server() {
+        let (env, server) = ftp_env("ftp-empty", 0);
+        let src = env.dir.join("empty.txt");
+        std::fs::write(&src, b"").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/empty.txt").unwrap(), b"");
+        assert_eq!(server.names(), ["up/empty.txt"]);
+    }
+
+    #[test]
+    fn an_interrupted_ftp_upload_never_shows_under_the_final_name() {
+        let (env, server) = ftp_env("ftp-interrupted", 8 * 1024 * 1024);
+        server.put("up/big.bin", b"old");
+        let src = env.dir.join("big.bin");
+        let content: Vec<u8> = (0..40 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &content).unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        pause_once_past(&env, id, 0);
+        assert_eq!(server.read("up/big.bin").unwrap(), b"old");
+        let names = server.names();
+        let partial = names.iter().find(|name| name.ends_with(transfer::PARTIAL_SUFFIX)).unwrap();
+        assert!(server.read(partial).unwrap().len() < content.len());
+
+        env.handle.resume(id);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert!(server.read("up/big.bin").unwrap() == content, "the resumed upload differs");
+        assert_eq!(server.names(), ["up/big.bin"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_site_move_renames_instead_of_copying() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let env = test_env("same-site-move");
+        let src = env.dir.join("from/file.txt");
+        let dst_dir = env.dir.join("to");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        std::fs::write(&src, b"moved").unwrap();
+        let inode = std::fs::metadata(&src).unwrap().ino();
+
+        let id = env
+            .rt
+            .block_on(env.handle.submit(NewJob {
+                move_source: true,
+                ..job(browse(&src), format!("{}/", browse(&dst_dir)), ConflictPolicy::Ask)
+            }))
+            .unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert!(!src.exists());
+        assert_eq!(std::fs::metadata(dst_dir.join("file.txt")).unwrap().ino(), inode);
+    }
+
     #[test]
     fn a_site_limit_holds_across_jobs() {
         let (env, src_dir, dst_dir, _) = slow_env("site-limit");
@@ -2300,7 +2496,8 @@ mod tests {
 
     /// The deterministic partial file of task `id` writing `dst`.
     fn legacy_partial(dst: &Path, id: i64) -> PathBuf {
-        PathBuf::from(format!("/{}", transfer::partial_path(&browse(dst), id)))
+        let name = dst.file_name().unwrap().to_str().unwrap();
+        dst.with_file_name(format!(".{name}.{id}{}", transfer::PARTIAL_SUFFIX))
     }
 
     #[test]
