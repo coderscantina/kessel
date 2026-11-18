@@ -93,6 +93,8 @@ if ($signArgs) {
     if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
     & $signtool verify /pa $exe
     if ($LASTEXITCODE -ne 0) { throw 'signature verification failed' }
+} elseif ($env:KESSEL_REQUIRE_SIGNING) {
+    throw 'Release builds must be signed: set KESSEL_WIN_CERT or KESSEL_WIN_CERT_THUMBPRINT'
 } else {
     Write-Warning 'No signing certificate configured (KESSEL_WIN_CERT / KESSEL_WIN_CERT_THUMBPRINT) — SmartScreen will warn users on first run.'
 }
