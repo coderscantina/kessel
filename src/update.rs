@@ -309,8 +309,8 @@ mod install {
             (app.extension().is_some_and(|ext| ext == "app")).then_some(app)
         }
 
-        /// Mount the DMG, copy the new bundle over `target_app` with an
-        /// atomic-ish swap, and detach the mount.
+        /// Mount the DMG, swap the new bundle in for `target_app` atomically,
+        /// and detach the mount.
         fn install_in_place(dmg: &Path, target_app: &Path) -> Result<()> {
             let mount = attach_dmg(dmg)?;
             let result = swap_bundle(&mount, target_app);
@@ -350,17 +350,29 @@ mod install {
                 .status();
         }
 
+        /// Atomically trade the paths of two entries on one volume, so both
+        /// paths exist at every moment.
+        fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let (a, b) = (CString::new(a.as_os_str().as_bytes())?, CString::new(b.as_os_str().as_bytes())?);
+            // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+            match unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+
         /// Copy the `.app` out of the read-only mount to a staging path, then
-        /// swap it over the current bundle (old moved aside, new moved in, old
-        /// removed). On failure the previous bundle is restored.
+        /// exchange it with the current bundle and remove the old one from the
+        /// staging path. An interruption never leaves the install path empty.
         fn swap_bundle(mount: &Path, target_app: &Path) -> Result<()> {
             let new_app = find_app(mount)?;
             let parent = target_app.parent().context("app bundle has no parent")?;
             let pid = std::process::id();
             let staging = parent.join(format!(".kessel-new-{pid}.app"));
-            let backup = parent.join(format!(".kessel-old-{pid}.app"));
             let _ = std::fs::remove_dir_all(&staging);
-            let _ = std::fs::remove_dir_all(&backup);
 
             // ditto preserves bundle metadata/extended attributes and dereferences the
             // read-only DMG into a writable copy we own.
@@ -379,19 +391,10 @@ mod install {
                 bail!("the downloaded app's code signature is invalid");
             }
 
-            std::fs::rename(target_app, &backup).context("moving the current app aside")?;
-            match std::fs::rename(&staging, target_app) {
-                Ok(()) => {
-                    let _ = std::fs::remove_dir_all(&backup);
-                    Ok(())
-                }
-                Err(error) => {
-                    // Restore the previous bundle so the app stays launchable.
-                    let _ = std::fs::rename(&backup, target_app);
-                    let _ = std::fs::remove_dir_all(&staging);
-                    Err(anyhow::Error::new(error).context("installing the new app bundle"))
-                }
-            }
+            let exchanged = exchange(&staging, target_app);
+            // Holds the old bundle after the exchange, the new one without it.
+            let _ = std::fs::remove_dir_all(&staging);
+            exchanged.context("installing the new app bundle")
         }
 
         /// The first `.app` directory at the root of the mounted DMG.
@@ -403,6 +406,27 @@ mod install {
                 }
             }
             bail!("no .app bundle found in the mounted DMG");
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn exchange_trades_two_folders_in_place() {
+                let dir = std::env::temp_dir().join(format!("kessel-swap-test-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let (old, new) = (dir.join("Kessel.app"), dir.join(".kessel-new.app"));
+                std::fs::create_dir_all(&old).unwrap();
+                std::fs::create_dir_all(&new).unwrap();
+                std::fs::write(old.join("version"), b"old").unwrap();
+                std::fs::write(new.join("version"), b"new").unwrap();
+
+                super::exchange(&new, &old).unwrap();
+
+                assert_eq!(std::fs::read(old.join("version")).unwrap(), b"new");
+                assert_eq!(std::fs::read(new.join("version")).unwrap(), b"old");
+                assert!(super::exchange(&dir.join("missing"), &old).is_err());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 
