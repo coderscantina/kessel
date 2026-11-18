@@ -4736,12 +4736,6 @@ fn unreachable_volume_message(count: usize) -> String {
     )
 }
 
-/// Local directory → browse path on the reserved local site (root-relative,
-/// trailing `/` unless it *is* the root).
-pub(crate) fn local_dir_path(dir: &Path) -> String {
-    crate::localfs::dir_browse_path(dir)
-}
-
 /// `report.pdf` → `report copy.pdf`, then `report copy 2.pdf`, … — first
 /// name not already taken in the listing.
 fn duplicate_name(name: &str, entries: &[FsEntry]) -> String {

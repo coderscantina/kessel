@@ -35,7 +35,7 @@ use sqlx::SqlitePool;
 use crate::config::KesselConfig;
 use crate::db::{self, BookmarkFolder, OpenTabRow, Space};
 use crate::provider::{LayerConfig, SiteProfile};
-use crate::queue::{ConflictPolicy, JobState, NewJob, LOCAL_SITE_ID};
+use crate::queue::{ConflictPolicy, JobOutcome, JobState, NewJob, LOCAL_SITE_ID};
 use crate::i18n::{t, tf};
 use crate::ui::bookmarks::{BookmarkEvent, BookmarkManager};
 use crate::bookmarks::QUICK_CONNECT_SPACE;
@@ -3919,6 +3919,18 @@ impl KesselApp {
     }
 }
 
+/// A drag-out promise succeeded only if every file arrived: a folder job can
+/// settle as `Done` with some of its files failed.
+fn promise_result(outcome: &JobOutcome) -> anyhow::Result<()> {
+    if outcome.state == JobState::Done && outcome.files_failed == 0 {
+        return Ok(());
+    }
+    Err(match &outcome.error {
+        Some(error) => anyhow::anyhow!(error.clone()),
+        None => anyhow::anyhow!("transfer {}", outcome.state.as_str()),
+    })
+}
+
 /// Promote an in-flight internal row drag to a native OS drag session —
 /// gpui has no outbound drag support, so once the pointer leaves the window
 /// the gpui drag is stopped and the still-held gesture is handed to the
@@ -3945,17 +3957,20 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
         .collect();
 
     let site_id = drag.site_id;
+    let sites = state.sites.clone();
     let sources: Vec<String> = drag.entries.iter().map(|entry| entry.path.clone()).collect();
     let fulfill: crate::dragout::FulfillFn = Box::new(move |ix, dest| {
         use anyhow::Context as _;
         let src = sources.get(ix).context("unknown drag item")?.clone();
         let dir = dest.parent().context("promise destination has no parent")?;
         let name = dest.file_name().context("promise destination has no name")?;
+        let (dst_site_id, dst_dir) = crate::localfs::locate(&sites, dir, true)
+            .context("no local site covers the drop destination")?;
         let job = NewJob {
             src_site_id: site_id,
-            dst_site_id: LOCAL_SITE_ID,
+            dst_site_id,
             src,
-            dst_dir: crate::ui::file_pane::local_dir_path(dir),
+            dst_dir,
             dst_name: Some(name.to_string_lossy().to_string()),
             // The destination already chose the final (unique) name; never
             // park a promise on a conflict prompt.
@@ -3968,21 +3983,7 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
                 .enqueue_tracked(job)
                 .await
                 .map_err(|_| anyhow::anyhow!("transfer was rejected"))?;
-            match queue.wait_terminal(job_id).await {
-                JobState::Done => Ok(()),
-                state => {
-                    let detail = queue
-                        .latest()
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == job_id)
-                        .and_then(|job| job.error.clone());
-                    Err(match detail {
-                        Some(error) => anyhow::anyhow!(error),
-                        None => anyhow::anyhow!("transfer {}", state.as_str()),
-                    })
-                }
-            }
+            promise_result(&queue.settled(job_id).await?)
         })
     });
 
@@ -4390,5 +4391,24 @@ mod linked_browsing_tests {
         assert_eq!(linked_directory("a/b/", "a/", "www/"), Some("".into()));
         assert_eq!(linked_directory("a/b/", "", "www/"), None);
         assert_eq!(linked_directory("project/", "project/../private/", "www/"), None);
+    }
+}
+
+#[cfg(test)]
+mod drag_out_tests {
+    use super::*;
+
+    #[test]
+    fn a_promise_fails_when_any_file_failed() {
+        let outcome = |state, files_failed, error: Option<&str>| JobOutcome {
+            state,
+            error: error.map(str::to_string),
+            files_done: 3,
+            files_failed,
+        };
+        assert!(promise_result(&outcome(JobState::Done, 0, None)).is_ok());
+        let partial = promise_result(&outcome(JobState::Done, 2, Some("2 files failed"))).unwrap_err();
+        assert_eq!(partial.to_string(), "2 files failed");
+        assert!(promise_result(&outcome(JobState::Cancelled, 0, None)).is_err());
     }
 }
