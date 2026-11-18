@@ -393,8 +393,8 @@ impl Engine {
             Command::Submit(job, reply) => {
                 let _ = reply.send(self.enqueue(&job).await);
             }
-            Command::SubmitBatch(batch, reply) => {
-                let _ = reply.send(self.enqueue_batch(&batch).await);
+            Command::SubmitBatch(batch, expected, reply) => {
+                let _ = reply.send(self.enqueue_batch(&batch, &expected).await);
             }
             Command::Settled(id, reply) => match store::job_outcome(&self.pool, id).await? {
                 None => {
@@ -640,14 +640,18 @@ impl Engine {
     }
 
     /// Validate and persist a multi-file job, already expanded.
-    async fn enqueue_batch(&self, batch: &super::NewBatch) -> Result<i64> {
+    async fn enqueue_batch(
+        &self,
+        batch: &super::NewBatch,
+        expected: &HashMap<String, super::ExpectedDest>,
+    ) -> Result<i64> {
         anyhow::ensure!(!batch.files.is_empty(), "nothing to transfer");
         anyhow::ensure!(
             batch.src_site_id != batch.dst_site_id
                 || batch.files.iter().all(|file| file.src != file.dst),
             "source and destination are the same"
         );
-        store::enqueue_batch(&self.pool, batch).await
+        store::enqueue_batch(&self.pool, batch, expected).await
     }
 
     /// Answer everyone waiting for this job to settle.
@@ -1204,7 +1208,7 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
-    use crate::queue::{ConflictPolicy, JobState, NewJob, QueueHandle, QueueSnapshot};
+    use crate::queue::{BatchFile, ConflictPolicy, JobState, NewBatch, NewJob, QueueHandle, QueueSnapshot};
 
     fn job(src: String, dst_dir: String, policy: ConflictPolicy) -> NewJob {
         NewJob {
@@ -2164,6 +2168,97 @@ mod tests {
         };
         assert_eq!(reason("folder/cycle"), "Link to a folder, not copied");
         assert_eq!(reason("broken"), "Broken link, not copied");
+    }
+
+    /// One reviewed file `src/new.txt` → `dst/file.txt`, as a sync or an
+    /// edit save submits it.
+    fn reviewed_batch(env: &TestEnv, expected: crate::queue::ExpectedDest) -> i64 {
+        let dst = browse(&env.dir.join("dst/file.txt"));
+        let batch = NewBatch {
+            src_site_id: 0,
+            dst_site_id: 1,
+            src_label: "src".into(),
+            dst_label: "dst".into(),
+            files: vec![BatchFile {
+                src: browse(&env.dir.join("src/new.txt")),
+                dst: dst.clone(),
+                size: Some(3),
+            }],
+            conflict_policy: ConflictPolicy::Overwrite,
+            move_source: false,
+        };
+        env.rt
+            .block_on(env.handle.submit_reviewed_batch(batch, [(dst, expected)].into()))
+            .unwrap()
+    }
+
+    fn reviewed_env(name: &str) -> TestEnv {
+        let env = test_env(name);
+        env.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO sites (id, name, scheme, options) \
+                     VALUES (1, 'Local copy', 'fs', '{\"root\":\"/\"}')",
+                )
+                .execute(&env.pool),
+            )
+            .unwrap();
+        std::fs::create_dir_all(env.dir.join("src")).unwrap();
+        std::fs::create_dir_all(env.dir.join("dst")).unwrap();
+        std::fs::write(env.dir.join("src/new.txt"), b"new").unwrap();
+        env
+    }
+
+    fn wait_for_conflict(env: &TestEnv, id: i64) {
+        wait_until(&env.handle, |s| s.jobs.iter().any(|j| j.id == id && j.files_conflict == 1));
+    }
+
+    #[test]
+    fn a_reviewed_write_parks_when_the_destination_changed_and_the_decision_wins() {
+        let env = reviewed_env("reviewed-changed");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"theirs").unwrap();
+        let id = reviewed_batch(
+            &env,
+            crate::queue::ExpectedDest::File { size: 3, etag: None, modified: None },
+        );
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"theirs");
+
+        env.handle.resolve(id, ConflictPolicy::Overwrite);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_reviewed_new_file_parks_when_one_appeared_meanwhile() {
+        let env = reviewed_env("reviewed-absent");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"appeared").unwrap();
+        let id = reviewed_batch(&env, crate::queue::ExpectedDest::Absent);
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"appeared");
+    }
+
+    #[test]
+    fn a_retried_save_goes_through_the_check_again() {
+        let env = reviewed_env("reviewed-retry");
+        let dst = env.dir.join("dst/file.txt");
+        std::fs::write(&dst, b"old").unwrap();
+        let reviewed = crate::queue::ExpectedDest::File { size: 3, etag: None, modified: None };
+        // The save fails because its source is gone.
+        std::fs::rename(env.dir.join("src/new.txt"), env.dir.join("src/parked.txt")).unwrap();
+        let id = reviewed_batch(&env, reviewed);
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+        assert_eq!(outcome.files_failed, 1);
+
+        // A later version lands on the server before the old save is retried.
+        std::fs::write(&dst, b"a newer save").unwrap();
+        std::fs::rename(env.dir.join("src/parked.txt"), env.dir.join("src/new.txt")).unwrap();
+        env.handle.retry_failed(id);
+        wait_for_conflict(&env, id);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"a newer save");
     }
 
     #[test]

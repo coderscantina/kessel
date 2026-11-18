@@ -13,7 +13,9 @@
 //! the remote is stat'ed again. If someone else changed it, or the check
 //! itself fails, nothing is uploaded: a change raises a conflict the user
 //! decides on (see [`open_conflict_dialog`]), a failed check keeps the local
-//! copy and offers a retry.
+//! copy and offers a retry. The queue job carries the accepted state too, so
+//! its worker refuses to overwrite anything else, also when an old save is
+//! retried from the transfers panel much later.
 //!
 //! Sessions live until the app quits, because an editor may keep the file
 //! open indefinitely and a watcher per edited file is cheap. Quitting removes
@@ -35,7 +37,9 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::i18n::{t, tf};
 use crate::provider::Provider;
-use crate::queue::{ConflictPolicy, JobState, NewJob, QueueHandle, LOCAL_SITE_ID};
+use crate::queue::{
+    BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState, NewBatch, QueueHandle, LOCAL_SITE_ID,
+};
 
 /// Quiet period after a burst of editor writes before uploading.
 const DEBOUNCE: Duration = Duration::from_millis(750);
@@ -59,6 +63,21 @@ struct RemoteState {
     etag: Option<String>,
     modified: Option<String>,
     size: u64,
+}
+
+impl RemoteState {
+    /// What the queue must still find on the server when it writes this save.
+    fn expected(&self) -> ExpectedDest {
+        ExpectedDest::File {
+            size: self.size,
+            etag: self.etag.clone(),
+            modified: self
+                .modified
+                .as_deref()
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|t| t.with_timezone(&chrono::Utc)),
+        }
+    }
 }
 
 /// Identifies one version of the local file: a save changes the length or
@@ -236,7 +255,8 @@ struct Session {
 
 /// What to do with a save after checking the server copy.
 enum Preflight {
-    Upload,
+    /// Go ahead, replacing exactly this server state.
+    Upload(RemoteState),
     Discard(RemoteState),
     Stop,
 }
@@ -352,17 +372,19 @@ impl Session {
             // The last step before the queue takes over, so the server has
             // as little time as possible to change unnoticed.
             let preflight = self.preflight(sync.remote.as_ref()).await;
-            if !matches!(preflight, Ok(Preflight::Upload)) {
+            if !matches!(preflight, Ok(Preflight::Upload(_))) {
                 remove_snapshot(&snapshot).await;
             }
-            match preflight {
-                Ok(Preflight::Upload) => {}
+            let accepted = match preflight {
+                Ok(Preflight::Upload(accepted)) => accepted,
                 Ok(Preflight::Discard(current)) => return self.discard(&mut sync, current).await,
                 Ok(Preflight::Stop) => return,
                 Err(error) => return self.failed(&error),
-            }
-            match self.upload(&snapshot, local).await {
-                Ok((remote, local)) => {
+            };
+            match self.upload(&snapshot, local, &accepted).await {
+                // The server changed after the preflight: the next pass asks.
+                Ok(None) => remove_snapshot(&snapshot).await,
+                Ok(Some((remote, local))) => {
                     remove_snapshot(&snapshot).await;
                     *sync = SyncPoint { remote, local };
                     self.notify(EditNotice::Saved(
@@ -402,7 +424,7 @@ impl Session {
         loop {
             let current = stat_remote(&self.provider, &self.remote_path).await?;
             if accepted.as_ref() == Some(&current) {
-                return Ok(Preflight::Upload);
+                return Ok(Preflight::Upload(current));
             }
             match self.decide(&current).await {
                 EditDecision::Overwrite => accepted = Some(current),
@@ -416,30 +438,74 @@ impl Session {
     /// new sync point. `local` was read before the snapshot, so a save racing
     /// the copy only makes the snapshot newer than recorded, and the next
     /// pass uploads once more. A failed job keeps its snapshot for a retry
-    /// from the transfers panel.
-    async fn upload(&self, snapshot: &Path, local: LocalVersion) -> Result<(Option<RemoteState>, LocalVersion)> {
+    /// from the transfers panel. `None` when the queue found the server no
+    /// longer at `accepted`: the job is cancelled and nothing was written.
+    async fn upload(
+        &self,
+        snapshot: &Path,
+        local: LocalVersion,
+        accepted: &RemoteState,
+    ) -> Result<Option<(Option<RemoteState>, LocalVersion)>> {
         tracing::info!(file = %self.name, "external edit saved; uploading");
+        let src = crate::localfs::browse_path(snapshot, false);
+        let size = tokio::fs::metadata(snapshot).await.ok().map(|meta| meta.len());
         let job_id = self
             .queue
-            .submit(NewJob {
-                src_site_id: LOCAL_SITE_ID,
-                dst_site_id: self.provider.site_id,
-                src: crate::localfs::browse_path(snapshot, false),
-                dst_dir: parent_of(&self.remote_path),
-                dst_name: Some(self.name.clone()),
-                conflict_policy: ConflictPolicy::Overwrite,
-                move_source: false,
-            })
+            .submit_reviewed_batch(
+                NewBatch {
+                    src_site_id: LOCAL_SITE_ID,
+                    dst_site_id: self.provider.site_id,
+                    src_label: src.clone(),
+                    dst_label: parent_of(&self.remote_path),
+                    files: vec![BatchFile {
+                        src,
+                        dst: self.remote_path.clone(),
+                        size,
+                    }],
+                    conflict_policy: ConflictPolicy::Overwrite,
+                    move_source: false,
+                },
+                HashMap::from([(self.remote_path.clone(), accepted.expected())]),
+            )
             .await?;
-        let outcome = self.queue.settled(job_id).await?;
-        if outcome.state != JobState::Done || outcome.files_failed > 0 {
+        let Some(outcome) = self.settled_unless_parked(job_id).await? else {
+            return Ok(None);
+        };
+        if outcome.state != JobState::Done || outcome.files_failed > 0 || outcome.files_done == 0 {
             anyhow::bail!(outcome
                 .error
                 .unwrap_or_else(|| "the upload was cancelled".to_string()));
         }
         // Unknown on a failed stat: the next save asks instead of guessing.
         let remote = stat_remote(&self.provider, &self.remote_path).await.ok();
-        Ok((remote, local))
+        Ok(Some((remote, local)))
+    }
+
+    /// Wait for the upload job to settle. A job parked on a conflict is
+    /// cancelled and reported as `None`, because this session asks the user
+    /// itself instead of leaving the decision to the transfers panel.
+    async fn settled_unless_parked(&self, job_id: i64) -> Result<Option<JobOutcome>> {
+        let mut snapshots = self.queue.subscribe();
+        let parked = async {
+            loop {
+                let conflict = snapshots
+                    .borrow_and_update()
+                    .jobs
+                    .iter()
+                    .any(|job| job.id == job_id && job.files_conflict > 0);
+                if conflict || snapshots.changed().await.is_err() {
+                    return conflict;
+                }
+            }
+        };
+        tokio::select! {
+            outcome = self.queue.settled(job_id) => outcome.map(Some),
+            true = parked => {
+                self.queue.cancel(job_id);
+                self.queue.settled(job_id).await?;
+                Ok(None)
+            }
+        }
     }
 
     /// Raise the conflict to the UI and wait for the decision.
@@ -674,6 +740,28 @@ mod tests {
         assert!(!remote_file.exists());
         assert_eq!(std::fs::read(&session.temp).unwrap(), b"v3 local, longer");
         assert!(matches!(notices.try_recv(), Ok(EditNotice::Failed(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_upload_against_an_outdated_server_state_writes_nothing() {
+        let (rt, dir, provider, queue) = fixture("stale");
+        let remote_file = dir.join("notes.txt");
+        let remote_path = remote_file.to_str().unwrap().trim_start_matches('/').to_string();
+        let session = rt
+            .block_on(Session::open(provider, remote_path, "notes.txt".into(), queue))
+            .unwrap();
+        std::fs::write(&session.temp, b"v2 local").unwrap();
+        let local = rt.block_on(LocalVersion::of(&session.temp)).unwrap();
+        let snapshot = rt.block_on(session.snapshot()).unwrap();
+        let accepted = rt.block_on(session.sync.lock()).remote.clone().unwrap();
+
+        // The server moves on after the preflight accepted its old state.
+        std::fs::write(&remote_file, b"v2 from someone else").unwrap();
+        let uploaded = rt.block_on(session.upload(&snapshot, local, &accepted)).unwrap();
+
+        assert!(uploaded.is_none());
+        assert_eq!(std::fs::read(&remote_file).unwrap(), b"v2 from someone else");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

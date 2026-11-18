@@ -240,6 +240,10 @@ async fn run_inner(
         .map(|t| t.to_rfc3339());
     let can_append = resumes_by_append(&dst.caps);
 
+    if let Some(outcome) = reviewed_state_changed(task, &dst_op, &dst_path).await? {
+        return Ok(outcome);
+    }
+
     // Bytes of an earlier run only count while they provably are this
     // source's start; otherwise the file restarts from zero.
     let mut offset = 0;
@@ -345,8 +349,7 @@ async fn run_inner(
     live.persisted = offset;
 
     if offset == size && size > 0 {
-        finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
-        return Ok(Outcome::Done { bytes: size });
+        return finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await;
     }
 
     // Same-site fast path: let the backend copy server-side (S3 CopyObject
@@ -354,8 +357,7 @@ async fn run_inner(
     if opts.same_site && dst.caps.copy && offset == 0 {
         match dst.copy(&task.src, dest.write_browse()).await {
             Ok(()) => {
-                finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
-                return Ok(Outcome::Done { bytes: size });
+                return finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -433,8 +435,7 @@ async fn run_inner(
                 .with_context(|| format!("finalize `{}`", task.dst))?;
             // An open writer holds a slot of the site's connection limit.
             drop(writer);
-            finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
-            Ok(Outcome::Done { bytes: size })
+            finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await
         }
         Ok(Some(Outcome::Cancelled)) => {
             // Discard: no half-written object or partial file left behind.
@@ -468,7 +469,8 @@ async fn run_inner(
 
 /// Post-transfer duties on a fully written destination: verification,
 /// committing the partial onto the real name, timestamp preservation, and
-/// the source deletion move semantics require.
+/// the source deletion move semantics require. A destination that changed
+/// since its review parks the task instead, keeping the partial.
 #[allow(clippy::too_many_arguments)]
 async fn finish_transfer(
     pool: &SqlitePool,
@@ -480,7 +482,7 @@ async fn finish_transfer(
     src_meta: &opendal::Metadata,
     task: &ClaimedTask,
     opts: &TransferOpts,
-) -> Result<()> {
+) -> Result<Outcome> {
     let size = src_meta.content_length();
 
     if opts.verify {
@@ -505,6 +507,11 @@ async fn finish_transfer(
     }
 
     if let Some((partial, _)) = &dest.partial {
+        // The commit is what replaces the old file, so the review is checked
+        // once more right before it.
+        if let Some(outcome) = reviewed_state_changed(task, &dest.op, &dest.path).await? {
+            return Ok(outcome);
+        }
         commit_partial(&dest.op, partial, &dest.path).await?;
         store::set_task_partial(pool, task.id, None).await?;
     }
@@ -535,7 +542,32 @@ async fn finish_transfer(
             .with_context(|| format!("deleting moved source `{}`", task.src))?;
     }
 
-    Ok(())
+    Ok(Outcome::Done { bytes: size })
+}
+
+/// The conflict to park the task with when its destination no longer is what
+/// the job was reviewed against. Must not run while a writer on `op` is open:
+/// the writer can hold the site's only connection slot.
+async fn reviewed_state_changed(task: &ClaimedTask, op: &Operator, path: &str) -> Result<Option<Outcome>> {
+    let Some(expected) = &task.expected else {
+        return Ok(None);
+    };
+    let current = match op.stat(path).await {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("checking destination before writing"),
+    };
+    if expected.matches(current.as_ref()) {
+        return Ok(None);
+    }
+    Ok(Some(match &current {
+        Some(meta) => conflict(task, meta),
+        None => Outcome::Conflict {
+            policy: task.conflict_policy,
+            dst_size: 0,
+            dst_modified: None,
+        },
+    }))
 }
 
 /// Move a finished partial onto the real name. Some servers (SFTP v3) refuse
@@ -773,6 +805,7 @@ mod tests {
             move_source: false,
             partial: None,
             in_place: false,
+            expected: None,
         }
     }
 
