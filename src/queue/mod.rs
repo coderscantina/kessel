@@ -14,7 +14,7 @@ pub(crate) mod store;
 mod transfer;
 
 pub use engine::start;
-pub(crate) use transfer::PARTIAL_SUFFIX;
+pub(crate) use transfer::{normalize_etag, PARTIAL_SUFFIX};
 
 use std::collections::HashMap;
 

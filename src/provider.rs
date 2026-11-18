@@ -119,6 +119,8 @@ pub struct RemoteEntry {
     pub is_bucket: bool,
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    /// The backend's version tag for this file, where it reports one.
+    pub etag: Option<String>,
     /// Unix permission bits (`mode & 0o7777`): filled inline for local fs,
     /// via [`Provider::sftp_permissions`] for sftp.
     pub permissions: Option<u32>,
@@ -698,6 +700,7 @@ impl Provider {
                             is_bucket: true,
                             size: 0,
                             modified: bucket.created,
+                            etag: None,
                             permissions: None,
                             storage_class: None,
                         })
@@ -822,6 +825,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
             is_bucket: false,
             size: meta.content_length(),
             modified: meta.last_modified().and_then(to_datetime),
+            etag: meta.etag().map(str::to_string),
             permissions,
             storage_class: None,
         });
@@ -840,6 +844,7 @@ async fn list_operator(op: &Operator, path: &str, prefix: &str) -> Result<Vec<Re
         let entry = &mut entries[ix];
         entry.size = meta.content_length();
         entry.modified = meta.last_modified().and_then(to_datetime);
+        entry.etag = meta.etag().map(str::to_string);
         if entry.is_symlink && meta.is_dir() {
             entry.is_dir = true;
             if !entry.path.ends_with('/') {

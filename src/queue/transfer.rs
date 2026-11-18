@@ -735,7 +735,7 @@ fn checksums_comparable(src_scheme: &str, dst_scheme: &str, src: &str, dst: &str
     src_scheme == dst_scheme && MD5_ETAG_SCHEMES.contains(&src_scheme) && is_md5(src) && is_md5(dst)
 }
 
-fn normalize_etag(etag: &str) -> String {
+pub(crate) fn normalize_etag(etag: &str) -> String {
     etag.trim_start_matches("W/").trim_matches('"').to_ascii_lowercase()
 }
 
