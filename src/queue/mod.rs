@@ -73,8 +73,9 @@ pub enum ConflictPolicy {
     /// Replace only a newer source; missing timestamps leave a conflict.
     OverwriteNewer,
     Skip,
-    /// Append the missing tail where the backend supports it; skip files the
-    /// destination already holds completely; overwrite where neither fits.
+    /// Append the missing tail when the destination provably is the start of
+    /// the source and the backend can append; skip files the destination
+    /// already holds completely; otherwise ask, and never overwrite.
     Resume,
     /// Write under a unique name ("file (1).txt").
     Rename,
@@ -180,6 +181,8 @@ pub struct JobSnapshot {
     pub priority: i64,
     /// Sources are deleted after successful transfer (move semantics).
     pub move_source: bool,
+    /// Files found so far while the source tree is being listed.
+    pub discovering: Option<u64>,
 }
 
 /// One per-file task, for the transfers panel's drill-down view.

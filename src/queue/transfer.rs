@@ -6,14 +6,15 @@
 //! after the copy finished and verified. The old file stays intact until
 //! then. The task records the partial it owns, so cancel and removal can
 //! delete it later. Object stores write the destination directly: their
-//! uploads only become visible on a successful close.
+//! uploads only become visible on a successful close, so an interrupted
+//! upload is always aborted and restarts from zero.
 //!
 //! Resume model: the byte offset is checkpointed to SQLite every 500ms.
 //! When the destination can append, a partial resumes where it stopped: the
 //! partial's own length is the truth, provided the source provably didn't
 //! change (same size, and matching ETag and/or mtime). Without that proof,
-//! or without append support, the file restarts from zero; partial
-//! multipart uploads are aborted rather than committed.
+//! or without append support, the file restarts from zero, and a restart
+//! goes through the conflict check like a fresh transfer.
 //!
 //! Transient failures (dropped connections, 5xx, timeouts) are retried
 //! inside each read/write by the site's OpenDAL RetryLayer; an error that
@@ -40,6 +41,9 @@ pub(crate) const CHUNK: u64 = 8 * 1024 * 1024;
 const PERSIST_EVERY: Duration = Duration::from_millis(500);
 /// Suffix of task-owned partial files; expansion never picks them up.
 pub(crate) const PARTIAL_SUFFIX: &str = ".kessel-part";
+/// How much of an existing destination's end is compared with the source
+/// before appending to a file kessel did not write.
+const TAIL_SAMPLE: u64 = 64 * 1024;
 
 /// Shared per-job state between the engine and its workers: pause/cancel
 /// flags (polled between chunks, so a pause lands within one chunk of I/O)
@@ -54,6 +58,10 @@ pub(crate) struct JobControl {
     /// Bytes running workers wrote beyond their last persisted checkpoint.
     /// Added to the persisted counters for live progress.
     pub unpersisted: AtomicU64,
+    /// The source tree is being listed.
+    pub listing: AtomicBool,
+    /// Files the running listing found so far.
+    pub discovered: AtomicU64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -146,6 +154,14 @@ pub(crate) fn stages(caps: &Capabilities) -> bool {
     caps.rename && !caps.virtual_dirs
 }
 
+/// Whether an interrupted write can continue by appending. Object stores
+/// report append support, but S3 honours it only on directory buckets and
+/// Azure only on append blobs, and closing their writer publishes the
+/// truncated object.
+fn resumes_by_append(caps: &Capabilities) -> bool {
+    caps.write_can_append && !caps.virtual_dirs
+}
+
 /// The partial file next to `path` (an operator or browse path) that task
 /// `task_id` writes before committing.
 pub(crate) fn partial_path(path: &str, task_id: i64) -> String {
@@ -222,14 +238,31 @@ async fn run_inner(
         .last_modified()
         .and_then(crate::provider::to_datetime)
         .map(|t| t.to_rfc3339());
-    let can_append = dst.caps.write_can_append;
+    let can_append = resumes_by_append(&dst.caps);
 
-    // Conflict check: only for a fresh transfer (byte_offset > 0 means the
-    // partial destination is our own earlier work, handled by resume below).
-    let mut resume_from_dst = None;
-    if task.byte_offset == 0 {
+    // Bytes of an earlier run only count while they provably are this
+    // source's start; otherwise the file restarts from zero.
+    let mut offset = 0;
+    if task.byte_offset > 0 {
+        let written = if task.in_place || !stages(&dst.caps) {
+            dst_path.clone()
+        } else {
+            partial_path(&dst_path, task.id)
+        };
+        if can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref()) {
+            offset = resume_offset(&dst_op, &written, size).await;
+        }
+    }
+
+    // Conflict check: for every start from zero. A resume continues our own
+    // earlier work, which already passed it.
+    let mut append_to_existing = false;
+    if offset == 0 {
         store::update_task_meta(pool, task.id, size, etag.as_deref(), 0, modified.as_deref())
             .await?;
+        if task.in_place {
+            store::set_task_in_place(pool, task.id, false).await?;
+        }
         let destination = match dst_op.stat(&dst_path).await {
             Ok(meta) => Some(meta),
             Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
@@ -244,37 +277,20 @@ async fn run_inner(
                     match (meta.last_modified(), dst_meta.last_modified()) {
                         (Some(source), Some(destination)) if source > destination => {}
                         (Some(_), Some(_)) => return Ok(Outcome::Skipped),
-                        _ => {
-                            return Ok(Outcome::Conflict {
-                                policy: task.conflict_policy,
-                                dst_size: dst_len,
-                                dst_modified: dst_meta
-                                    .last_modified()
-                                    .and_then(crate::provider::to_datetime)
-                                    .map(|t| t.to_rfc3339()),
-                            })
-                        }
+                        _ => return Ok(conflict(task, &dst_meta)),
                     }
                 }
-                ConflictPolicy::Ask => {
-                    return Ok(Outcome::Conflict {
-                        policy: task.conflict_policy,
-                        dst_size: dst_len,
-                        dst_modified: dst_meta
-                            .last_modified()
-                            .and_then(crate::provider::to_datetime)
-                            .map(|t| t.to_rfc3339()),
-                    });
-                }
+                ConflictPolicy::Ask => return Ok(conflict(task, &dst_meta)),
                 ConflictPolicy::Skip => return Ok(Outcome::Skipped),
                 ConflictPolicy::Resume => {
                     if dst_len >= size {
                         return Ok(Outcome::Skipped);
                     }
-                    if can_append {
-                        resume_from_dst = Some(dst_len);
+                    if !can_append || !tail_matches(&src_op, &src_path, &dst_op, &dst_path, dst_len).await? {
+                        return Ok(conflict(task, &dst_meta));
                     }
-                    // No append support: fall through and overwrite.
+                    append_to_existing = true;
+                    offset = dst_len;
                 }
                 ConflictPolicy::Rename => {
                     let new_name = unique_name(pool, task.id, &dst_op, &dst_path, &dst_browse).await?;
@@ -286,15 +302,15 @@ async fn run_inner(
                 }
             }
         }
-        if resume_from_dst.is_some() != task.in_place {
-            store::set_task_in_place(pool, task.id, resume_from_dst.is_some()).await?;
+        if append_to_existing {
+            store::set_task_in_place(pool, task.id, true).await?;
         }
     }
 
     // Appending onto an existing destination (policy `Resume`) is the one
     // case that deliberately writes the real file in place, also when a
     // later run of the task picks up its resume offset.
-    let in_place = resume_from_dst.is_some() || (task.byte_offset > 0 && task.in_place);
+    let in_place = append_to_existing || (offset > 0 && task.in_place);
     let partial = (stages(&dst.caps) && !in_place).then(|| {
         (
             partial_path(&dst_path, task.id),
@@ -316,10 +332,6 @@ async fn run_inner(
         }
     }
 
-    let offset = match resume_from_dst {
-        Some(offset) => offset,
-        None => resume_offset(&dest, task, size, etag.as_deref(), modified.as_deref(), can_append).await,
-    };
     store::update_task_meta(
         pool,
         task.id,
@@ -381,7 +393,6 @@ async fn run_inner(
         }
     };
 
-    let mut offset = offset;
     let mut last_persist = Instant::now();
     let copy_result: Result<Option<Outcome>> = async {
         while offset < size {
@@ -420,12 +431,15 @@ async fn run_inner(
                 .close()
                 .await
                 .with_context(|| format!("finalize `{}`", task.dst))?;
+            // An open writer holds a slot of the site's connection limit.
+            drop(writer);
             finish_transfer(pool, src, &src_op, &src_path, dst, &dest, &meta, task, opts).await?;
             Ok(Outcome::Done { bytes: size })
         }
         Ok(Some(Outcome::Cancelled)) => {
             // Discard: no half-written object or partial file left behind.
             let _ = writer.abort().await;
+            drop(writer);
             if let Some((partial, _)) = &dest.partial {
                 // A partial that can't be deleted now stays recorded, so
                 // the job's cleanup tries again.
@@ -646,20 +660,49 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// A resume offset only counts if the source provably is the one the
-/// partial came from and the destination actually holds that many bytes.
-async fn resume_offset(
-    dest: &Dest,
-    task: &ClaimedTask,
-    size: u64,
-    etag: Option<&str>,
-    modified: Option<&str>,
-    can_append: bool,
-) -> u64 {
-    if task.byte_offset == 0 || !can_append || !source_unchanged(task, size, etag, modified) {
-        return 0;
+/// The task's outcome when the destination needs the user's decision, with
+/// what it holds now.
+fn conflict(task: &ClaimedTask, dst_meta: &opendal::Metadata) -> Outcome {
+    Outcome::Conflict {
+        policy: task.conflict_policy,
+        dst_size: dst_meta.content_length(),
+        dst_modified: dst_meta
+            .last_modified()
+            .and_then(crate::provider::to_datetime)
+            .map(|t| t.to_rfc3339()),
     }
-    match dest.op.stat(dest.write_path()).await {
+}
+
+/// Whether the end of a `len` bytes long destination equals the same byte
+/// range of the source, the check before appending to a foreign file.
+async fn tail_matches(
+    src_op: &Operator,
+    src_path: &str,
+    dst_op: &Operator,
+    dst_path: &str,
+    len: u64,
+) -> Result<bool> {
+    if len == 0 {
+        return Ok(true);
+    }
+    let range = len.saturating_sub(TAIL_SAMPLE)..len;
+    let source = src_op
+        .read_with(src_path)
+        .range(range.clone())
+        .await
+        .context("reading the source to compare with the destination")?;
+    let destination = dst_op
+        .read_with(dst_path)
+        .range(range)
+        .await
+        .context("reading the end of the destination")?;
+    Ok(source.to_bytes() == destination.to_bytes())
+}
+
+/// What the file holds of a resumable write: its length, or nothing when it
+/// is missing or longer than the source.
+async fn resume_offset(op: &Operator, written: &str, size: u64) -> u64 {
+    match op.stat(written).await {
         Ok(meta) if meta.content_length() <= size => meta.content_length(),
         _ => 0,
     }
@@ -794,6 +837,20 @@ mod tests {
         assert!(store::task_failed(&pool, b, "denied", false, 0).await.unwrap());
         assert_eq!(name(c).await.unwrap(), "file (3).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn object_stores_never_resume_by_append() {
+        let caps = |write_can_append, virtual_dirs| Capabilities {
+            rename: false,
+            copy: false,
+            presign: false,
+            write_can_append,
+            virtual_dirs,
+        };
+        assert!(resumes_by_append(&caps(true, false)));
+        assert!(!resumes_by_append(&caps(true, true)));
+        assert!(!resumes_by_append(&caps(false, false)));
     }
 
     #[test]
