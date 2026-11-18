@@ -163,6 +163,8 @@ pub(crate) mod test_server {
         dirs: BTreeSet<String>,
         /// `(folder, name)` pairs `LIST` reports without any file behind them.
         listed: Vec<(String, String)>,
+        /// `RNTO` renames, then drops the connection instead of answering.
+        lose_rename_replies: bool,
     }
 
     #[derive(Clone)]
@@ -193,6 +195,10 @@ pub(crate) mod test_server {
         /// Make `LIST` of `dir` report `name` verbatim, as a hostile server would.
         pub fn list_raw(&self, dir: &str, name: &str) {
             self.tree.lock().unwrap().listed.push((dir.to_string(), name.to_string()));
+        }
+
+        pub fn lose_rename_replies(&self) {
+            self.tree.lock().unwrap().lose_rename_replies = true;
         }
 
         pub fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -254,6 +260,9 @@ pub(crate) mod test_server {
                         let mut tree = self.tree.lock().unwrap();
                         let content = tree.files.remove(&rename_from)?;
                         tree.files.insert(path, content);
+                        if tree.lose_rename_replies {
+                            return None;
+                        }
                         "250 renamed".to_string()
                     }
                     "LIST" | "STOR" | "APPE" | "RETR" => {

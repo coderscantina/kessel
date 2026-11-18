@@ -350,13 +350,25 @@ async fn run_inner(
     }
 
     // A same-site move is one rename on the server when the backend has it.
-    // Anything it can't do (another volume, say) still works by copying.
+    // Anything it can't do (another volume, say) still works by copying, as
+    // long as the source is there to copy. Without it the rename may have
+    // happened with its answer lost, which only the user can judge.
     if opts.same_site && task.move_source && dst.caps.rename && offset == 0 && !append_to_existing {
-        store::set_task_dst_committed(pool, task.id, true).await?;
         match move_into_place(dst, &dst_op, &src_path, &dst_path).await {
-            Ok(()) => return Ok(Outcome::Done { bytes: size }),
+            Ok(()) => {
+                store::set_task_dst_committed(pool, task.id, true).await?;
+                return Ok(Outcome::Done { bytes: size });
+            }
             Err(error) => {
-                store::set_task_dst_committed(pool, task.id, false).await?;
+                let source_exists = src_op
+                    .exists(&src_path)
+                    .await
+                    .with_context(|| format!("checking moved source `{}`", task.src))?;
+                if !source_exists {
+                    return Err(error).with_context(|| {
+                        format!("moving `{}` was not confirmed and the source is gone", task.src)
+                    });
+                }
                 tracing::warn!(
                     src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
                     "server-side move failed; falling back to copying"
@@ -957,6 +969,45 @@ mod tests {
         let (unrelated, _) = run_task(&pool, &provider, &provider, &moved(6, false), &control, opts).await;
         assert!(matches!(unrelated, Outcome::Failed(_)), "{unrelated:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_move_whose_rename_answer_got_lost_fails_visibly() {
+        let server = crate::ftp::test_server::FakeFtp::start();
+        server.put("a", b"moved!");
+        server.lose_rename_replies();
+        let site = crate::provider::SiteProfile {
+            scheme: "ftp".into(),
+            options: [("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&site, &Default::default()).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let opts = TransferOpts {
+            same_site: true,
+            verify: false,
+            preserve_timestamps: false,
+            limiters: Vec::new(),
+        };
+        let moved = ClaimedTask {
+            byte_offset: 0,
+            total_bytes: Some(6),
+            move_source: true,
+            ..task(None, None)
+        };
+
+        let control = JobControl::default();
+        let (first, _) = run_task(&pool, &provider, &provider, &moved, &control, opts.clone()).await;
+        assert!(matches!(first, Outcome::Failed(_)), "{first:?}");
+        assert_eq!(server.names(), ["b"]);
+        // The retry finds no source and no recorded commit: still no success.
+        let (retry, _) = run_task(&pool, &provider, &provider, &moved, &control, opts).await;
+        assert!(matches!(retry, Outcome::Failed(_)), "{retry:?}");
     }
 
     #[tokio::test]
