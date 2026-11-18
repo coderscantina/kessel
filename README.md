@@ -32,22 +32,34 @@ flag on.
   columns (size, modified, unix permissions, S3 storage class, bucket region)
 - Finder-grade selection: click, cmd-click, shift-click ranges, rubber-band,
   full keyboard navigation
-- Per-pane folder tree, quick look, in-app search, hidden-file toggle
+- Per-pane folder tree, quick look, hidden-file toggle
+- Filter the current folder as you type, or search every subfolder by name
+  (`cmd-shift-f`): results stream in, can be stopped, and work like any other
+  rows. A search stops at 5,000 matches
+- A lost connection keeps the last loaded rows on screen, marked as out of
+  date, with **Reconnect** to rebuild the connection and renew credentials
+- Remote programs and scripts never launch on a double-click: kessel names the
+  file and offers to download it instead
 - Account-root S3 browsing: save a site without a bucket and the root lists
   every bucket in the account
 
 ### Transfers
 
 - **Persistent queue** — every job and per-file task lives in SQLite with its
-  state and byte offset, so the queue survives a crash or quit and resumes
-  mid-transfer on relaunch
+  state and byte offset, so the queue survives a crash or quit and picks up
+  again on relaunch. A file continues from its last byte when the destination
+  can append and the source is provably unchanged. Otherwise, and always on
+  object stores like S3, that file restarts from zero
 - Upload, download and site-to-site copy are the same code path: a layered
   source Operator streamed into a layered destination Operator
 - Resolve conflicts per file or for the entire transfer: overwrite, overwrite
   if newer, skip, resume a known partial copy, or keep both with a unique name
 - Priorities, pause/resume (per job and global), retries, post-transfer
   verification, timestamp preservation, transfer history
-- Global and per-site bandwidth throttling and concurrency caps
+- Global bandwidth and parallel-transfer limits, adjustable while running.
+  The `layers` section of `config.json5` sets the per-connection throttle and
+  concurrency cap for all sites. Per-site overrides are honored when stored on
+  a site, but the site editor has no fields for them yet
 
 ### Synchronization
 
@@ -116,8 +128,11 @@ wrapped in a composable, per-site layer stack:
 
 ### Accessibility & localization
 
-- Fully keyboard-operable: every command is reachable via configurable
-  shortcuts, the command bar, or the native menu bar
+- Keyboard-first: navigation, selection, search, upload, download, rename,
+  delete, pane copy and move, and the transfer queue (`cmd-shift-j`) all work
+  from configurable shortcuts and the command bar. A few per-file actions are
+  in the context menu only: Download As, Duplicate, Calculate Folder Size,
+  permissions, S3 storage class and ACL, and presigned URLs
 - Localized UI (English and German built in); add a locale by dropping a
   `<locale>.json5` string table into `<data_dir>/i18n/` — see
   [CONTRIBUTING.md](CONTRIBUTING.md)
