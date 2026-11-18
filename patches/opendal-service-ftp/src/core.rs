@@ -31,6 +31,18 @@ use suppaftp::types::FileType;
 use opendal_core::raw::*;
 use opendal_core::*;
 
+/// Refuse a path with a line break: suppaftp writes arguments into the
+/// control connection verbatim, so the rest would run as another FTP command.
+pub(super) fn check_path(path: &str) -> Result<()> {
+    if path.contains(['\r', '\n']) {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "ftp paths can't contain line breaks",
+        ));
+    }
+    Ok(())
+}
+
 pub struct FtpCore {
     info: ServiceInfo,
     capability: Capability,

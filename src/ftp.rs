@@ -14,6 +14,15 @@ use suppaftp::async_std::{AsyncRustlsConnector, AsyncRustlsFtpStream, ImplAsyncF
 use suppaftp::types::FileType;
 use suppaftp::{FtpError, Status};
 
+/// Refuse a path with a line break: suppaftp writes arguments into the
+/// control connection verbatim, so the rest would run as another FTP command.
+fn check_path(path: &str) -> Result<()> {
+    if path.contains(['\r', '\n']) {
+        return Err(Error::new(ErrorKind::Unsupported, "ftp paths can't contain line breaks"));
+    }
+    Ok(())
+}
+
 /// Rename `from` to `to`, operator-relative paths below the site root. Most
 /// servers replace an existing `to`; the rest answer with an error.
 pub async fn rename(
@@ -23,6 +32,8 @@ pub async fn rename(
     timeout: Duration,
 ) -> Result<()> {
     let (from, to) = (from.trim_end_matches('/'), to.trim_end_matches('/'));
+    check_path(from)?;
+    check_path(to)?;
     bounded(timeout, async {
         let mut ftp = connect(options).await?;
         ftp.rename(from, to).await.map_err(into_opendal)?;
@@ -34,6 +45,7 @@ pub async fn rename(
 
 /// Create (or truncate) `path` as an empty file. Its folder must exist.
 pub async fn create_empty(options: &HashMap<String, String>, path: &str, timeout: Duration) -> Result<()> {
+    check_path(path)?;
     bounded(timeout, async {
         let mut ftp = connect(options).await?;
         ftp.put_file(path, &mut futures::io::empty())
@@ -77,6 +89,7 @@ fn parse_endpoint(endpoint: &str) -> Result<Endpoint> {
 
 async fn connect(options: &HashMap<String, String>) -> Result<AsyncRustlsFtpStream> {
     let option = |key: &str| options.get(key).map_or("", String::as_str);
+    check_path(option("root"))?;
     let endpoint = parse_endpoint(option("endpoint"))?;
     let mut ftp = ImplAsyncFtpStream::connect((endpoint.host.as_str(), endpoint.port))
         .await
@@ -290,6 +303,36 @@ mod tests {
         assert_eq!(parse_endpoint("ftps://files.example.org:2121").unwrap(), endpoint(true, 2121));
         assert_eq!(parse_endpoint("files.example.org:990").unwrap(), endpoint(true, 990));
         assert!(parse_endpoint("sftp://files.example.org").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_line_break_in_a_path_never_reaches_the_server() {
+        const EVIL: &str = "x\r\nDELE victim.txt";
+        let server = test_server::FakeFtp::start();
+        server.put("victim.txt", b"keep");
+        let endpoint = format!("ftp://127.0.0.1:{}", server.port);
+        let options = HashMap::from([("endpoint".to_string(), endpoint.clone())]);
+        let timeout = Duration::from_secs(5);
+
+        assert!(rename(&options, EVIL, "new.txt", timeout).await.is_err());
+        assert!(rename(&options, "victim.txt", EVIL, timeout).await.is_err());
+        assert!(create_empty(&options, EVIL, timeout).await.is_err());
+        let evil_root = HashMap::from([
+            ("endpoint".to_string(), endpoint.clone()),
+            ("root".to_string(), format!("/{EVIL}")),
+        ]);
+        assert!(rename(&evil_root, "a", "b", timeout).await.is_err());
+        assert!(opendal::Operator::via_iter("ftp", evil_root).is_err());
+
+        let op = opendal::Operator::via_iter("ftp", options).unwrap();
+        assert!(op.stat(EVIL).await.is_err());
+        assert!(op.read(EVIL).await.is_err());
+        assert!(op.write(EVIL, b"x".to_vec()).await.is_err());
+        assert!(op.delete(EVIL).await.is_err());
+        assert!(op.list(&format!("{EVIL}/")).await.is_err());
+        assert!(op.create_dir(&format!("{EVIL}/")).await.is_err());
+
+        assert_eq!(server.names(), ["victim.txt"]);
     }
 
     #[tokio::test]

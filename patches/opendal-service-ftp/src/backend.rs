@@ -30,6 +30,7 @@ use super::FTP_SCHEME;
 use super::config::FtpConfig;
 use super::core::FtpCore;
 use super::core::Manager;
+use super::core::check_path;
 use super::core::format_ftp_error;
 use super::deleter::FtpDeleter;
 use super::reader::*;
@@ -129,6 +130,9 @@ impl Builder for FtpBuilder {
         };
 
         let root = normalize_root(&self.config.root.unwrap_or_default());
+        check_path(&root).map_err(|err| {
+            Error::new(ErrorKind::ConfigInvalid, "root is invalid").set_source(err)
+        })?;
 
         let user = match &self.config.user {
             None => "".to_string(),
@@ -205,6 +209,7 @@ impl Service for FtpBackend {
         path: &str,
         _: OpCreateDir,
     ) -> Result<RpCreateDir> {
+        check_path(path)?;
         let mut ftp_stream = self.core.ftp_connect(Operation::CreateDir).await?;
 
         let paths: Vec<&str> = path.split_inclusive('/').collect();
@@ -247,6 +252,7 @@ impl Service for FtpBackend {
         Ok(RpStat::new(meta))
     }
     fn read(&self, _ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        check_path(path)?;
         let output: oio::StreamReader<FtpReader> = {
             Ok(oio::StreamReader::new(FtpReader::new(
                 self.clone(),
@@ -259,6 +265,7 @@ impl Service for FtpBackend {
     }
 
     fn write(&self, _ctx: &OperationContext, path: &str, op: OpWrite) -> Result<Self::Writer> {
+        check_path(path)?;
         Ok(FtpLazyWriter::new(self.core.clone(), path, op))
     }
 
@@ -270,6 +277,7 @@ impl Service for FtpBackend {
     }
 
     fn list(&self, _ctx: &OperationContext, path: &str, _: OpList) -> Result<Self::Lister> {
+        check_path(path)?;
         Ok(FtpLazyLister::new(self.core.clone(), path))
     }
 
@@ -315,6 +323,7 @@ impl Service for FtpBackend {
 
 impl FtpBackend {
     pub async fn ftp_stat(&self, path: &str) -> Result<File> {
+        check_path(path)?;
         let mut ftp_stream = self.core.ftp_connect(Operation::Stat).await?;
 
         let (parent, basename) = (get_parent(path), get_basename(path));
