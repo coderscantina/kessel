@@ -57,7 +57,7 @@ flag on.
 - Priorities, pause/resume (per job and global), retries, post-transfer
   verification, timestamp preservation, transfer history
 - Global bandwidth and parallel-transfer limits, adjustable while running.
-  The `layers` section of `config.json5` sets the per-connection throttle and
+  The `layers` section of `config.json5` sets the per-site speed limit and
   concurrency cap for all sites. Per-site overrides are honored when stored on
   a site, but the site editor has no fields for them yet
 
@@ -99,7 +99,6 @@ wrapped in a composable, per-site layer stack:
 | ------------------------------- | --------------------------------------------------------- |
 | `RetryLayer`                    | exponential backoff; dropped FTP/S3 connections self-heal |
 | `TimeoutLayer`                  | bounded operations; no hung transfers on a dead socket    |
-| `ThrottleLayer`                 | bandwidth control, per-site and global                    |
 | `ConcurrentLimitLayer`          | caps in-flight operations per backend                     |
 | `LoggingLayer` + `TracingLayer` | structured logs feeding the in-app console                |
 

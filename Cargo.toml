@@ -47,7 +47,6 @@ opendal = { version = "0.58", features = [
   "services-gdrive",
   "services-dropbox",
   "services-onedrive",
-  "layers-throttle",
   "layers-tracing",
 ] }
 

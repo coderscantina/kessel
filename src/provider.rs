@@ -2,8 +2,8 @@
 //!
 //! Every backend is an [`opendal::Operator`]; kessel's job here is only to
 //! (a) build the Operator from a site profile plus keychain secrets, and
-//! (b) compose the per-site middleware stack (retry / timeout / throttle /
-//! concurrency / logging) that makes transfers resilient.
+//! (b) compose the per-site middleware stack (retry / timeout / concurrency /
+//! logging) that makes transfers resilient.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,9 +12,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
-use opendal::layers::{
-    ConcurrentLimitLayer, LoggingLayer, RetryLayer, ThrottleLayer, TimeoutLayer, TracingLayer,
-};
+use opendal::layers::{ConcurrentLimitLayer, LoggingLayer, RetryLayer, TimeoutLayer, TracingLayer};
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
@@ -48,10 +46,8 @@ pub struct RetryConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThrottleConfig {
-    /// bytes per second
+    /// bytes per second, enforced by the transfer queue
     pub bandwidth: u32,
-    /// burst size in bytes
-    pub burst: u32,
 }
 
 impl LayerConfig {
@@ -230,8 +226,8 @@ impl Provider {
         })
     }
 
-    // The layer stack is the core value proposition: retry, timeout,
-    // throttle and observability are OpenDAL's, not ours.
+    // The layer stack is the core value proposition: retry, timeout and
+    // observability are OpenDAL's, not ours.
     fn apply_layers(mut op: Operator, layers: &LayerConfig) -> Operator {
         // Timeout goes inside retry, so a stalled attempt is retried instead
         // of ending the whole operation. The one knob also bounds each IO
@@ -253,9 +249,6 @@ impl Provider {
                     .with_max_delay(Duration::from_millis(retry.max_delay_ms))
                     .with_jitter(),
             );
-        }
-        if let Some(throttle) = &layers.throttle {
-            op = op.layer(ThrottleLayer::new(throttle.bandwidth, throttle.burst));
         }
         if let Some(limit) = layers.concurrent_limit {
             op = op.layer(ConcurrentLimitLayer::new(limit));

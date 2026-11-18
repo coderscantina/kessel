@@ -5,11 +5,12 @@
 //! Both ends of a transfer are OpenDAL sites — the local filesystem is the
 //! reserved site 0 — so upload, download and site-to-site copy are the same
 //! code path: a layered source Operator streamed into a layered destination
-//! Operator. Retry, timeout, throttling and tracing come from the per-site
-//! OpenDAL layer stack built in [`crate::provider`]; this module owns only
-//! scheduling, persistence and resume.
+//! Operator. Retry, timeout and tracing come from the per-site OpenDAL layer
+//! stack built in [`crate::provider`]; this module owns scheduling,
+//! persistence, resume and bandwidth limits.
 
 mod engine;
+mod limiter;
 pub(crate) mod store;
 mod transfer;
 

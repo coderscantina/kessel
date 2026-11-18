@@ -22,16 +22,17 @@
 //! error class whether to re-queue the task with backoff.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use opendal::layers::ThrottleLayer;
 use opendal::{Operator, Writer};
 use sqlx::SqlitePool;
 use tokio::time::Instant;
 
 use crate::provider::{Capabilities, Provider};
 
+use super::limiter::{self, RateLimiter};
 use super::store::{self, ClaimedTask};
 use super::ConflictPolicy;
 
@@ -126,9 +127,8 @@ pub(crate) struct TransferOpts {
     pub verify: bool,
     /// Copy the source mtime onto the destination where the backend can.
     pub preserve_timestamps: bool,
-    /// The global bandwidth cap. Clones share one rate limiter, so every
-    /// running transfer draws from the same budget.
-    pub throttle: Option<ThrottleLayer>,
+    /// The global and per-site bandwidth limits this transfer draws from.
+    pub limiters: Vec<Arc<RateLimiter>>,
 }
 
 #[derive(Debug)]
@@ -447,19 +447,14 @@ async fn run_inner(
     // upload holds, so those bytes go straight into the partial instead.
     let append = offset > 0 || dst.caps.write_renames_on_close;
 
-    // Only the streaming writer draws from the global bandwidth budget.
-    let write_op = match &opts.throttle {
-        Some(throttle) => dest.op.clone().layer(throttle.clone()),
-        None => dest.op.clone(),
-    };
     let mut writer = if append {
-        write_op
+        dest.op
             .writer_with(dest.write_path())
             .append(true)
             .await
             .with_context(|| format!("open destination `{}` for append", task.dst))?
     } else {
-        write_op
+        dest.op
             .writer_with(dest.write_path())
             .chunk(part_size(size) as usize)
             .await
@@ -474,6 +469,7 @@ async fn run_inner(
         }
     };
 
+    let step = limiter::slice(&opts.limiters);
     let mut last_persist = Instant::now();
     let copy_result: Result<Option<Outcome>> = async {
         while offset < size {
@@ -482,13 +478,16 @@ async fn run_inner(
                 Signal::Pause => return Ok(Some(Outcome::Paused)),
                 Signal::Cancel => return Ok(Some(Outcome::Cancelled)),
             }
-            let end = (offset + CHUNK).min(size);
+            let end = (offset + step).min(size);
             let buf = reader
                 .read(offset..end)
                 .await
                 .with_context(|| format!("read `{}` at {offset}", task.src))?;
             let read = buf.len() as u64;
             anyhow::ensure!(read > 0, "source `{}` truncated mid-transfer", task.src);
+            if !limiter::pace(&opts.limiters, read, control).await {
+                continue;
+            }
             writer
                 .write(buf)
                 .await
@@ -949,7 +948,7 @@ mod tests {
             same_site: false,
             verify: false,
             preserve_timestamps: false,
-            throttle: None,
+            limiters: Vec::new(),
         };
         let moved = |total_bytes, dst_committed| ClaimedTask {
             total_bytes: Some(total_bytes),

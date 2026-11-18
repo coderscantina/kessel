@@ -54,8 +54,8 @@
   transfers: {
     // Global cap on concurrently running transfer tasks across all sites.
     max_parallel: 4,
-    // Global bandwidth limit in bytes/sec; 0 = unlimited. Applied as the
-    // default per-site OpenDAL throttle wherever a site doesn't set its own.
+    // Global bandwidth limit in bytes/sec; 0 = unlimited. All running
+    // transfers share it, on top of any per-site limit.
     bandwidth_limit: 0,
     // Extra attempts per file after its first failure (on top of the
     // per-operation retries OpenDAL's RetryLayer already does).
@@ -85,7 +85,7 @@
     },
     timeout_secs: 60,
     concurrent_limit: 8,
-    // throttle: { bandwidth: 1048576, burst: 2097152 }, // bytes/sec, uncomment to cap per-site
+    // throttle: { bandwidth: 1048576 }, // bytes/sec, uncomment to cap per-site
   },
 
   logging: {
