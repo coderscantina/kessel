@@ -4796,7 +4796,7 @@ const RUNNABLE_EXTENSIONS: &[&str] = &[
     // Windows.
     "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "mst", "cpl", "hta", "jar", "ps1",
     "psm1", "vb", "vbs", "vbe", "js", "jse", "ws", "wsf", "wsc", "wsh", "lnk", "inf", "reg",
-    "scf", "url", "application", "appref-ms", "gadget", "msc",
+    "scf", "url", "application", "appref-ms", "gadget", "msc", "chm", "xll",
     // macOS.
     "command", "tool", "app", "pkg", "mpkg", "dmg", "terminal", "scpt", "scptd", "applescript",
     "workflow", "action", "osax", "prefpane", "webloc", "inetloc", "fileloc",

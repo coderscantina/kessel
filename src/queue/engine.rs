@@ -2335,6 +2335,89 @@ mod tests {
         assert_eq!(server.names(), ["up/big.bin"]);
     }
 
+    #[test]
+    fn an_ftp_upload_leaves_a_file_named_like_an_old_partial_alone() {
+        let (env, server) = ftp_env("ftp-foreign-partial", 0);
+        // The name earlier versions derived from the file and the task id.
+        server.put("up/file.txt.1.kessel-part", b"not ours");
+        let src = env.dir.join("file.txt");
+        std::fs::write(&src, b"new content").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/file.txt.1.kessel-part").unwrap(), b"not ours");
+        assert_eq!(server.names(), ["up/file.txt", "up/file.txt.1.kessel-part"]);
+    }
+
+    #[test]
+    fn a_dotfile_upload_verifies_on_a_server_that_hides_dotfiles() {
+        let (env, server) = ftp_env("ftp-dotfile", 0);
+        let src = env.dir.join(".htaccess");
+        std::fs::write(&src, b"deny from all").unwrap();
+
+        let id = env.rt.block_on(env.handle.submit(ftp_upload(&src))).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(server.read("up/.htaccess").unwrap(), b"deny from all");
+        assert_eq!(server.names(), ["up/.htaccess"]);
+    }
+
+    /// A task that stopped mid-file with `partial` written, parked as a
+    /// conflict over the destination holding `theirs`.
+    fn parked_mid_file(env: &TestEnv, name: &str, theirs: &[u8]) -> (i64, PathBuf, PathBuf) {
+        let src = env.dir.join(format!("src/{name}"));
+        let dst = env.dir.join(format!("dst/{name}"));
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"0123456789").unwrap();
+        std::fs::write(&dst, theirs).unwrap();
+        let (job, task) = legacy_job(env, ("active", "active"), 0, &src, &dst, 4);
+        let partial = legacy_partial(&dst, task);
+        std::fs::write(&partial, b"0123").unwrap();
+        env.rt.block_on(async {
+            sqlx::query("UPDATE transfer_tasks SET partial = ? WHERE id = ?")
+                .bind(browse(&partial))
+                .bind(task)
+                .execute(&env.pool)
+                .await
+                .unwrap();
+            store::park_task_conflict(&env.pool, task, ConflictPolicy::Ask, theirs.len() as u64, None)
+                .await
+                .unwrap();
+        });
+        (job, dst, partial)
+    }
+
+    #[test]
+    fn skipping_a_conflict_parked_mid_file_keeps_the_destination() {
+        let env = test_env("conflict-skip");
+        let (job, dst, partial) = parked_mid_file(&env, "skip.bin", b"THEIRS");
+
+        env.handle.resolve(job, ConflictPolicy::Skip);
+        let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_skipped), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"THEIRS");
+        assert!(!partial.exists(), "the stale partial was kept");
+    }
+
+    #[test]
+    fn keeping_both_after_a_conflict_parked_mid_file_keeps_the_destination() {
+        let env = test_env("conflict-keep-both");
+        let (job, dst, partial) = parked_mid_file(&env, "both.bin", b"THEIRS");
+
+        env.handle.resolve(job, ConflictPolicy::Rename);
+        let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"THEIRS");
+        assert_eq!(std::fs::read(dst.with_file_name("both (1).bin")).unwrap(), b"0123456789");
+        assert!(!partial.exists(), "the stale partial was kept");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_same_site_move_renames_instead_of_copying() {

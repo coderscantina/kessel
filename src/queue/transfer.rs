@@ -2,10 +2,10 @@
 //!
 //! Safe overwrite: on backends that can rename (local fs, sftp, ftp, …) a
 //! task writes into its own partial file next to the destination
-//! (`.<name>.<task id>.kessel-part`, on FTP without the leading dot) and
-//! renames it onto the real name only after the copy finished and verified. The old file stays intact until
-//! then. The task records the partial it owns, so cancel and removal can
-//! delete it later. Object stores write the destination directly: their
+//! (`.<name>.<task id>.kessel-part`, on FTP a fresh random name, see
+//! [`fresh_ftp_partial`]) and renames it onto the real name only after the
+//! copy finished and verified. The old file stays intact until then. The task
+//! records the partial it owns, so cancel and removal can delete it later. Object stores write the destination directly: their
 //! uploads only become visible on a successful close, so an interrupted
 //! upload is always aborted and restarts from zero.
 //!
@@ -162,14 +162,46 @@ fn resumes_by_append(caps: &Capabilities) -> bool {
     caps.write_can_append && !caps.virtual_dirs
 }
 
+/// Part size for a streamed upload of `size` bytes: S3 allows 10,000 parts,
+/// and the last one may be short.
+fn part_size(size: u64) -> u64 {
+    CHUNK.max(size.div_ceil(9_999))
+}
+
+/// `path` with its file name replaced by `name`.
+fn sibling(path: &str, name: &str) -> String {
+    format!("{}{name}", &path[..path.len() - file_name(path).len()])
+}
+
 /// The partial file next to `path` (an operator or browse path) that task
-/// `task_id` writes before committing. FTP partials stay visible: many
-/// servers hide dotfiles from `LIST`, the only way OpenDAL stats a file there.
-pub(crate) fn partial_path(dst: &Provider, path: &str, task_id: i64) -> String {
-    let name = file_name(path);
-    let parent = &path[..path.len() - name.len()];
-    let dot = if dst.scheme == "ftp" { "" } else { "." };
-    format!("{parent}{dot}{name}.{task_id}{PARTIAL_SUFFIX}")
+/// `task_id` writes before committing, on backends other than FTP.
+fn partial_name(path: &str, task_id: i64) -> String {
+    format!(".{}.{task_id}{PARTIAL_SUFFIX}", file_name(path))
+}
+
+/// The file an earlier run of the task left its bytes in. FTP partials have
+/// random names, so only the task's record knows them.
+fn earlier_partial(dst: &Provider, path: &str, task: &ClaimedTask) -> Option<String> {
+    if dst.scheme == "ftp" {
+        return task.partial.as_deref().map(|partial| sibling(path, file_name(partial)));
+    }
+    Some(sibling(path, &partial_name(path, task.id)))
+}
+
+/// A partial name next to `path` that nothing on the FTP server uses yet. FTP
+/// can't create a file exclusively and appends to what it finds, so the name
+/// is random and probed first. It never starts with a dot: many servers hide
+/// dotfiles from `LIST`, the only way OpenDAL stats a file there.
+async fn fresh_ftp_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
+    for _ in 0..8 {
+        let name = format!("kessel-{task_id}-{:016x}{PARTIAL_SUFFIX}", rand::random::<u64>());
+        match op.stat(&sibling(path, &name)).await {
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(name),
+            Err(error) => return Err(error).context("probing a name for the partial file"),
+            Ok(_) => {}
+        }
+    }
+    anyhow::bail!("no free partial file name next to `{path}`")
 }
 
 /// Run one claimed task. Also returns the bytes the worker still counts in
@@ -241,6 +273,10 @@ async fn run_inner(
             return Err(error).with_context(|| format!("stat source `{}`", task.src));
         }
     };
+    // The source is still there, so an earlier commit record is out of date.
+    if task.dst_committed {
+        store::set_task_dst_committed(pool, task.id, false).await?;
+    }
     let size = meta.content_length();
     let etag = meta.etag().map(str::to_string);
     let modified = meta
@@ -258,11 +294,13 @@ async fn run_inner(
     let mut offset = 0;
     if task.byte_offset > 0 {
         let written = if task.in_place || !stages(&dst.caps) {
-            dst_path.clone()
+            Some(dst_path.clone())
         } else {
-            partial_path(dst, &dst_path, task.id)
+            earlier_partial(dst, &dst_path, task)
         };
-        if can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref()) {
+        if let Some(written) = written.filter(|_| {
+            can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref())
+        }) {
             offset = resume_offset(&dst_op, &written, size).await;
         }
     }
@@ -323,12 +361,16 @@ async fn run_inner(
     // A same-site move is one rename on the server when the backend has it.
     // Anything it can't do (another volume, say) still works by copying.
     if opts.same_site && task.move_source && dst.caps.rename && offset == 0 && !append_to_existing {
+        store::set_task_dst_committed(pool, task.id, true).await?;
         match move_into_place(dst, &dst_op, &src_path, &dst_path).await {
             Ok(()) => return Ok(Outcome::Done { bytes: size }),
-            Err(error) => tracing::warn!(
-                src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
-                "server-side move failed; falling back to copying"
-            ),
+            Err(error) => {
+                store::set_task_dst_committed(pool, task.id, false).await?;
+                tracing::warn!(
+                    src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
+                    "server-side move failed; falling back to copying"
+                );
+            }
         }
     }
 
@@ -336,12 +378,16 @@ async fn run_inner(
     // case that deliberately writes the real file in place, also when a
     // later run of the task picks up its resume offset.
     let in_place = append_to_existing || (offset > 0 && task.in_place);
-    let partial = (stages(&dst.caps) && !in_place).then(|| {
-        (
-            partial_path(dst, &dst_path, task.id),
-            partial_path(dst, &dst_browse, task.id),
-        )
-    });
+    let partial = if stages(&dst.caps) && !in_place {
+        let name = match task.partial.as_deref() {
+            _ if dst.scheme != "ftp" => partial_name(&dst_path, task.id),
+            Some(recorded) if offset > 0 => file_name(recorded).to_string(),
+            _ => fresh_ftp_partial(&dst_op, &dst_path, task.id).await?,
+        };
+        Some((sibling(&dst_path, &name), sibling(&dst_browse, &name)))
+    } else {
+        None
+    };
     let dest = Dest {
         op: dst_op,
         path: dst_path,
@@ -400,12 +446,6 @@ async fn run_inner(
     // A writer that renames on close would publish whatever an interrupted
     // upload holds, so those bytes go straight into the partial instead.
     let append = offset > 0 || dst.caps.write_renames_on_close;
-    if offset == 0 && append && dest.partial.is_some() {
-        dest.op
-            .delete(dest.write_path())
-            .await
-            .with_context(|| format!("clearing the partial of `{}`", task.dst))?;
-    }
 
     // Only the streaming writer draws from the global bandwidth budget.
     let write_op = match &opts.throttle {
@@ -421,7 +461,7 @@ async fn run_inner(
     } else {
         write_op
             .writer_with(dest.write_path())
-            .chunk(CHUNK as usize)
+            .chunk(part_size(size) as usize)
             .await
             .with_context(|| format!("open destination `{}`", task.dst))?
     };
@@ -565,6 +605,7 @@ async fn finish_transfer(
     }
 
     if task.move_source {
+        store::set_task_dst_committed(pool, task.id, true).await?;
         // Only delete what was copied: a source that changed meanwhile stays.
         let now = src_op
             .stat(src_path)
@@ -610,10 +651,11 @@ async fn reviewed_state_changed(task: &ClaimedTask, op: &Operator, path: &str) -
 }
 
 /// Whether a move whose source is gone already finished: a crash can land
-/// between deleting the source and recording completion. The destination then
-/// holds the whole file. Returns its size.
+/// between deleting the source and recording completion. Only a destination
+/// the task recorded as complete counts, a file of the same size that happens
+/// to be there does not. Returns its size.
 async fn already_moved(task: &ClaimedTask, op: &Operator, path: &str) -> Result<Option<u64>> {
-    let Some(size) = task.total_bytes else {
+    let Some(size) = task.total_bytes.filter(|_| task.dst_committed) else {
         return Ok(None);
     };
     match op.stat(path).await {
@@ -693,7 +735,7 @@ fn checksums_comparable(src_scheme: &str, dst_scheme: &str, src: &str, dst: &str
     src_scheme == dst_scheme && MD5_ETAG_SCHEMES.contains(&src_scheme) && is_md5(src) && is_md5(dst)
 }
 
-fn normalize_etag(etag: &str) -> String {
+pub(crate) fn normalize_etag(etag: &str) -> String {
     etag.trim_start_matches("W/").trim_matches('"').to_ascii_lowercase()
 }
 
@@ -860,6 +902,7 @@ mod tests {
             partial: None,
             in_place: false,
             expected: None,
+            dst_committed: false,
         }
     }
 
@@ -908,17 +951,22 @@ mod tests {
             preserve_timestamps: false,
             throttle: None,
         };
-        let moved = |total_bytes| ClaimedTask {
+        let moved = |total_bytes, dst_committed| ClaimedTask {
             total_bytes: Some(total_bytes),
             move_source: true,
+            dst_committed,
             ..task(None, None)
         };
 
-        let (done, _) = run_task(&pool, &provider, &provider, &moved(6), &control, opts.clone()).await;
+        let (done, _) = run_task(&pool, &provider, &provider, &moved(6, true), &control, opts.clone()).await;
         assert!(matches!(done, Outcome::Done { bytes: 6 }), "{done:?}");
         // A shorter destination is no finished move: the failure stays visible.
-        let (short, _) = run_task(&pool, &provider, &provider, &moved(9), &control, opts).await;
+        let (short, _) = run_task(&pool, &provider, &provider, &moved(9, true), &control, opts.clone()).await;
         assert!(matches!(short, Outcome::Failed(_)), "{short:?}");
+        // An unrelated file of the right size, with nothing recorded: the
+        // source vanished before this task moved anything.
+        let (unrelated, _) = run_task(&pool, &provider, &provider, &moved(6, false), &control, opts).await;
+        assert!(matches!(unrelated, Outcome::Failed(_)), "{unrelated:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -969,6 +1017,15 @@ mod tests {
         assert!(store::task_failed(&pool, b, "denied", false, 0).await.unwrap());
         assert_eq!(name(c).await.unwrap(), "file (3).txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_uploads_stay_within_the_part_limit() {
+        assert_eq!(part_size(0), CHUNK);
+        assert_eq!(part_size(CHUNK * 9_999), CHUNK);
+        for size in [CHUNK * 9_999 + 1, 100 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024 * 1024] {
+            assert!(size.div_ceil(part_size(size)) <= 10_000, "{size}");
+        }
     }
 
     #[test]

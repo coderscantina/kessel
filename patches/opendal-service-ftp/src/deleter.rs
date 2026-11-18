@@ -22,6 +22,7 @@ use suppaftp::Status;
 use suppaftp::types::Response;
 
 use super::core::FtpCore;
+use super::core::check_path;
 use super::core::format_ftp_error;
 use opendal_core::raw::*;
 use opendal_core::*;
@@ -38,6 +39,7 @@ impl FtpDeleter {
 
 impl oio::OneShotDelete for FtpDeleter {
     async fn delete_once(&self, path: String, _: OpDelete) -> Result<()> {
+        check_path(&path)?;
         let mut ftp_stream = self.core.ftp_connect(Operation::Delete).await?;
 
         let result = if path.ends_with('/') {

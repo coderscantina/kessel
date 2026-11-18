@@ -180,6 +180,9 @@ pub async fn insert_site(
 
 /// Saving through the form also settles an imported site's "needs
 /// credentials" flag: the user has been through the form.
+/// Save a site's settings. A change of where it points is refused while open
+/// transfer jobs reference the site: the check is part of the update, so a
+/// job can't slip in between.
 pub async fn update_site(
     pool: &SqlitePool,
     site_id: i64,
@@ -189,10 +192,15 @@ pub async fn update_site(
     layers: &LayerConfig,
     meta: &BookmarkMeta,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE sites SET name = ?, scheme = ?, options = ?, layers = ?, icon = ?, color = ?, \
-         tags = ?, folder_id = ?, needs_credentials = 0, updated_at = datetime('now') WHERE id = ?",
-    )
+    let retargets = retargets_site(pool, site_id, scheme, options).await?;
+    let sql = format!(
+        "UPDATE sites SET name = ?1, scheme = ?2, options = ?3, layers = ?4, icon = ?5, color = ?6, \
+         tags = ?7, folder_id = ?8, needs_credentials = 0, updated_at = datetime('now') \
+         WHERE id = ?9 AND (?10 = 0 OR NOT EXISTS ( \
+           SELECT 1 FROM transfer_jobs \
+           WHERE (src_site_id = ?9 OR dst_site_id = ?9) AND {OPEN_JOB}))"
+    );
+    let updated = sqlx::query(sqlx::AssertSqlSafe(sql))
     .bind(name)
     .bind(scheme)
     .bind(serde_json::to_string(options)?)
@@ -202,8 +210,16 @@ pub async fn update_site(
     .bind(serde_json::to_string(&meta.tags)?)
     .bind(meta.folder_id)
     .bind(site_id)
+    .bind(retargets)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated == 0 && retargets {
+        let jobs = open_job_count(pool, site_id).await?;
+        if jobs > 0 {
+            return Err(SiteBusy::Edit(jobs).into());
+        }
+    }
     Ok(())
 }
 
@@ -488,35 +504,55 @@ pub async fn delete_site(pool: &SqlitePool, site_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// What a job aims at when it resolves the site: protocol and where on the
-/// server. Credentials, names and limits don't redirect anything.
+/// What a job aims at when it resolves the site: protocol, where on the
+/// server, and whose account it logs in to, since another user can see other
+/// files at the same path. Passwords, names and limits don't redirect anything.
 fn connection_target<'a>(scheme: &'a str, options: &'a HashMap<String, String>) -> Vec<&'a str> {
     std::iter::once(scheme)
         .chain(
-            ["endpoint", "root", "bucket", "container"]
-                .map(|key| options.get(key).map_or("", String::as_str)),
+            [
+                "endpoint",
+                "root",
+                "bucket",
+                "container",
+                "user",
+                "username",
+                "account_name",
+                "credential_path",
+                crate::bookmarks::AWS_PROFILE_OPT,
+            ]
+            .map(|key| options.get(key).map_or("", String::as_str)),
         )
         .collect()
 }
 
-/// Refuse a change of protocol, endpoint, root, bucket or container while
-/// open transfer jobs reference the site: a paused job would otherwise resume
-/// against the new location.
+/// Whether saving these settings points the site somewhere else.
+async fn retargets_site(
+    pool: &SqlitePool,
+    site_id: i64,
+    scheme: &str,
+    options: &HashMap<String, String>,
+) -> Result<bool> {
+    let row = sqlx::query("SELECT scheme, options FROM sites WHERE id = ?")
+        .bind(site_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(false) };
+    let old_scheme: String = row.get("scheme");
+    let old_options: HashMap<String, String> =
+        serde_json::from_str(row.get::<String, _>("options").as_str())?;
+    Ok(connection_target(&old_scheme, &old_options) != connection_target(scheme, options))
+}
+
+/// Refuse early, before any keychain change, what [`update_site`] would
+/// refuse: a paused job would otherwise resume against the new location.
 pub async fn ensure_site_retargetable(
     pool: &SqlitePool,
     site_id: i64,
     scheme: &str,
     options: &HashMap<String, String>,
 ) -> Result<()> {
-    let row = sqlx::query("SELECT scheme, options FROM sites WHERE id = ?")
-        .bind(site_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some(row) = row else { return Ok(()) };
-    let old_scheme: String = row.get("scheme");
-    let old_options: HashMap<String, String> =
-        serde_json::from_str(row.get::<String, _>("options").as_str())?;
-    if connection_target(&old_scheme, &old_options) == connection_target(scheme, options) {
+    if !retargets_site(pool, site_id, scheme, options).await? {
         return Ok(());
     }
     let jobs = open_job_count(pool, site_id).await?;
@@ -702,15 +738,49 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (pool, site, dir) = site_with_job("retarget-busy", Some("queued")).await;
             let mut options = HashMap::from([("endpoint".to_string(), "ssh://old.example.com".to_string())]);
-            options.insert("user".to_string(), "anna".to_string());
+            options.insert("region".to_string(), "eu".to_string());
             ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap();
 
-            options.insert("endpoint".to_string(), "ssh://new.example.com".to_string());
-            let error = ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap_err();
-            assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Edit(1))));
+            for (key, value) in [("user", "anna"), ("endpoint", "ssh://new.example.com")] {
+                let mut changed = options.clone();
+                changed.insert(key.to_string(), value.to_string());
+                let error = ensure_site_retargetable(&pool, site, "sftp", &changed).await.unwrap_err();
+                assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Edit(1))));
+            }
 
             sqlx::query("DELETE FROM transfer_jobs").execute(&pool).await.unwrap();
+            options.insert("user".to_string(), "anna".to_string());
             ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap();
+            pool.close().await;
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn saving_another_account_is_refused_by_the_update_itself() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (pool, site, dir) = site_with_job("retarget-update", Some("paused")).await;
+            let save = |name: &'static str, options: HashMap<String, String>| {
+                let pool = pool.clone();
+                async move {
+                    update_site(&pool, site, name, "sftp", &options, &LayerConfig::default(), &BookmarkMeta::default()).await
+                }
+            };
+            let same = HashMap::from([("endpoint".to_string(), "ssh://old.example.com".to_string())]);
+            let mut other_user = same.clone();
+            other_user.insert("user".to_string(), "bob".to_string());
+
+            let error = save("renamed", other_user.clone()).await.unwrap_err();
+            assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Edit(1))));
+            assert_eq!(list_sites(&pool).await.unwrap()[0].name, "x");
+
+            // Settings that don't redirect the site still save.
+            save("renamed", same).await.unwrap();
+            assert_eq!(list_sites(&pool).await.unwrap()[0].name, "renamed");
+
+            sqlx::query("DELETE FROM transfer_jobs").execute(&pool).await.unwrap();
+            save("moved", other_user).await.unwrap();
+            assert_eq!(list_sites(&pool).await.unwrap()[0].options["user"], "bob");
             pool.close().await;
             std::fs::remove_dir_all(&dir).unwrap();
         });

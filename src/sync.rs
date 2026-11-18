@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 
 use crate::queue::{
-    BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState, NewBatch, QueueHandle,
-    MTIME_SLACK_SECS,
+    normalize_etag, BatchFile, ConflictPolicy, ExpectedDest, JobOutcome, JobState, NewBatch,
+    QueueHandle, MTIME_SLACK_SECS,
 };
 use crate::provider::Provider;
 
@@ -68,26 +68,29 @@ impl PlanKind {
 }
 
 /// A destination file as the review saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewedFile {
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    pub etag: Option<String>,
 }
 
 impl ReviewedFile {
+    /// Whether the file is still this version: an ETag known on both sides
+    /// decides, otherwise the time does. `None` when neither can tell.
     /// Listings and stats can report a time at different precision, so
     /// times get the same slack as the comparison itself.
-    fn matches(&self, size: u64, modified: Option<DateTime<Utc>>) -> bool {
-        let same_time = match (self.modified, modified) {
-            (Some(reviewed), Some(now)) => (reviewed - now).num_seconds().abs() <= MTIME_SLACK_SECS,
-            _ => true,
-        };
-        self.size == size && same_time
+    fn same_version(&self, modified: Option<DateTime<Utc>>, etag: Option<&str>) -> Option<bool> {
+        if let (Some(reviewed), Some(now)) = (self.etag.as_deref(), etag) {
+            return Some(normalize_etag(reviewed) == normalize_etag(now));
+        }
+        let (reviewed, now) = (self.modified?, modified?);
+        Some((reviewed - now).num_seconds().abs() <= MTIME_SLACK_SECS)
     }
 }
 
 /// What the queue must still find at a reviewed copy's destination.
-fn expected_dest(reviewed: Option<ReviewedFile>) -> ExpectedDest {
+fn expected_dest(reviewed: Option<&ReviewedFile>) -> ExpectedDest {
     reviewed.map_or(ExpectedDest::Absent, |file| ExpectedDest::File {
         size: file.size,
         etag: None,
@@ -118,11 +121,12 @@ impl SyncPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FileMeta {
     is_dir: bool,
     size: u64,
     modified: Option<DateTime<Utc>>,
+    etag: Option<String>,
     /// A link to a folder: recorded, but never entered, copied or deleted.
     dir_link: bool,
 }
@@ -132,6 +136,7 @@ impl FileMeta {
         ReviewedFile {
             size: self.size,
             modified: self.modified,
+            etag: self.etag.clone(),
         }
     }
 }
@@ -159,6 +164,7 @@ async fn walk(provider: &Provider, root: &str) -> Result<BTreeMap<String, FileMe
                     is_dir: entry.is_dir,
                     size: entry.size,
                     modified: entry.modified,
+                    etag: entry.etag,
                     dir_link,
                 },
             );
@@ -197,13 +203,25 @@ fn compare(src: &FileMeta, dst: &FileMeta, dst_keeps_mtime: bool) -> Option<Plan
     }
 }
 
+/// What tells a site's server apart from others of its scheme: the endpoint,
+/// or the site itself when neither an endpoint nor a service name (a bucket,
+/// say) identifies the store.
+fn server_identity(endpoint: Option<&str>, service: &str, site_id: i64) -> String {
+    match endpoint {
+        Some(endpoint) => endpoint.trim_end_matches('/').to_lowercase(),
+        None if service.is_empty() => format!("site-{site_id}"),
+        None => String::new(),
+    }
+}
+
 /// Where a browse directory really lives, comparable across bookmarks of
 /// one store: a location inside another starts with that location's text.
 async fn location(provider: &Provider, dir: &str) -> String {
     let scheme = &provider.scheme;
-    // Only the account root of a bucket-root S3 site has no operator.
+    // Only the account root of a bucket-root S3 site has no operator. It
+    // contains every bucket of its server.
     let Ok((op, rel)) = provider.route(dir).await else {
-        return format!("{scheme}://");
+        return format!("{scheme}://{}", provider.endpoint().unwrap_or_default().to_lowercase());
     };
     let info = op.info();
     if scheme == "fs" {
@@ -212,7 +230,8 @@ async fn location(provider: &Provider, dir: &str) -> String {
         let path = real.to_string_lossy().replace('\\', "/");
         return format!("fs://{}/", path.trim_end_matches('/'));
     }
-    let parts = [info.name(), info.root(), rel];
+    let server = server_identity(provider.endpoint(), &info.name(), provider.site_id);
+    let parts = [server.as_str(), &info.name(), &info.root(), &rel];
     let path: Vec<&str> = parts.iter().map(|part| part.trim_matches('/')).filter(|part| !part.is_empty()).collect();
     format!("{scheme}://{}/", path.join("/"))
 }
@@ -369,7 +388,7 @@ impl SyncWork {
                 PlanKind::Delete => work.deletes.push(ReviewedDelete {
                     path: dst,
                     is_dir: item.is_dir,
-                    reviewed: item.reviewed,
+                    reviewed: item.reviewed.clone(),
                 }),
                 _ if item.is_dir => work.new_dirs.push(dst),
                 _ => work.copies.push(ReviewedCopy {
@@ -378,7 +397,7 @@ impl SyncWork {
                         dst,
                         size: Some(item.size),
                     },
-                    reviewed: item.reviewed,
+                    reviewed: item.reviewed.clone(),
                 }),
             }
         }
@@ -408,13 +427,23 @@ impl SyncReport {
 }
 
 /// Whether the destination file at `path` is still what the review saw
-/// (`None` = nothing there).
-async fn still_as_reviewed(dst: &Provider, path: &str, reviewed: Option<ReviewedFile>) -> Result<bool> {
+/// (`None` = nothing there). With `needs_proof`, the same size alone isn't
+/// enough: an ETag or a time has to confirm it.
+async fn still_as_reviewed(
+    dst: &Provider,
+    path: &str,
+    reviewed: Option<&ReviewedFile>,
+    needs_proof: bool,
+) -> Result<bool> {
     let (op, rel) = dst.route(path).await?;
     match op.stat(&rel).await {
         Ok(meta) => {
             let modified = meta.last_modified().and_then(crate::provider::to_datetime);
-            Ok(!meta.is_dir() && reviewed.is_some_and(|file| file.matches(meta.content_length(), modified)))
+            Ok(!meta.is_dir()
+                && reviewed.is_some_and(|file| {
+                    file.size == meta.content_length()
+                        && file.same_version(modified, meta.etag()).unwrap_or(!needs_proof)
+                }))
         }
         Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(reviewed.is_none()),
         Err(error) => Err(error.into()),
@@ -426,7 +455,7 @@ async fn still_as_reviewed(dst: &Provider, path: &str, reviewed: Option<Reviewed
 async fn recheck_copies(dst: &Provider, copies: Vec<ReviewedCopy>, report: &mut SyncReport) -> Vec<ReviewedCopy> {
     let checked: Vec<_> = futures::stream::iter(copies)
         .map(|copy| async move {
-            let unchanged = still_as_reviewed(dst, &copy.file.dst, copy.reviewed).await;
+            let unchanged = still_as_reviewed(dst, &copy.file.dst, copy.reviewed.as_ref(), false).await;
             (copy, unchanged)
         })
         .buffered(RECHECK_CONCURRENCY)
@@ -443,12 +472,12 @@ async fn recheck_copies(dst: &Provider, copies: Vec<ReviewedCopy>, report: &mut 
     files
 }
 
-/// Delete one reviewed entry if it is still as reviewed; false when it was
-/// left alone. Folders are only removed once empty, so anything that
+/// Delete one reviewed entry if it provably is still as reviewed; false when
+/// it was left alone. Folders are only removed once empty, so anything that
 /// appeared in them after the review survives.
 async fn delete_reviewed(dst: &Provider, entry: &ReviewedDelete) -> Result<bool> {
     if !entry.is_dir {
-        if !still_as_reviewed(dst, &entry.path, entry.reviewed).await? {
+        if !still_as_reviewed(dst, &entry.path, entry.reviewed.as_ref(), true).await? {
             return Ok(false);
         }
     } else {
@@ -500,7 +529,7 @@ pub async fn run(
         let total = copies.len() as u64;
         let expected: HashMap<String, ExpectedDest> = copies
             .iter()
-            .map(|copy| (copy.file.dst.clone(), expected_dest(copy.reviewed)))
+            .map(|copy| (copy.file.dst.clone(), expected_dest(copy.reviewed.as_ref())))
             .collect();
         let batch = NewBatch {
             src_site_id,
@@ -570,6 +599,7 @@ mod tests {
             is_dir: false,
             size,
             modified: secs.map(at),
+            etag: None,
             dir_link: false,
         };
         let compare = |src: &FileMeta, dst: &FileMeta| compare(src, dst, true);
@@ -660,7 +690,7 @@ mod tests {
         assert_eq!(expected_dest(None), ExpectedDest::Absent);
         let modified = Some(Utc::now());
         assert_eq!(
-            expected_dest(Some(ReviewedFile { size: 7, modified })),
+            expected_dest(Some(&ReviewedFile { size: 7, modified, etag: None })),
             ExpectedDest::File { size: 7, etag: None, modified }
         );
     }
@@ -757,6 +787,62 @@ mod tests {
     }
 
     #[test]
+    fn sites_on_different_servers_are_different_locations() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ftp = |id, endpoint: &str| {
+            let profile = crate::provider::SiteProfile {
+                id,
+                scheme: "ftp".into(),
+                options: [("endpoint".to_string(), endpoint.to_string())].into(),
+                ..Default::default()
+            };
+            Provider::connect(&profile, &Default::default()).unwrap()
+        };
+        let at = |provider: &Provider, dir: &str| rt.block_on(location(provider, dir));
+        let (a, b, a_again) = (ftp(1, "ftp://a.example.org"), ftp(2, "ftp://b.example.org"), ftp(3, "ftp://A.example.org/"));
+
+        assert!(!overlapping(&at(&a, "www/"), &at(&b, "www/")));
+        assert!(overlapping(&at(&a, "www/"), &at(&a_again, "www/sub/")));
+        // No endpoint: only a bucket name can say two sites share a store.
+        assert_ne!(server_identity(None, "", 1), server_identity(None, "", 2));
+        assert_eq!(server_identity(None, "bucket", 1), server_identity(None, "bucket", 2));
+    }
+
+    #[test]
+    fn a_delete_needs_an_etag_or_time_to_prove_the_file_unchanged() {
+        let (rt, dir, provider) = local_fixture("proof");
+        std::fs::write(dir.join("dst/old.txt"), b"same").unwrap();
+        let path = browse_dir(&dir, "dst/old.txt");
+        let modified = std::fs::metadata(dir.join("dst/old.txt")).unwrap().modified().unwrap().into();
+        let delete = |reviewed: ReviewedFile| {
+            let entry = ReviewedDelete { path: path.clone(), is_dir: false, reviewed: Some(reviewed) };
+            rt.block_on(delete_reviewed(&provider, &entry)).unwrap()
+        };
+
+        // Neither side of the comparison has a time or an ETag to go on.
+        assert!(!delete(ReviewedFile { size: 4, modified: None, etag: None }));
+        assert!(dir.join("dst/old.txt").exists());
+        // A same-size replacement with another time stays too.
+        let earlier = chrono::DateTime::<Utc>::UNIX_EPOCH;
+        assert!(!delete(ReviewedFile { size: 4, modified: Some(earlier), etag: None }));
+        assert!(dir.join("dst/old.txt").exists());
+
+        assert!(delete(ReviewedFile { size: 4, modified: Some(modified), etag: None }));
+        assert!(!dir.join("dst/old.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_etag_known_on_both_sides_outranks_the_time() {
+        let at = Some(Utc::now());
+        let file = ReviewedFile { size: 1, modified: at, etag: Some("\"abc\"".into()) };
+        assert_eq!(file.same_version(at, Some("W/\"ABC\"")), Some(true));
+        assert_eq!(file.same_version(at, Some("\"def\"")), Some(false));
+        assert_eq!(file.same_version(at, None), Some(true));
+        assert_eq!(file.same_version(None, None), None);
+    }
+
+    #[test]
     fn deletions_start_unticked() {
         assert!(!PlanKind::Delete.selected_by_default());
         assert!(!PlanKind::Conflict.selected_by_default());
@@ -838,6 +924,7 @@ mod tests {
             is_dir: false,
             size,
             modified: Some(Utc.timestamp_opt(secs, 0).unwrap()),
+            etag: None,
             dir_link: false,
         };
         assert_eq!(compare(&meta(5, 100), &meta(5, 900), false), None);
@@ -904,7 +991,7 @@ mod tests {
             deletes: vec![ReviewedDelete {
                 path: browse("dst/extra.txt"),
                 is_dir: false,
-                reviewed: Some(ReviewedFile { size: 7, modified: None }),
+                reviewed: Some(ReviewedFile { size: 7, modified: None, etag: None }),
             }],
         };
         let report = rt.block_on(run(&queue, 0, &dst, "s".into(), "d".into(), work));

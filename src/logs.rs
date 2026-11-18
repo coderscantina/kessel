@@ -42,6 +42,19 @@ pub fn clear() {
     VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whether events of this target can carry credentials: suppaftp logs every
+/// FTP command it sends at trace level, `PASS <password>` included.
+fn logs_credentials(target: &str) -> bool {
+    target == "suppaftp" || target.starts_with("suppaftp::")
+}
+
+/// Drops events that can carry credentials before any other layer sees them.
+/// A separate layer, so no `logging.filter` or `RUST_LOG` directive can turn
+/// them back on.
+pub fn credential_guard<S: tracing::Subscriber>() -> impl tracing_subscriber::Layer<S> {
+    tracing_subscriber::filter::filter_fn(|metadata| !logs_credentials(metadata.target()))
+}
+
 /// The capture layer for the subscriber registry in `main`.
 pub fn layer() -> BufferLayer {
     BufferLayer
@@ -159,6 +172,34 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_filter_setting_lets_ftp_commands_through() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                self.0.lock().unwrap().push(event.metadata().target().to_string());
+            }
+        }
+
+        let seen = Seen::default();
+        let filter = tracing_subscriber::EnvFilter::new("trace,suppaftp=trace,suppaftp::command=trace");
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(credential_guard())
+            .with(seen.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "suppaftp", "PASS secret");
+            tracing::trace!(target: "suppaftp::command", "PASS secret");
+            tracing::trace!(target: "suppaftp_other", "kept");
+            tracing::trace!(target: "kessel", "kept");
+        });
+        assert_eq!(*seen.0.lock().unwrap(), ["suppaftp_other", "kessel"]);
+    }
     use std::io::Write as _;
 
     #[test]

@@ -57,6 +57,7 @@ jobs:
       - name: Bundle, sign, notarize, package
         env:
           KESSEL_BIN: target/universal/kessel
+          KESSEL_REQUIRE_SIGNING: "1"
           KESSEL_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -99,9 +100,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # WINDOWS_CERT_PFX_BASE64 is the base64 of the .pfx file. When it is
-      # set, the packaging script must sign (it fails the job otherwise);
-      # without it the build is unsigned, with a warning.
+      # WINDOWS_CERT_PFX_BASE64 is the base64 of the .pfx file. Releases must
+      # be signed: without it or WINDOWS_CERT_THUMBPRINT the packaging script
+      # fails the job.
       - name: Write the signing certificate
         shell: pwsh
         env:
@@ -115,6 +116,7 @@ jobs:
       - name: Build, sign and package
         shell: pwsh
         env:
+          KESSEL_REQUIRE_SIGNING: "1"
           KESSEL_WIN_CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
           KESSEL_WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: scripts/package-windows.ps1

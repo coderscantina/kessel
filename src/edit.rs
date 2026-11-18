@@ -325,6 +325,11 @@ impl Session {
     /// Download the remote file into a fresh per-process folder and record
     /// the sync point.
     async fn open(provider: Provider, remote_path: String, name: String, queue: QueueHandle) -> Result<Self> {
+        anyhow::ensure!(
+            is_plain_file_name(&name, cfg!(windows)),
+            "{}",
+            tf("edit.unsafe_name", &[("name", &name)])
+        );
         let dir = std::env::temp_dir()
             .join("kessel-edit")
             .join(std::process::id().to_string())
@@ -664,6 +669,17 @@ fn parent_of(path: &str) -> String {
     }
 }
 
+/// Whether a name coming from a server is one plain path component, so that
+/// joining it onto the edit folder stays inside that folder. Separators of
+/// every platform count. Windows also reads `C:x` as a drive path and `a:b` as
+/// a stream of `a`, and drops trailing dots and spaces, which turns `.. ` into
+/// the parent folder.
+fn is_plain_file_name(name: &str, windows: bool) -> bool {
+    !matches!(name, "" | "." | "..")
+        && !name.contains(['/', '\\', '\0'])
+        && !(windows && (name.contains(':') || name.ends_with(['.', ' '])))
+}
+
 /// Tiny stable hash for temp dir names (no extra dependency).
 fn fxhash(s: &str) -> u64 {
     s.bytes()
@@ -682,6 +698,21 @@ mod tests {
         let guard = CHANNELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while subscribe_notices().try_recv().is_ok() {}
         guard
+    }
+
+    #[test]
+    fn only_a_single_plain_name_may_become_the_edit_file() {
+        for name in ["notes.txt", ".env", "a b.txt", "12:30.txt"] {
+            assert!(is_plain_file_name(name, false), "{name}");
+        }
+        for name in ["", ".", "..", "../x", "a/b", "..\\..\\x", "C:\\path\\x", "a\0b"] {
+            assert!(!is_plain_file_name(name, false), "{name}");
+            assert!(!is_plain_file_name(name, true), "{name}");
+        }
+        for name in ["C:x", "notes.txt:stream", ".. ", "..."] {
+            assert!(!is_plain_file_name(name, true), "{name}");
+        }
+        assert!(is_plain_file_name("notes.txt", true));
     }
 
     /// A queue and a local-filesystem provider standing in for a remote,

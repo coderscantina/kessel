@@ -175,6 +175,7 @@
   "sync.confirm.start": "{count} löschen und starten",
   "sync.confirm.back": "Zurück",
   "sync.report.skipped": "{count} Element(e) blieben unberührt, weil sie sich nach der Prüfung geändert haben.",
+  "edit.unsafe_name": "„{name}“ kann nicht bearbeitet werden, weil der Name kein gültiger lokaler Dateiname ist.",
   "edit.saved": "{name} auf {site} gespeichert.",
   "edit.failed": "{name} konnte nicht auf {site} gespeichert werden: {reason} Die lokale Kopie bleibt erhalten.",
   "edit.retry": "Erneut versuchen",
@@ -229,7 +230,7 @@
   // Sites, die noch von Übertragungen genutzt werden.
   "site.busy.title": "Site wird noch verwendet",
   "site.busy.delete": "Übertragungen nutzen diese Site noch (offen: {jobs}). Löschen würde sie entfernen. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
-  "site.busy.edit": "Übertragungen nutzen diese Site noch (offen: {jobs}), deshalb lassen sich Protokoll, Endpunkt, Stammpfad, Bucket und Container jetzt nicht ändern. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
+  "site.busy.edit": "Übertragungen nutzen diese Site noch (offen: {jobs}), deshalb lassen sich Protokoll, Endpunkt, Stammpfad, Bucket, Container und Konto jetzt nicht ändern. Brich sie ab oder entferne beendete im Übertragungs-Panel, dann versuche es erneut.",
 
   // Import aus anderen Clients.
   "site.import.button": "Importieren…",
@@ -249,6 +250,9 @@
   "sso.hint": "Öffnet dein Identity-Center-Portal; Anfrage bestätigen, dann verbinden.",
 
   // Automatische Updates.
+  "startup.already_running": "kessel läuft bereits. Wechsle zum geöffneten Fenster oder beende kessel, bevor du es erneut startest.",
+  "startup.lock_failed": "kessel konnte nicht prüfen, ob es bereits läuft.",
+
   "update.footer": "Update {version} bereit",
   "update.up_to_date": "Du bist auf dem neuesten Stand.",
   "update.check_failed": "Update-Prüfung fehlgeschlagen — bitte später erneut versuchen.",

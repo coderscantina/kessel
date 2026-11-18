@@ -31,6 +31,10 @@ IDENTITY="${KESSEL_SIGN_IDENTITY:--}"
 [[ -d "$APP" ]] || scripts/bundle.sh release
 
 if [[ "$IDENTITY" == "-" ]]; then
+    if [[ -n "${KESSEL_REQUIRE_SIGNING:-}" ]]; then
+        echo "ERROR: release builds must be signed, but KESSEL_SIGN_IDENTITY is not set." >&2
+        exit 1
+    fi
     echo "WARNING: KESSEL_SIGN_IDENTITY not set — ad-hoc signing (cannot be notarized)." >&2
     SKIP_NOTARIZE=1
 fi

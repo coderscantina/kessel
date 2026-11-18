@@ -52,6 +52,8 @@ pub(crate) struct ClaimedTask {
     pub in_place: bool,
     /// What the destination must still hold when this task writes it.
     pub expected: Option<ExpectedDest>,
+    /// A move recorded its destination as complete before removing the source.
+    pub dst_committed: bool,
 }
 
 /// A file discovered during directory expansion.
@@ -64,6 +66,10 @@ pub(crate) struct NewTask {
 }
 
 pub(crate) async fn get_site(pool: &SqlitePool, site_id: i64) -> Result<SiteProfile> {
+    // The seeded row says `/`; the pane's root is the system drive on Windows.
+    if site_id == super::LOCAL_SITE_ID {
+        return Ok(crate::app::local_profile());
+    }
     let row = sqlx::query(
         "SELECT id, name, scheme, options, layers, secret_handle FROM sites WHERE id = ?",
     )
@@ -282,7 +288,7 @@ fn claim_sql(ids: &str) -> String {
              WHERE j.state = 'active' AND j.id IN ({ids}) \
              ORDER BY j.priority DESC, head.id LIMIT 1) \
          RETURNING id, job_id, src, dst, byte_offset, total_bytes, src_etag, src_modified, partial, in_place, \
-             expected_dest, \
+             expected_dest, dst_committed, \
              COALESCE(conflict_policy, (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) AS conflict_policy, \
              (SELECT move_source FROM transfer_jobs WHERE id = job_id) AS move_source"
     )
@@ -327,6 +333,7 @@ pub(crate) async fn claim_task(
         partial: row.get("partial"),
         in_place: row.get::<i64, _>("in_place") != 0,
         expected,
+        dst_committed: row.get::<i64, _>("dst_committed") != 0,
     }))
 }
 
@@ -383,7 +390,9 @@ pub(crate) async fn complete_task(pool: &SqlitePool, task_id: i64, bytes: u64) -
 }
 
 /// Park a task awaiting a user decision, recording what the destination
-/// held so the prompt can show it.
+/// held so the prompt can show it. The offset resets: whatever the user
+/// decides, the next run has to pass the conflict check again instead of
+/// resuming into a commit.
 pub(crate) async fn park_task_conflict(
     pool: &SqlitePool,
     task_id: i64,
@@ -396,7 +405,7 @@ pub(crate) async fn park_task_conflict(
             "UPDATE transfer_tasks SET state = CASE WHEN {JOB_CANCELLED} THEN 'cancelled' \
              WHEN COALESCE(conflict_policy, \
              (SELECT conflict_policy FROM transfer_jobs WHERE id = job_id)) = ? \
-             THEN 'conflict' ELSE 'queued' END, dst_size = ?, dst_modified = ?, \
+             THEN 'conflict' ELSE 'queued' END, byte_offset = 0, dst_size = ?, dst_modified = ?, \
              updated_at = datetime('now') WHERE id = ?"
         )),
     )
@@ -450,6 +459,17 @@ pub(crate) async fn set_task_dst(pool: &SqlitePool, task_id: i64, dst: &str) -> 
 pub(crate) async fn set_task_partial(pool: &SqlitePool, task_id: i64, partial: Option<&str>) -> Result<()> {
     sqlx::query("UPDATE transfer_tasks SET partial = ? WHERE id = ?")
         .bind(partial)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record whether a move's destination is complete. Set before the source is
+/// removed, so a source found missing later proves the move finished.
+pub(crate) async fn set_task_dst_committed(pool: &SqlitePool, task_id: i64, committed: bool) -> Result<()> {
+    sqlx::query("UPDATE transfer_tasks SET dst_committed = ? WHERE id = ?")
+        .bind(committed)
         .bind(task_id)
         .execute(pool)
         .await?;
@@ -1190,6 +1210,27 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_local_site_uses_the_panes_profile_whatever_its_row_says() {
+        let (pool, _) = prepared_job().await;
+        sqlx::query("UPDATE sites SET options = '{\"root\":\"/elsewhere\"}' WHERE id = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let local = get_site(&pool, super::super::LOCAL_SITE_ID).await.unwrap();
+        assert_eq!(local.options, crate::app::local_profile().options);
+    }
+
+    #[tokio::test]
+    async fn a_parked_conflict_forgets_its_resume_offset() {
+        let (pool, id) = prepared_job().await;
+        let task = claim_task(&pool, &[id]).await.unwrap().unwrap();
+        update_task_offset(&pool, task.id, 2).await.unwrap();
+        park_task_conflict(&pool, task.id, task.conflict_policy, 3, None).await.unwrap();
+        resolve_job_conflicts(&pool, id, ConflictPolicy::Skip).await.unwrap();
+        assert_eq!(claim_task(&pool, &[id]).await.unwrap().unwrap().byte_offset, 0);
     }
 
     #[tokio::test]

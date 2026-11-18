@@ -254,6 +254,49 @@ mod install {
                 .is_ok_and(|output| output.status.success())
         }
 
+        /// The Team ID in `codesign --display` output. Ad-hoc signatures
+        /// report `TeamIdentifier=not set`.
+        pub(super) fn parse_team_id(details: &str) -> Option<&str> {
+            details
+                .lines()
+                .find_map(|line| line.strip_prefix("TeamIdentifier="))
+                .filter(|id| id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        }
+
+        /// The Team ID the bundle is signed with, if any.
+        fn team_id(app: &Path) -> Option<String> {
+            let output = Command::new("codesign")
+                .args(["--display", "--verbose=2"])
+                .arg(app)
+                .output()
+                .ok()?;
+            parse_team_id(&String::from_utf8_lossy(&output.stderr)).map(str::to_string)
+        }
+
+        /// Whether the bundle verifies and chains to Apple for this team. A
+        /// self-made certificate can claim any Team ID, so the requirement
+        /// asks for Apple's anchor too.
+        pub(super) fn signed_by_team(app: &Path, team: &str) -> bool {
+            Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(format!(
+                    "-R=anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+                ))
+                .arg(app)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }
+
+        /// Holding the update to the standard of the running build: a build
+        /// signed by a team only accepts that team's bundles, an ad-hoc signed
+        /// one any valid signature, an unsigned dev build anything.
+        fn update_acceptable(running: &Path, update: &Path) -> bool {
+            match team_id(running) {
+                Some(team) => signed_by_team(update, &team),
+                None => !signature_valid(running) || signature_valid(update),
+            }
+        }
+
         /// Nothing to sweep: the bundle swap removes its own backup.
         pub fn sweep_leftovers() {}
 
@@ -331,9 +374,7 @@ mod install {
                 bail!("ditto failed to copy the new app bundle");
             }
 
-            // Holding the update to the standard of the running build: a signed
-            // install only accepts a bundle whose signature verifies.
-            if signature_valid(target_app) && !signature_valid(&staging) {
+            if !update_acceptable(target_app, &staging) {
                 let _ = std::fs::remove_dir_all(&staging);
                 bail!("the downloaded app's code signature is invalid");
             }
@@ -402,8 +443,8 @@ mod install {
             let staging = dir.join(format!(".kessel-new-{pid}-{name}"));
             let _ = std::fs::remove_file(&staging);
             std::fs::copy(artifact, &staging).context("staging the new executable")?;
-            // A signed install only accepts a download whose signature verifies.
-            if signature_valid(&exe) && !signature_valid(&staging) {
+            // A signed install only accepts a download from the same signer.
+            if signer(&exe).is_some_and(|running| signer(&staging).as_ref() != Some(&running)) {
                 let _ = std::fs::remove_file(&staging);
                 bail!("the downloaded executable's Authenticode signature is invalid");
             }
@@ -420,17 +461,22 @@ mod install {
             Ok(InstallOutcome::ReadyToRelaunch { app_path: exe })
         }
 
-        /// Whether PowerShell reports a valid Authenticode signature.
-        fn signature_valid(exe: &Path) -> bool {
-            Command::new("powershell")
+        /// The certificate subject of a valid Authenticode signature. The
+        /// subject rather than the thumbprint, so renewing the certificate
+        /// doesn't lock existing installs out of updates.
+        fn signer(exe: &Path) -> Option<String> {
+            let output = Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
-                    "if ((Get-AuthenticodeSignature -LiteralPath $env:KESSEL_EXE).Status -eq 'Valid') { exit 0 } else { exit 1 }",
+                    "$s = Get-AuthenticodeSignature -LiteralPath $env:KESSEL_EXE; \
+                     if ($s.Status -eq 'Valid') { $s.SignerCertificate.Subject } else { exit 1 }",
                 ])
                 .env("KESSEL_EXE", exe)
                 .output()
-                .is_ok_and(|output| output.status.success())
+                .ok()?;
+            let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (output.status.success() && !subject.is_empty()).then_some(subject)
         }
 
         /// Start the freshly installed executable. The caller quits the current
@@ -493,6 +539,36 @@ mod install {
     }
 
     pub use imp::{install, relaunch, sweep_leftovers};
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::imp::{parse_team_id, signed_by_team};
+        use std::process::Command;
+
+        #[test]
+        fn only_a_real_team_id_counts() {
+            assert_eq!(parse_team_id("Identifier=x\nTeamIdentifier=ABCDE12345\n"), Some("ABCDE12345"));
+            assert_eq!(parse_team_id("Signature=adhoc\nTeamIdentifier=not set\n"), None);
+            assert_eq!(parse_team_id("code object is not signed at all"), None);
+        }
+
+        #[test]
+        fn an_ad_hoc_signature_does_not_pass_for_a_team() {
+            let dir = std::env::temp_dir().join(format!("kessel-adhoc-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let binary = dir.join("adhoc");
+            std::fs::copy("/usr/bin/true", &binary).unwrap();
+            let signed = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(signed.status.success(), "{}", String::from_utf8_lossy(&signed.stderr));
+
+            assert!(!signed_by_team(&binary, "ABCDE12345"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 #[cfg(test)]

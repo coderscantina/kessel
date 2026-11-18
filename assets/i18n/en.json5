@@ -183,6 +183,7 @@
   "sync.confirm.start": "Delete {count} and start",
   "sync.confirm.back": "Back",
   "sync.report.skipped": "{count} item(s) were left alone because they changed after the review.",
+  "edit.unsafe_name": "“{name}” can't be edited because its name isn't a valid local file name.",
   "edit.saved": "Saved {name} to {site}.",
   "edit.failed": "Couldn't save {name} to {site}: {reason} Your local copy is kept.",
   "edit.retry": "Retry",
@@ -239,7 +240,7 @@
   // Sites in use by transfer jobs.
   "site.busy.title": "Site is still in use",
   "site.busy.delete": "Transfer jobs still use this site (open: {jobs}). Deleting it would remove them. Cancel them or clear finished ones in the Transfers panel, then try again.",
-  "site.busy.edit": "Transfer jobs still use this site (open: {jobs}), so its protocol, endpoint, root, bucket and container can't change now. Cancel them or clear finished ones in the Transfers panel, then try again.",
+  "site.busy.edit": "Transfer jobs still use this site (open: {jobs}), so its protocol, endpoint, root, bucket, container and account can't change now. Cancel them or clear finished ones in the Transfers panel, then try again.",
 
   // Import from other clients.
   "site.import.button": "Import…",
@@ -257,6 +258,9 @@
   "sso.waiting": "Waiting for AWS sign-in in the browser…",
   "sso.signed_in": "Signed in — a temporary session is cached for this profile.",
   "sso.hint": "Opens your Identity Center portal; approve the request, then connect.",
+
+  "startup.already_running": "kessel is already running. Switch to the open window, or quit it before starting kessel again.",
+  "startup.lock_failed": "kessel could not check whether it is already running.",
 
   // Auto-update.
   "update.footer": "Update {version} ready",
