@@ -161,7 +161,7 @@
   "sync.needs_split": "Synchronization compares the two panes of a split layout — switch to a split view first.",
 
   // Sync and editing.
-  "sync.rule": "Files are compared by modified time (2 s tolerance), then size. Files newer at the destination, and matches that can't be proven, stay unticked.",
+  "sync.rule": "Files are compared by modified time (2 s tolerance), then size. Files newer at the destination, and matches that can't be proven, and deletions stay unticked.",
   "sync.kind.copy": "New",
   "sync.kind.update": "Changed",
   "sync.kind.dest_newer": "Newer at the destination",
@@ -176,6 +176,13 @@
   "sync.report.partial": "Sync finished with {failed} failure(s): {reason}",
   "sync.report.deletes_skipped": "Nothing was deleted because not every file was copied.",
   "sync.report.failed": "Sync failed: {reason}",
+  "sync.kind.conflict": "File, folder or link clash (resolve by hand)",
+  "sync.plan.conflict": "conflict",
+  "sync.overlap": "Source and destination overlap. Pick two folders where neither contains the other.",
+  "sync.confirm.body": "{count} item(s) will be permanently deleted from {site}. This can't be undone.",
+  "sync.confirm.start": "Delete {count} and start",
+  "sync.confirm.back": "Back",
+  "sync.report.skipped": "{count} item(s) were left alone because they changed after the review.",
   "edit.saved": "Saved {name} to {site}.",
   "edit.failed": "Couldn't save {name} to {site}: {reason} Your local copy is kept; save again to retry.",
 

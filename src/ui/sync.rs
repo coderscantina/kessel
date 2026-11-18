@@ -4,7 +4,7 @@
 
 use gpui::prelude::*;
 use gpui::{div, px, uniform_list, AnyElement, Context, Entity, Hsla, SharedString, Window};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::{
@@ -40,6 +40,9 @@ struct Review {
     selected: Vec<bool>,
     src: SyncSide,
     dst: SyncSide,
+    /// Start was pressed with deletions ticked; waiting for the user to
+    /// confirm them.
+    confirming_deletes: bool,
 }
 
 impl Review {
@@ -54,6 +57,7 @@ impl Review {
             selected,
             src,
             dst,
+            confirming_deletes: false,
         }
     }
 
@@ -65,6 +69,10 @@ impl Review {
             .zip(&self.selected)
             .filter(|(item, _)| item.kind == kind)
             .fold((0, 0), |(on, total), (_, selected)| (on + usize::from(*selected), total + 1))
+    }
+
+    fn selected_deletes(&self) -> usize {
+        self.tally(PlanKind::Delete).0
     }
 
     fn set_kind(&mut self, kind: PlanKind, on: bool) {
@@ -215,6 +223,18 @@ impl SyncDialog {
         .detach();
     }
 
+    /// Start the selection, first asking for confirmation when it deletes.
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let State::Planned(review) = &mut self.state {
+            if review.selected_deletes() > 0 && !review.confirming_deletes {
+                review.confirming_deletes = true;
+                cx.notify();
+                return;
+            }
+        }
+        self.apply(window, cx);
+    }
+
     /// Run the reviewed selection in the background and report the outcome
     /// as a notification once the copies settled and deletes ran.
     fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -268,6 +288,19 @@ impl SyncDialog {
                 .child(t("sync.in_sync"))
                 .into_any_element();
         }
+        if review.confirming_deletes {
+            return div()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(tf(
+                    "sync.confirm.body",
+                    &[
+                        ("count", &review.selected_deletes().to_string()),
+                        ("site", &side_name(&review.dst)),
+                    ],
+                ))
+                .into_any_element();
+        }
 
         let kinds = PlanKind::ALL.into_iter().filter_map(|kind| {
             let (on, total) = review.tally(kind);
@@ -280,6 +313,7 @@ impl SyncDialog {
                     .child(
                         Checkbox::new(("sync-kind", kind as usize))
                             .checked(on == total)
+                            .disabled(kind == PlanKind::Conflict)
                             .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                                 if let State::Planned(review) = &mut this.state {
                                     review.set_kind(kind, *checked);
@@ -359,6 +393,7 @@ fn render_row(review: &Review, ix: usize, cx: &mut Context<SyncDialog>) -> AnyEl
         .child(
             Checkbox::new(("sync-item", ix))
                 .checked(review.selected[ix])
+                .disabled(item.kind == PlanKind::Conflict)
                 .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                     if let State::Planned(review) = &mut this.state {
                         review.selected[ix] = *checked;
@@ -380,7 +415,7 @@ fn render_row(review: &Review, ix: usize, cx: &mut Context<SyncDialog>) -> AnyEl
                 .truncate()
                 .child(SharedString::from(item.rel.clone())),
         )
-        .when(!item.is_dir && item.kind != PlanKind::Delete, |el| {
+        .when(!item.is_dir && !matches!(item.kind, PlanKind::Delete | PlanKind::Conflict), |el| {
             el.child(div().text_color(muted).child(human_size(item.size)))
         })
         .into_any_element()
@@ -393,6 +428,7 @@ fn kind_color(kind: PlanKind, theme: &Theme) -> Hsla {
         PlanKind::DestNewer => theme.warning,
         PlanKind::Unsure => theme.muted_foreground,
         PlanKind::Delete => theme.danger,
+        PlanKind::Conflict => theme.warning,
     }
 }
 
@@ -403,6 +439,7 @@ fn kind_label(kind: PlanKind) -> SharedString {
         PlanKind::DestNewer => "sync.kind.dest_newer",
         PlanKind::Unsure => "sync.kind.unsure",
         PlanKind::Delete => "sync.kind.delete",
+        PlanKind::Conflict => "sync.kind.conflict",
     })
 }
 
@@ -413,6 +450,7 @@ fn row_tag(kind: PlanKind) -> SharedString {
         PlanKind::DestNewer => "sync.plan.dest_newer",
         PlanKind::Unsure => "sync.plan.unsure",
         PlanKind::Delete => "sync.plan.delete",
+        PlanKind::Conflict => "sync.plan.conflict",
     })
 }
 
@@ -432,6 +470,10 @@ fn report_message(report: &SyncReport) -> String {
         (0, Some(_)) => tf("sync.report.failed", &args).to_string(),
         _ => tf("sync.report.partial", &args).to_string(),
     };
+    if report.skipped > 0 {
+        message.push(' ');
+        message.push_str(&tf("sync.report.skipped", &[("count", &report.skipped.to_string())]));
+    }
     if report.deletes_skipped {
         message.push(' ');
         message.push_str(&t("sync.report.deletes_skipped"));
@@ -479,6 +521,10 @@ impl Render for SyncDialog {
 
         let can_start = matches!(&self.state, State::Planned(review) if review.any_selected());
         let planning = matches!(self.state, State::Planning);
+        let confirm_count = match &self.state {
+            State::Planned(review) if review.confirming_deletes => Some(review.selected_deletes()),
+            _ => None,
+        };
 
         v_flex()
             .gap_3()
@@ -495,23 +541,46 @@ impl Render for SyncDialog {
                 h_flex()
                     .gap_2()
                     .justify_end()
-                    .child(
-                        Button::new("sync-analyze")
-                            .label(t("sync.analyze"))
-                            .outline()
-                            .small()
-                            .loading(planning)
-                            .disabled(planning)
-                            .on_click(cx.listener(|this, _, _, cx| this.analyze(cx))),
-                    )
+                    .when(confirm_count.is_some(), |row| {
+                        row.child(
+                            Button::new("sync-confirm-back")
+                                .label(t("sync.confirm.back"))
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let State::Planned(review) = &mut this.state {
+                                        review.confirming_deletes = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
+                    .when(confirm_count.is_none(), |row| {
+                        row.child(
+                            Button::new("sync-analyze")
+                                .label(t("sync.analyze"))
+                                .outline()
+                                .small()
+                                .loading(planning)
+                                .disabled(planning)
+                                .on_click(cx.listener(|this, _, _, cx| this.analyze(cx))),
+                        )
+                    })
                     .child(
                         Button::new("sync-start")
-                            .label(t("sync.start"))
-                            .primary()
+                            .label(match confirm_count {
+                                Some(count) => tf("sync.confirm.start", &[("count", &count.to_string())]),
+                                None => t("sync.start"),
+                            })
+                            .with_variant(if confirm_count.is_some() {
+                                ButtonVariant::Danger
+                            } else {
+                                ButtonVariant::Primary
+                            })
                             .small()
                             .disabled(!can_start)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply(window, cx);
+                                this.start(window, cx);
                             })),
                     ),
             )

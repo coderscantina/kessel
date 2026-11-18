@@ -153,7 +153,7 @@
   "sync.needs_split": "Die Synchronisierung vergleicht die beiden Ansichten eines geteilten Layouts — bitte zuerst teilen.",
 
   // Sync and editing.
-  "sync.rule": "Dateien werden nach Änderungszeit (2 s Toleranz), dann Größe verglichen. Am Ziel neuere Dateien und nicht belegbare Übereinstimmungen bleiben abgewählt.",
+  "sync.rule": "Dateien werden nach Änderungszeit (2 s Toleranz), dann Größe verglichen. Am Ziel neuere Dateien und nicht belegbare Übereinstimmungen sowie Löschungen bleiben abgewählt.",
   "sync.kind.copy": "Neu",
   "sync.kind.update": "Geändert",
   "sync.kind.dest_newer": "Am Ziel neuer",
@@ -168,6 +168,13 @@
   "sync.report.partial": "Synchronisierung mit {failed} Fehler(n) beendet: {reason}",
   "sync.report.deletes_skipped": "Es wurde nichts gelöscht, weil nicht alle Dateien kopiert wurden.",
   "sync.report.failed": "Synchronisierung fehlgeschlagen: {reason}",
+  "sync.kind.conflict": "Datei, Ordner oder Link im Konflikt (von Hand lösen)",
+  "sync.plan.conflict": "Konflikt",
+  "sync.overlap": "Quelle und Ziel überschneiden sich. Wähle zwei Ordner, von denen keiner den anderen enthält.",
+  "sync.confirm.body": "{count} Element(e) werden endgültig von {site} gelöscht. Das lässt sich nicht rückgängig machen.",
+  "sync.confirm.start": "{count} löschen und starten",
+  "sync.confirm.back": "Zurück",
+  "sync.report.skipped": "{count} Element(e) blieben unberührt, weil sie sich nach der Prüfung geändert haben.",
   "edit.saved": "{name} auf {site} gespeichert.",
   "edit.failed": "{name} konnte nicht auf {site} gespeichert werden: {reason} Die lokale Kopie bleibt erhalten; zum erneuten Versuch noch einmal speichern.",
 
