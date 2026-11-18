@@ -2127,14 +2127,31 @@ impl KesselApp {
     }
 
     /// Bookmark click: focus its pinned tab in the current space, opening it
-    /// first if needed. Never adds a row to the ephemeral tab list.
+    /// first if needed. Never adds a row to the ephemeral tab list. An imported
+    /// site still missing its credentials opens the site editor instead.
     fn open_bookmark(&mut self, site_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(uid) = self.bookmark_tab(site_id) {
             self.activate_tab(uid, cx);
             return;
         }
-        let profile = self.profile_for(Some(site_id), cx);
-        self.open_tab_with(profile, String::new(), Some(site_id), window, cx);
+        let state = cx.global::<AppState>();
+        let pool = state.db.clone();
+        let task = state
+            .runtime
+            .spawn(async move { db::sites_needing_credentials(&pool).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let needs_credentials = matches!(task.await, Ok(Ok(ids)) if ids.contains(&site_id));
+            this.update_in(cx, |this, window, cx| {
+                if needs_credentials {
+                    this.edit_site(site_id, window, cx);
+                } else {
+                    let profile = this.profile_for(Some(site_id), cx);
+                    this.open_tab_with(profile, String::new(), Some(site_id), window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Await a DB task returning the fresh site list and sync it into the
@@ -4429,6 +4446,7 @@ mod drag_out_tests {
             state,
             error: error.map(str::to_string),
             files_done: 3,
+            files_skipped: 0,
             files_failed,
         };
         assert!(promise_result(&outcome(JobState::Done, 0, None)).is_ok());
