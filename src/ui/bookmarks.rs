@@ -782,8 +782,13 @@ impl BookmarkManager {
             .site_id
             .filter(|_| Self::keeps_stored_secret(editor))
             .map(SecretStore::handle_for_site);
+        let site_id = editor.site_id;
+        let pool = cx.global::<AppState>().db.clone();
 
         let task = cx.global::<AppState>().runtime.spawn(async move {
+            if let Some(site_id) = site_id {
+                db::ensure_site_idle(&pool, site_id).await?;
+            }
             let mut secret = client_secret;
             if secret.is_empty() {
                 if let Some(handle) = stored_handle {
@@ -1835,6 +1840,10 @@ async fn save_site(
     match site_id {
         Some(id) => {
             db::ensure_site_retargetable(&pool, id, &form.scheme, &form.options).await?;
+            // A new sign-in can be another account, which no option shows.
+            if form.secrets.contains_key("refresh_token") {
+                db::ensure_site_idle(&pool, id).await?;
+            }
             update_existing(&pool, id, &form, had_secret, keep_stored, promote).await?;
         }
         None => insert_new(&pool, &form).await?,

@@ -555,6 +555,12 @@ pub async fn ensure_site_retargetable(
     if !retargets_site(pool, site_id, scheme, options).await? {
         return Ok(());
     }
+    ensure_site_idle(pool, site_id).await
+}
+
+/// Refuse a change no site option shows, like signing a cloud drive bookmark
+/// in to another account: a paused job would resume against that account.
+pub async fn ensure_site_idle(pool: &SqlitePool, site_id: i64) -> Result<()> {
     let jobs = open_job_count(pool, site_id).await?;
     if jobs > 0 {
         return Err(SiteBusy::Edit(jobs).into());
@@ -751,6 +757,23 @@ mod tests {
             sqlx::query("DELETE FROM transfer_jobs").execute(&pool).await.unwrap();
             options.insert("user".to_string(), "anna".to_string());
             ensure_site_retargetable(&pool, site, "sftp", &options).await.unwrap();
+            pool.close().await;
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_site_with_open_jobs_is_not_idle() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (pool, site, dir) = site_with_job("idle", Some("paused")).await;
+            let error = ensure_site_idle(&pool, site).await.unwrap_err();
+            assert!(matches!(error.downcast_ref::<SiteBusy>(), Some(SiteBusy::Edit(1))));
+
+            sqlx::query("UPDATE transfer_jobs SET state = 'done', files_failed = 0")
+                .execute(&pool)
+                .await
+                .unwrap();
+            ensure_site_idle(&pool, site).await.unwrap();
             pool.close().await;
             std::fs::remove_dir_all(&dir).unwrap();
         });
