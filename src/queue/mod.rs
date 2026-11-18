@@ -417,14 +417,6 @@ impl QueueHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("the transfer queue has stopped"))?
     }
-    /// Wait until the job reaches a terminal state. Prefer [`Self::settled`],
-    /// which also carries the error; this reports an unknown job or a
-    /// stopped engine as `Cancelled`.
-    pub async fn wait_terminal(&self, job_id: i64) -> JobState {
-        self.settled(job_id)
-            .await
-            .map_or(JobState::Cancelled, |outcome| outcome.state)
-    }
     pub fn pause(&self, job_id: i64) {
         let _ = self.cmds.send(Command::Pause(job_id));
     }
