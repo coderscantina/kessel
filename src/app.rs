@@ -35,7 +35,7 @@ use sqlx::SqlitePool;
 use crate::config::KesselConfig;
 use crate::db::{self, BookmarkFolder, OpenTabRow, Space};
 use crate::provider::{LayerConfig, SiteProfile};
-use crate::queue::{ConflictPolicy, JobState, NewJob, LOCAL_SITE_ID};
+use crate::queue::{ConflictPolicy, JobOutcome, JobState, NewJob, LOCAL_SITE_ID};
 use crate::i18n::{t, tf};
 use crate::ui::bookmarks::{BookmarkEvent, BookmarkManager};
 use crate::bookmarks::QUICK_CONNECT_SPACE;
@@ -55,6 +55,8 @@ actions!(
         PrevTab,
         ToggleSidebar,
         ToggleTransfers,
+        ShowTransfers,
+        FocusTransfers,
         ToggleLogs,
         LayoutSingle,
         LayoutSplitH,
@@ -1017,6 +1019,21 @@ impl KesselApp {
         self.toggle_bottom(BottomPanel::Transfers, cx);
     }
 
+    /// Open the queue without moving the keyboard: where every "queued" note
+    /// leads, whichever way the transfer was started.
+    fn on_show_transfers(&mut self, _: &ShowTransfers, _: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        cx.notify();
+    }
+
+    /// Open the queue and give it the keyboard.
+    fn on_focus_transfers(&mut self, _: &FocusTransfers, window: &mut Window, cx: &mut Context<Self>) {
+        self.bottom_dock = Some(BottomPanel::Transfers);
+        let focus = self.transfers.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn on_toggle_logs(&mut self, _: &ToggleLogs, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_bottom(BottomPanel::Logs, cx);
     }
@@ -1654,6 +1671,10 @@ impl KesselApp {
             TransfersRequest::ShowInPane { site_id, dir } => {
                 self.show_in_pane(*site_id, dir.clone(), window, cx);
             }
+            TransfersRequest::ReturnToPane => {
+                self.pending_pane_focus = true;
+                cx.notify();
+            }
         }
     }
 
@@ -1967,9 +1988,6 @@ impl KesselApp {
         src_pane
             .clone()
             .update(cx, |pane, cx| pane.submit_jobs(jobs, window, cx));
-        // Surface the queue right where the work was kicked off.
-        self.bottom_dock = Some(BottomPanel::Transfers);
-        cx.notify();
     }
 
     // --- panel size persistence ---
@@ -2404,6 +2422,8 @@ impl KesselApp {
         } else {
             Some(panel)
         };
+        // A closing panel may hold the keyboard; hand it back to the files.
+        self.pending_pane_focus |= self.bottom_dock.is_none();
         cx.notify();
     }
 
@@ -2451,6 +2471,7 @@ impl KesselApp {
                             .tooltip(t("dock.close"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.bottom_dock = None;
+                                this.pending_pane_focus = true;
                                 cx.notify();
                             })),
                     ),
@@ -3923,6 +3944,18 @@ impl KesselApp {
     }
 }
 
+/// A drag-out promise succeeded only if every file arrived: a folder job can
+/// settle as `Done` with some of its files failed.
+fn promise_result(outcome: &JobOutcome) -> anyhow::Result<()> {
+    if outcome.state == JobState::Done && outcome.files_failed == 0 {
+        return Ok(());
+    }
+    Err(match &outcome.error {
+        Some(error) => anyhow::anyhow!(error.clone()),
+        None => anyhow::anyhow!("transfer {}", outcome.state.as_str()),
+    })
+}
+
 /// Promote an in-flight internal row drag to a native OS drag session —
 /// gpui has no outbound drag support, so once the pointer leaves the window
 /// the gpui drag is stopped and the still-held gesture is handed to the
@@ -3949,17 +3982,20 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
         .collect();
 
     let site_id = drag.site_id;
+    let sites = state.sites.clone();
     let sources: Vec<String> = drag.entries.iter().map(|entry| entry.path.clone()).collect();
     let fulfill: crate::dragout::FulfillFn = Box::new(move |ix, dest| {
         use anyhow::Context as _;
         let src = sources.get(ix).context("unknown drag item")?.clone();
         let dir = dest.parent().context("promise destination has no parent")?;
         let name = dest.file_name().context("promise destination has no name")?;
+        let (dst_site_id, dst_dir) = crate::localfs::locate(&sites, dir, true)
+            .context("no local site covers the drop destination")?;
         let job = NewJob {
             src_site_id: site_id,
-            dst_site_id: LOCAL_SITE_ID,
+            dst_site_id,
             src,
-            dst_dir: crate::ui::file_pane::local_dir_path(dir),
+            dst_dir,
             dst_name: Some(name.to_string_lossy().to_string()),
             // The destination already chose the final (unique) name; never
             // park a promise on a conflict prompt.
@@ -3972,21 +4008,7 @@ fn promote_drag_out(drag: DraggedRowEntries, window: &mut Window, cx: &mut App) 
                 .enqueue_tracked(job)
                 .await
                 .map_err(|_| anyhow::anyhow!("transfer was rejected"))?;
-            match queue.wait_terminal(job_id).await {
-                JobState::Done => Ok(()),
-                state => {
-                    let detail = queue
-                        .latest()
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == job_id)
-                        .and_then(|job| job.error.clone());
-                    Err(match detail {
-                        Some(error) => anyhow::anyhow!(error),
-                        None => anyhow::anyhow!("transfer {}", state.as_str()),
-                    })
-                }
-            }
+            promise_result(&queue.settled(job_id).await?)
         })
     });
 
@@ -4028,10 +4050,14 @@ impl Render for KesselApp {
             window.focus(&focus, cx);
         }
         // Keyboard shortcuts must work everywhere: when nothing holds focus
-        // (empty space, freshly closed dialog), park it on the workspace so
-        // Workspace-context bindings (quit, tabs, panels) keep firing.
+        // (empty space, a dialog that opened with nothing focused), park it
+        // on the active pane, or the workspace when no pane is showing.
         if window.focused(cx).is_none() && self.rename.is_none() {
-            window.focus(&self.focus_handle, cx);
+            let focus = match self.active_tab().map(|tab| &tab.content) {
+                Some(TabContent::Panes(workspace)) => workspace.panes[workspace.active].focus_handle(cx),
+                _ => self.focus_handle.clone(),
+            };
+            window.focus(&focus, cx);
         }
 
         // Where the OS draws no menu bar, kessel draws one in its title bar.
@@ -4143,6 +4169,8 @@ impl Render for KesselApp {
             .on_action(cx.listener(Self::on_layout_split_v))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_transfers))
+            .on_action(cx.listener(Self::on_show_transfers))
+            .on_action(cx.listener(Self::on_focus_transfers))
             .on_action(cx.listener(Self::on_toggle_logs))
             .on_action(cx.listener(Self::on_open_bookmarks))
             .on_action(cx.listener(Self::on_about))
@@ -4388,5 +4416,24 @@ mod linked_browsing_tests {
         assert_eq!(linked_directory("a/b/", "a/", "www/"), Some("".into()));
         assert_eq!(linked_directory("a/b/", "", "www/"), None);
         assert_eq!(linked_directory("project/", "project/../private/", "www/"), None);
+    }
+}
+
+#[cfg(test)]
+mod drag_out_tests {
+    use super::*;
+
+    #[test]
+    fn a_promise_fails_when_any_file_failed() {
+        let outcome = |state, files_failed, error: Option<&str>| JobOutcome {
+            state,
+            error: error.map(str::to_string),
+            files_done: 3,
+            files_failed,
+        };
+        assert!(promise_result(&outcome(JobState::Done, 0, None)).is_ok());
+        let partial = promise_result(&outcome(JobState::Done, 2, Some("2 files failed"))).unwrap_err();
+        assert_eq!(partial.to_string(), "2 files failed");
+        assert!(promise_result(&outcome(JobState::Cancelled, 0, None)).is_err());
     }
 }
