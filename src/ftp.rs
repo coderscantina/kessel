@@ -161,6 +161,10 @@ pub(crate) mod test_server {
     struct Tree {
         files: BTreeMap<String, Vec<u8>>,
         dirs: BTreeSet<String>,
+        /// `(folder, name)` pairs `LIST` reports without any file behind them.
+        listed: Vec<(String, String)>,
+        /// `RNTO` renames, then drops the connection instead of answering.
+        lose_rename_replies: bool,
     }
 
     #[derive(Clone)]
@@ -186,6 +190,15 @@ pub(crate) mod test_server {
 
         pub fn put(&self, path: &str, content: &[u8]) {
             self.tree.lock().unwrap().files.insert(path.to_string(), content.to_vec());
+        }
+
+        /// Make `LIST` of `dir` report `name` verbatim, as a hostile server would.
+        pub fn list_raw(&self, dir: &str, name: &str) {
+            self.tree.lock().unwrap().listed.push((dir.to_string(), name.to_string()));
+        }
+
+        pub fn lose_rename_replies(&self) {
+            self.tree.lock().unwrap().lose_rename_replies = true;
         }
 
         pub fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -230,6 +243,14 @@ pub(crate) mod test_server {
                         Some(_) => "250 deleted".to_string(),
                         None => "550 not found".to_string(),
                     },
+                    "SIZE" => match self.read(&path) {
+                        Some(content) => format!("213 {}", content.len()),
+                        None => "550 not found".to_string(),
+                    },
+                    "MDTM" => match self.read(&path) {
+                        Some(_) => "213 20260101120000".to_string(),
+                        None => "550 not found".to_string(),
+                    },
                     "RNFR" if self.tree.lock().unwrap().files.contains_key(&path) => {
                         rename_from = path;
                         "350 go on".to_string()
@@ -239,6 +260,9 @@ pub(crate) mod test_server {
                         let mut tree = self.tree.lock().unwrap();
                         let content = tree.files.remove(&rename_from)?;
                         tree.files.insert(path, content);
+                        if tree.lose_rename_replies {
+                            return None;
+                        }
                         "250 renamed".to_string()
                     }
                     "LIST" | "STOR" | "APPE" | "RETR" => {
@@ -287,7 +311,12 @@ pub(crate) mod test_server {
                 .dirs
                 .iter()
                 .filter_map(|path| child(path).map(|name| format!("drwxr-xr-x 1 o g 0 Jan 01 12:00 {name}\r\n")));
-            files.chain(dirs).collect()
+            let raw = tree
+                .listed
+                .iter()
+                .filter(|(listed, _)| listed == dir)
+                .map(|(_, name)| format!("-rw-r--r-- 1 o g 1 Jan 01 12:00 {name}\r\n"));
+            files.chain(dirs).chain(raw).collect()
         }
     }
 }
@@ -333,6 +362,21 @@ mod tests {
         assert!(op.create_dir(&format!("{EVIL}/")).await.is_err());
 
         assert_eq!(server.names(), ["victim.txt"]);
+    }
+
+    #[tokio::test]
+    async fn stat_finds_a_file_the_listing_hides() {
+        let server = test_server::FakeFtp::start();
+        server.put("www/.htaccess", b"deny");
+        let options = HashMap::from([("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))]);
+        let op = opendal::Operator::via_iter("ftp", options).unwrap();
+
+        let meta = op.stat("www/.htaccess").await.unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.content_length(), 4);
+        assert!(meta.last_modified().is_some());
+        let missing = op.stat("www/.missing").await.unwrap_err();
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
     }
 
     #[tokio::test]

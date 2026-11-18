@@ -21,12 +21,13 @@ use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use opendal::layers::ThrottleLayer;
 
 use crate::config::TransferConfig;
 use crate::provider::{LayerConfig, Provider};
 
 use super::store::{self, JobRow, NewTask};
+use super::has_dot_segment;
+use super::limiter::RateLimiter;
 use super::transfer::{self, JobControl, Outcome, TransferOpts};
 use super::{Command, JobOutcome, JobState, QueueHandle, QueueSnapshot};
 
@@ -62,7 +63,8 @@ pub fn start(
         max_retries: cfg.retries,
         max_parallel,
         bandwidth_limit: cfg.bandwidth_limit,
-        throttle: global_throttle(cfg.bandwidth_limit),
+        global_limiter: global_limiter(cfg.bandwidth_limit),
+        site_limiters: HashMap::new(),
         verify: cfg.verify,
         preserve_timestamps: cfg.preserve_timestamps,
         skip_hidden: cfg.skip_hidden,
@@ -100,6 +102,9 @@ struct JobProviders {
     /// Each site's connection limit, enforced across all jobs when claiming.
     src_limit: Option<usize>,
     dst_limit: Option<usize>,
+    /// Each site's speed limit in bytes/sec.
+    src_rate: Option<u64>,
+    dst_rate: Option<u64>,
 }
 
 impl JobProviders {
@@ -193,13 +198,8 @@ struct Speed {
 }
 
 /// bytes/sec → one rate limiter shared by every transfer (None = unlimited).
-/// OpenDAL's ThrottleLayer shares its limiter between clones; the burst must
-/// cover the largest single write, one chunk.
-fn global_throttle(bps: u64) -> Option<ThrottleLayer> {
-    (bps > 0).then(|| {
-        let bandwidth = bps.min(u64::from(u32::MAX)) as u32;
-        ThrottleLayer::new(bandwidth, bandwidth.max(transfer::CHUNK as u32))
-    })
+fn global_limiter(bps: u64) -> Option<Arc<RateLimiter>> {
+    (bps > 0).then(|| RateLimiter::new(bps))
 }
 
 struct Engine {
@@ -212,7 +212,9 @@ struct Engine {
     /// Global bandwidth cap for the UI (bytes/sec, 0 = unlimited).
     bandwidth_limit: u64,
     /// The limiter enforcing `bandwidth_limit` across all running transfers.
-    throttle: Option<ThrottleLayer>,
+    global_limiter: Option<Arc<RateLimiter>>,
+    /// One limiter per site with a speed limit, shared by all its transfers.
+    site_limiters: HashMap<i64, Arc<RateLimiter>>,
     /// Post-transfer verification / timestamp preservation / expansion
     /// filtering, from `transfers.*` in the config.
     verify: bool,
@@ -354,17 +356,39 @@ impl Engine {
             in_flight += 1;
             let providers = rt.providers.clone().expect("ready jobs have providers");
             let control = rt.control.clone();
+            let limiters = self.limiters_for(&providers);
             let opts = TransferOpts {
                 same_site: providers.same_site,
                 verify: self.verify,
                 preserve_timestamps: self.preserve_timestamps,
-                throttle: self.throttle.clone(),
+                limiters,
             };
             let pool = self.pool.clone();
             let tx = self.internal_tx.clone();
             tokio::spawn(run_worker(pool, task, providers, control, opts, tx));
         }
         Ok(())
+    }
+
+    /// The limiters a transfer between these sites draws from. A site whose
+    /// limit was edited gets a fresh limiter.
+    fn limiters_for(&mut self, providers: &JobProviders) -> Vec<Arc<RateLimiter>> {
+        let mut limiters: Vec<_> = self.global_limiter.iter().cloned().collect();
+        let dst = (!providers.same_site).then_some((providers.dst.site_id, providers.dst_rate));
+        for (site, rate) in std::iter::once((providers.src.site_id, providers.src_rate)).chain(dst) {
+            let Some(rate) = rate else { continue };
+            let limiter = self
+                .site_limiters
+                .entry(site)
+                .and_modify(|limiter| {
+                    if limiter.rate() != rate {
+                        *limiter = RateLimiter::new(rate);
+                    }
+                })
+                .or_insert_with(|| RateLimiter::new(rate));
+            limiters.push(limiter.clone());
+        }
+        limiters
     }
 
     /// Connections the running tasks of all jobs hold per site: one for each
@@ -476,7 +500,7 @@ impl Engine {
                 // Files started from now on share the new limiter; running
                 // ones finish under the old one.
                 self.bandwidth_limit = bps;
-                self.throttle = global_throttle(bps);
+                self.global_limiter = global_limiter(bps);
             }
             Command::SetTransferSettings {
                 retries,
@@ -808,13 +832,17 @@ async fn prepare_job(
     skip_hidden: bool,
     control: &JobControl,
 ) -> Result<Option<JobProviders>> {
+    let (src_limit, src_rate) = site_limits(pool, job.src_site_id, defaults).await?;
+    let (dst_limit, dst_rate) = site_limits(pool, job.dst_site_id, defaults).await?;
     let providers = JobProviders {
         src: connect_site(pool, job.src_site_id, defaults).await?,
         dst: connect_site(pool, job.dst_site_id, defaults).await?,
         same_site: job.src_site_id == job.dst_site_id,
         move_source: job.move_source,
-        src_limit: site_limit(pool, job.src_site_id, defaults).await?,
-        dst_limit: site_limit(pool, job.dst_site_id, defaults).await?,
+        src_limit,
+        dst_limit,
+        src_rate,
+        dst_rate,
     };
 
     if !job.expanded {
@@ -843,10 +871,16 @@ async fn connect_site(pool: &SqlitePool, site_id: i64, defaults: &LayerConfig) -
     .context("provider connect task panicked")?
 }
 
-/// The connection limit configured for a site, over the app defaults.
-async fn site_limit(pool: &SqlitePool, site_id: i64, defaults: &LayerConfig) -> Result<Option<usize>> {
-    let profile = store::get_site(pool, site_id).await?;
-    Ok(profile.layers.merged_over(defaults).concurrent_limit)
+/// The connection limit and speed limit (bytes/sec) configured for a site,
+/// over the app defaults.
+async fn site_limits(
+    pool: &SqlitePool,
+    site_id: i64,
+    defaults: &LayerConfig,
+) -> Result<(Option<usize>, Option<u64>)> {
+    let layers = store::get_site(pool, site_id).await?.layers.merged_over(defaults);
+    let rate = layers.throttle.map(|throttle| u64::from(throttle.bandwidth)).filter(|rate| *rate > 0);
+    Ok((layers.concurrent_limit, rate))
 }
 
 /// Whether a failed task is worth re-queueing: the error class says the
@@ -926,8 +960,8 @@ async fn delete_path(provider: &Provider, path: &str) -> Result<()> {
 /// while the walk runs, so arbitrarily large trees never sit in memory.
 /// Subdirectories are pre-created at the destination (so empty dirs
 /// survive). Links to files are copied as files; links to folders (which
-/// could form cycles), broken links and special files are recorded as
-/// skipped. Returns false when a pause or cancel stopped the walk early.
+/// could form cycles), broken links, special files and paths with `.` or `..`
+/// segments are recorded as skipped. Returns false when a pause or cancel stopped the walk early.
 async fn expand_job(
     pool: &SqlitePool,
     providers: &JobProviders,
@@ -994,6 +1028,11 @@ async fn expand_job(
             return Ok(false);
         }
         let rel = entry.path().strip_prefix(&src_rel).unwrap_or(entry.path());
+        if has_dot_segment(rel) {
+            let reason = crate::i18n::t("transfers.skipped.unsafe_path");
+            store::insert_skipped(pool, job.id, &format!("{src_dir}{rel}"), &base, &reason).await?;
+            continue;
+        }
         let meta = entry.metadata();
         if meta.is_dir() {
             let (dst_op, dst_rel) = providers.dst.route(&format!("{base}{rel}")).await?;
@@ -1133,7 +1172,7 @@ impl TreeWalk {
                 continue;
             }
             if let TreeWalk::Folders { pending, .. } = self {
-                if entry.metadata().is_dir() {
+                if entry.metadata().is_dir() && !has_dot_segment(rel) {
                     pending.push(entry.path().to_string());
                 }
             }
@@ -2285,6 +2324,62 @@ mod tests {
     }
 
     #[test]
+    fn a_file_larger_than_the_old_burst_completes_under_a_site_limit() {
+        let env = test_env("old-burst");
+        // A row saved by an earlier version still carries a burst.
+        let layers = r#"{"throttle":{"bandwidth":1048576,"burst":65536}}"#;
+        env.rt
+            .block_on(
+                sqlx::query("INSERT INTO sites (id, name, scheme, options, layers) VALUES (3, 'Slow', 'fs', '{\"root\":\"/\"}', ?)")
+                    .bind(layers)
+                    .execute(&env.pool),
+            )
+            .unwrap();
+        let content = vec![7u8; 3 * 1024 * 1024];
+        let src = env.dir.join("big.bin");
+        std::fs::write(&src, &content).unwrap();
+        let out = env.dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let started = std::time::Instant::now();
+        let new_job = NewJob {
+            dst_site_id: 3,
+            ..job(browse(&src), format!("{}/", browse(&out)), ConflictPolicy::Overwrite)
+        };
+        let id = env.rt.block_on(env.handle.submit(new_job)).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done), (JobState::Done, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(out.join("big.bin")).unwrap(), content);
+        // Three 1 MiB steps: the first goes at once, the others wait a second each.
+        assert!(started.elapsed() >= Duration::from_millis(1900), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_listed_path_that_climbs_out_of_the_destination_is_skipped() {
+        let (env, server) = ftp_env("dot-segments", 0);
+        server.put("pub/ok.txt", b"fine");
+        server.list_raw("pub", "../../escape.txt");
+        let out = env.dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let new_job = NewJob {
+            src_site_id: 2,
+            ..job("pub/".to_string(), format!("{}/", browse(&out)), ConflictPolicy::Overwrite)
+        };
+        let id = env.rt.block_on(env.handle.submit(new_job)).unwrap();
+        let outcome = env.rt.block_on(env.handle.settled(id)).unwrap();
+
+        assert_eq!((outcome.state, outcome.files_done, outcome.files_skipped), (JobState::Done, 1, 1), "{:?}", outcome.error);
+        assert_eq!(std::fs::read(out.join("pub/ok.txt")).unwrap(), b"fine");
+        assert!(!env.dir.join("escape.txt").exists());
+        let tasks = env.rt.block_on(store::job_tasks(&env.pool, id, 10)).unwrap();
+        let skipped = tasks.iter().find(|task| task.state == "skipped").unwrap();
+        assert!(skipped.src.ends_with("../../escape.txt"));
+        assert_eq!(skipped.error.as_deref(), Some(crate::i18n::t("transfers.skipped.unsafe_path").as_ref()));
+    }
+
+    #[test]
     fn an_ftp_upload_replaces_the_old_file_through_a_partial() {
         let (env, server) = ftp_env("ftp-replace", 0);
         server.put("up/file.txt", b"old");
@@ -2596,6 +2691,14 @@ mod tests {
         // Marked bytes prove the copy appended to the partial instead of
         // starting over.
         std::fs::write(legacy_partial(&dst, task), [b'X'; 16]).unwrap();
+        // This row was inserted after migrating; real databases recorded the
+        // partial through this backfill.
+        env.rt
+            .block_on(
+                sqlx::raw_sql(include_str!("../../migrations/0014_legacy_task_partials.sql"))
+                    .execute(&env.pool),
+            )
+            .unwrap();
 
         env.handle.resume(job);
         let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
@@ -2628,7 +2731,10 @@ mod tests {
         env.handle.resume(job);
         pause_once_past(&env, job, offset);
         assert_eq!(std::fs::read(&dst).unwrap(), b"OLD");
-        assert_eq!(partials(&dst_dir), vec![legacy_partial(&dst, task)]);
+        // With no recorded partial, the old predictable name isn't assumed to be ours.
+        let staged = partials(&dst_dir);
+        assert_eq!(staged.len(), 1);
+        assert_ne!(staged[0], legacy_partial(&dst, task));
 
         env.handle.resume(job);
         let outcome = env.rt.block_on(env.handle.settled(job)).unwrap();
@@ -2736,6 +2842,8 @@ mod tests {
                 move_source: false,
                 src_limit: None,
                 dst_limit: None,
+                src_rate: None,
+                dst_rate: None,
             };
             // A full walk reports what it found while listing.
             let control = JobControl::default();

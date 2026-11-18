@@ -253,8 +253,8 @@ pub fn ftp_endpoint(host: &str, tls: bool) -> String {
 
 /// Highest per-site connection count the form accepts.
 pub const MAX_CONNECTIONS: usize = 64;
-/// Highest per-site speed limit the form accepts, in KiB/s. Keeps the
-/// throttle's byte rate and burst inside `u32`.
+/// Highest per-site speed limit the form accepts, in KiB/s. Keeps the byte
+/// rate inside `u32`.
 pub const MAX_SPEED_KIB: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,11 +296,7 @@ pub fn apply_limits(
         "" => None,
         text => match text.parse::<u32>() {
             Ok(kib) if (1..=MAX_SPEED_KIB).contains(&kib) => {
-                let bandwidth = kib * 1024;
-                Some(ThrottleConfig {
-                    bandwidth,
-                    burst: (bandwidth * 2).max(2 * 1024 * 1024),
-                })
+                Some(ThrottleConfig { bandwidth: kib * 1024 })
             }
             _ => return Err(LimitError::Speed),
         },

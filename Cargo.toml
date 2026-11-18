@@ -47,7 +47,6 @@ opendal = { version = "0.58", features = [
   "services-gdrive",
   "services-dropbox",
   "services-onedrive",
-  "layers-throttle",
   "layers-tracing",
 ] }
 
@@ -179,6 +178,8 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["block2"] }
 block2 = "0.6"
+# renamex_np, to swap the app bundle atomically during an update.
+libc = "0.2"
 
 # Win32 bindings for the native drag-out session (an OLE data object over the
 # shell's file-promise protocol). Same major gpui already builds against, so

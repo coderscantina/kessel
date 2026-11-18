@@ -1,11 +1,11 @@
 //! One task = one file, streamed source → destination in ranged chunks.
 //!
 //! Safe overwrite: on backends that can rename (local fs, sftp, ftp, …) a
-//! task writes into its own partial file next to the destination
-//! (`.<name>.<task id>.kessel-part`, on FTP a fresh random name, see
-//! [`fresh_ftp_partial`]) and renames it onto the real name only after the
-//! copy finished and verified. The old file stays intact until then. The task
-//! records the partial it owns, so cancel and removal can delete it later. Object stores write the destination directly: their
+//! task writes into its own partial file next to the destination (a fresh
+//! random name, see [`fresh_partial`]) and renames it onto the real name only
+//! after the copy finished and verified. The old file stays intact until then.
+//! The task records the partial it owns, so a resume, cancel and removal only
+//! ever touch that file. Object stores write the destination directly: their
 //! uploads only become visible on a successful close, so an interrupted
 //! upload is always aborted and restarts from zero.
 //!
@@ -22,16 +22,17 @@
 //! error class whether to re-queue the task with backoff.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use opendal::layers::ThrottleLayer;
 use opendal::{Operator, Writer};
 use sqlx::SqlitePool;
 use tokio::time::Instant;
 
 use crate::provider::{Capabilities, Provider};
 
+use super::limiter::{self, RateLimiter};
 use super::store::{self, ClaimedTask};
 use super::ConflictPolicy;
 
@@ -126,9 +127,8 @@ pub(crate) struct TransferOpts {
     pub verify: bool,
     /// Copy the source mtime onto the destination where the backend can.
     pub preserve_timestamps: bool,
-    /// The global bandwidth cap. Clones share one rate limiter, so every
-    /// running transfer draws from the same budget.
-    pub throttle: Option<ThrottleLayer>,
+    /// The global and per-site bandwidth limits this transfer draws from.
+    pub limiters: Vec<Arc<RateLimiter>>,
 }
 
 #[derive(Debug)]
@@ -173,26 +173,17 @@ fn sibling(path: &str, name: &str) -> String {
     format!("{}{name}", &path[..path.len() - file_name(path).len()])
 }
 
-/// The partial file next to `path` (an operator or browse path) that task
-/// `task_id` writes before committing, on backends other than FTP.
-fn partial_name(path: &str, task_id: i64) -> String {
-    format!(".{}.{task_id}{PARTIAL_SUFFIX}", file_name(path))
+/// The file an earlier run of the task left its bytes in. Only the task's
+/// record knows it: a file that merely looks like a partial isn't ours.
+fn earlier_partial(path: &str, task: &ClaimedTask) -> Option<String> {
+    task.partial.as_deref().map(|partial| sibling(path, file_name(partial)))
 }
 
-/// The file an earlier run of the task left its bytes in. FTP partials have
-/// random names, so only the task's record knows them.
-fn earlier_partial(dst: &Provider, path: &str, task: &ClaimedTask) -> Option<String> {
-    if dst.scheme == "ftp" {
-        return task.partial.as_deref().map(|partial| sibling(path, file_name(partial)));
-    }
-    Some(sibling(path, &partial_name(path, task.id)))
-}
-
-/// A partial name next to `path` that nothing on the FTP server uses yet. FTP
-/// can't create a file exclusively and appends to what it finds, so the name
-/// is random and probed first. It never starts with a dot: many servers hide
-/// dotfiles from `LIST`, the only way OpenDAL stats a file there.
-async fn fresh_ftp_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
+/// A partial name next to `path` that nothing at the destination uses yet.
+/// Not every backend can create a file exclusively, and FTP appends to what it
+/// finds, so the name is random and probed first. It never starts with a dot:
+/// many FTP servers hide dotfiles from `LIST`.
+async fn fresh_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
     for _ in 0..8 {
         let name = format!("kessel-{task_id}-{:016x}{PARTIAL_SUFFIX}", rand::random::<u64>());
         match op.stat(&sibling(path, &name)).await {
@@ -296,7 +287,7 @@ async fn run_inner(
         let written = if task.in_place || !stages(&dst.caps) {
             Some(dst_path.clone())
         } else {
-            earlier_partial(dst, &dst_path, task)
+            earlier_partial(&dst_path, task)
         };
         if let Some(written) = written.filter(|_| {
             can_append && source_unchanged(task, size, etag.as_deref(), modified.as_deref())
@@ -359,13 +350,25 @@ async fn run_inner(
     }
 
     // A same-site move is one rename on the server when the backend has it.
-    // Anything it can't do (another volume, say) still works by copying.
+    // Anything it can't do (another volume, say) still works by copying, as
+    // long as the source is there to copy. Without it the rename may have
+    // happened with its answer lost, which only the user can judge.
     if opts.same_site && task.move_source && dst.caps.rename && offset == 0 && !append_to_existing {
-        store::set_task_dst_committed(pool, task.id, true).await?;
         match move_into_place(dst, &dst_op, &src_path, &dst_path).await {
-            Ok(()) => return Ok(Outcome::Done { bytes: size }),
+            Ok(()) => {
+                store::set_task_dst_committed(pool, task.id, true).await?;
+                return Ok(Outcome::Done { bytes: size });
+            }
             Err(error) => {
-                store::set_task_dst_committed(pool, task.id, false).await?;
+                let source_exists = src_op
+                    .exists(&src_path)
+                    .await
+                    .with_context(|| format!("checking moved source `{}`", task.src))?;
+                if !source_exists {
+                    return Err(error).with_context(|| {
+                        format!("moving `{}` was not confirmed and the source is gone", task.src)
+                    });
+                }
                 tracing::warn!(
                     src = %task.src, dst = %dst_browse, error = %format!("{error:#}"),
                     "server-side move failed; falling back to copying"
@@ -380,9 +383,8 @@ async fn run_inner(
     let in_place = append_to_existing || (offset > 0 && task.in_place);
     let partial = if stages(&dst.caps) && !in_place {
         let name = match task.partial.as_deref() {
-            _ if dst.scheme != "ftp" => partial_name(&dst_path, task.id),
             Some(recorded) if offset > 0 => file_name(recorded).to_string(),
-            _ => fresh_ftp_partial(&dst_op, &dst_path, task.id).await?,
+            _ => fresh_partial(&dst_op, &dst_path, task.id).await?,
         };
         Some((sibling(&dst_path, &name), sibling(&dst_browse, &name)))
     } else {
@@ -447,19 +449,14 @@ async fn run_inner(
     // upload holds, so those bytes go straight into the partial instead.
     let append = offset > 0 || dst.caps.write_renames_on_close;
 
-    // Only the streaming writer draws from the global bandwidth budget.
-    let write_op = match &opts.throttle {
-        Some(throttle) => dest.op.clone().layer(throttle.clone()),
-        None => dest.op.clone(),
-    };
     let mut writer = if append {
-        write_op
+        dest.op
             .writer_with(dest.write_path())
             .append(true)
             .await
             .with_context(|| format!("open destination `{}` for append", task.dst))?
     } else {
-        write_op
+        dest.op
             .writer_with(dest.write_path())
             .chunk(part_size(size) as usize)
             .await
@@ -474,6 +471,7 @@ async fn run_inner(
         }
     };
 
+    let step = limiter::slice(&opts.limiters);
     let mut last_persist = Instant::now();
     let copy_result: Result<Option<Outcome>> = async {
         while offset < size {
@@ -482,13 +480,16 @@ async fn run_inner(
                 Signal::Pause => return Ok(Some(Outcome::Paused)),
                 Signal::Cancel => return Ok(Some(Outcome::Cancelled)),
             }
-            let end = (offset + CHUNK).min(size);
+            let end = (offset + step).min(size);
             let buf = reader
                 .read(offset..end)
                 .await
                 .with_context(|| format!("read `{}` at {offset}", task.src))?;
             let read = buf.len() as u64;
             anyhow::ensure!(read > 0, "source `{}` truncated mid-transfer", task.src);
+            if !limiter::pace(&opts.limiters, read, control).await {
+                continue;
+            }
             writer
                 .write(buf)
                 .await
@@ -949,7 +950,7 @@ mod tests {
             same_site: false,
             verify: false,
             preserve_timestamps: false,
-            throttle: None,
+            limiters: Vec::new(),
         };
         let moved = |total_bytes, dst_committed| ClaimedTask {
             total_bytes: Some(total_bytes),
@@ -967,6 +968,100 @@ mod tests {
         // source vanished before this task moved anything.
         let (unrelated, _) = run_task(&pool, &provider, &provider, &moved(6, false), &control, opts).await;
         assert!(matches!(unrelated, Outcome::Failed(_)), "{unrelated:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_move_whose_rename_answer_got_lost_fails_visibly() {
+        let server = crate::ftp::test_server::FakeFtp::start();
+        server.put("a", b"moved!");
+        server.lose_rename_replies();
+        let site = crate::provider::SiteProfile {
+            scheme: "ftp".into(),
+            options: [("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&site, &Default::default()).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let opts = TransferOpts {
+            same_site: true,
+            verify: false,
+            preserve_timestamps: false,
+            limiters: Vec::new(),
+        };
+        let moved = ClaimedTask {
+            byte_offset: 0,
+            total_bytes: Some(6),
+            move_source: true,
+            ..task(None, None)
+        };
+
+        let control = JobControl::default();
+        let (first, _) = run_task(&pool, &provider, &provider, &moved, &control, opts.clone()).await;
+        assert!(matches!(first, Outcome::Failed(_)), "{first:?}");
+        assert_eq!(server.names(), ["b"]);
+        // The retry finds no source and no recorded commit: still no success.
+        let (retry, _) = run_task(&pool, &provider, &provider, &moved, &control, opts).await;
+        assert!(matches!(retry, Outcome::Failed(_)), "{retry:?}");
+    }
+
+    #[tokio::test]
+    async fn only_the_recorded_partial_is_ever_touched() {
+        const OLD_STYLE: &str = ".b.1.kessel-part";
+        let dir = std::env::temp_dir().join(format!("kessel-partial-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"0123456789").unwrap();
+        let local = crate::provider::SiteProfile {
+            scheme: "fs".into(),
+            options: [("root".to_string(), dir.to_string_lossy().to_string())].into(),
+            ..Default::default()
+        };
+        let provider = Provider::connect(&local, &Default::default()).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let control = JobControl::default();
+        let opts = TransferOpts {
+            same_site: false,
+            verify: false,
+            preserve_timestamps: false,
+            limiters: Vec::new(),
+        };
+        let (op, _) = provider.op_for("").unwrap();
+        let modified = op.stat("a").await.unwrap().last_modified().and_then(crate::provider::to_datetime);
+        let modified = modified.map(|time| time.to_rfc3339());
+
+        // A user's file at the old predictable name, on a fresh start and on a
+        // legacy task that resumes without a recorded partial.
+        std::fs::write(dir.join(OLD_STYLE), b"mine").unwrap();
+        for byte_offset in [0, 4] {
+            let fresh = ClaimedTask { byte_offset, ..task(None, modified.as_deref()) };
+            let (done, _) = run_task(&pool, &provider, &provider, &fresh, &control, opts.clone()).await;
+            assert!(matches!(done, Outcome::Done { bytes: 10 }), "{done:?}");
+            assert_eq!(std::fs::read(dir.join("b")).unwrap(), b"0123456789");
+            assert_eq!(std::fs::read(dir.join(OLD_STYLE)).unwrap(), b"mine");
+            std::fs::remove_file(dir.join("b")).unwrap();
+        }
+
+        // A recorded partial is ours, whatever its name: the resume continues it.
+        std::fs::write(dir.join(OLD_STYLE), b"XXXX").unwrap();
+        let resumed = ClaimedTask {
+            partial: Some(OLD_STYLE.to_string()),
+            ..task(None, modified.as_deref())
+        };
+        let (done, _) = run_task(&pool, &provider, &provider, &resumed, &control, opts).await;
+        assert!(matches!(done, Outcome::Done { bytes: 10 }), "{done:?}");
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), b"XXXX456789");
+        assert!(!dir.join(OLD_STYLE).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

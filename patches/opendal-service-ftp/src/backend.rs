@@ -235,21 +235,7 @@ impl Service for FtpBackend {
     }
 
     async fn stat(&self, _ctx: &OperationContext, path: &str, _: OpStat) -> Result<RpStat> {
-        let file = self.ftp_stat(path).await?;
-
-        let mode = if file.is_file() {
-            EntryMode::FILE
-        } else if file.is_directory() {
-            EntryMode::DIR
-        } else {
-            EntryMode::Unknown
-        };
-
-        let mut meta = Metadata::new(mode);
-        meta.set_content_length(file.size() as u64);
-        meta.set_last_modified(Timestamp::try_from(file.modified())?);
-
-        Ok(RpStat::new(meta))
+        Ok(RpStat::new(self.ftp_stat(path).await?))
     }
     fn read(&self, _ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
         check_path(path)?;
@@ -322,7 +308,7 @@ impl Service for FtpBackend {
 }
 
 impl FtpBackend {
-    pub async fn ftp_stat(&self, path: &str) -> Result<File> {
+    pub async fn ftp_stat(&self, path: &str) -> Result<Metadata> {
         check_path(path)?;
         let mut ftp_stream = self.core.ftp_connect(Operation::Stat).await?;
 
@@ -339,14 +325,42 @@ impl FtpBackend {
             .filter(|f| f.name() == basename.trim_end_matches('/'))
             .collect::<Vec<File>>();
 
-        if files.is_empty() {
-            Err(Error::new(
-                ErrorKind::NotFound,
-                "file is not found during list",
-            ))
-        } else {
-            Ok(files.remove(0))
+        if !files.is_empty() {
+            let file = files.remove(0);
+            let mode = if file.is_file() {
+                EntryMode::FILE
+            } else if file.is_directory() {
+                EntryMode::DIR
+            } else {
+                EntryMode::Unknown
+            };
+            let mut meta = Metadata::new(mode);
+            meta.set_content_length(file.size() as u64);
+            meta.set_last_modified(Timestamp::try_from(file.modified())?);
+            return Ok(meta);
         }
+
+        // Many servers hide dotfiles from LIST, so absence there proves
+        // nothing. SIZE names the exact path. A server without SIZE leaves
+        // LIST as the only answer.
+        let not_found = || Error::new(ErrorKind::NotFound, "file is not found during list");
+        if path.ends_with('/') {
+            return Err(not_found());
+        }
+        let size = match ftp_stream.size(path).await {
+            Ok(size) => size,
+            Err(FtpError::UnexpectedResponse(Response {
+                status: Status::BadCommand | Status::NotImplemented | Status::NotImplementedParameter,
+                ..
+            })) => return Err(not_found()),
+            Err(e) => return Err(format_ftp_error(e)),
+        };
+        let mut meta = Metadata::new(EntryMode::FILE);
+        meta.set_content_length(size as u64);
+        if let Ok(modified) = ftp_stream.mdtm(path).await {
+            meta.set_last_modified(Timestamp::from_second(modified.and_utc().timestamp())?);
+        }
+        Ok(meta)
     }
 }
 
