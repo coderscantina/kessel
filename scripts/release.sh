@@ -87,7 +87,7 @@ prepend_to_changelog() {
 # Set version = X.Y.Z in Cargo.toml's [package] section (first `version =` line).
 set_cargo_version() {
     local version="$1"
-    sed -i '' "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
+    perl -pi -e 'if (!$done && s/^version = ".*"/version = "'"${version}"'"/) { $done = 1 }' Cargo.toml
     # Refresh Cargo.lock's own entry without touching dependency versions
     cargo update --package kessel --precise "$version" 2>/dev/null \
         || cargo metadata --format-version 1 --no-deps > /dev/null
