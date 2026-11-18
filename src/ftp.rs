@@ -237,6 +237,14 @@ pub(crate) mod test_server {
                         Some(_) => "250 deleted".to_string(),
                         None => "550 not found".to_string(),
                     },
+                    "SIZE" => match self.read(&path) {
+                        Some(content) => format!("213 {}", content.len()),
+                        None => "550 not found".to_string(),
+                    },
+                    "MDTM" => match self.read(&path) {
+                        Some(_) => "213 20260101120000".to_string(),
+                        None => "550 not found".to_string(),
+                    },
                     "RNFR" if self.tree.lock().unwrap().files.contains_key(&path) => {
                         rename_from = path;
                         "350 go on".to_string()
@@ -345,6 +353,21 @@ mod tests {
         assert!(op.create_dir(&format!("{EVIL}/")).await.is_err());
 
         assert_eq!(server.names(), ["victim.txt"]);
+    }
+
+    #[tokio::test]
+    async fn stat_finds_a_file_the_listing_hides() {
+        let server = test_server::FakeFtp::start();
+        server.put("www/.htaccess", b"deny");
+        let options = HashMap::from([("endpoint".to_string(), format!("ftp://127.0.0.1:{}", server.port))]);
+        let op = opendal::Operator::via_iter("ftp", options).unwrap();
+
+        let meta = op.stat("www/.htaccess").await.unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.content_length(), 4);
+        assert!(meta.last_modified().is_some());
+        let missing = op.stat("www/.missing").await.unwrap_err();
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
     }
 
     #[tokio::test]

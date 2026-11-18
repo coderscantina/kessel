@@ -191,7 +191,7 @@ fn earlier_partial(dst: &Provider, path: &str, task: &ClaimedTask) -> Option<Str
 /// A partial name next to `path` that nothing on the FTP server uses yet. FTP
 /// can't create a file exclusively and appends to what it finds, so the name
 /// is random and probed first. It never starts with a dot: many servers hide
-/// dotfiles from `LIST`, the only way OpenDAL stats a file there.
+/// dotfiles from `LIST`.
 async fn fresh_ftp_partial(op: &Operator, path: &str, task_id: i64) -> Result<String> {
     for _ in 0..8 {
         let name = format!("kessel-{task_id}-{:016x}{PARTIAL_SUFFIX}", rand::random::<u64>());
